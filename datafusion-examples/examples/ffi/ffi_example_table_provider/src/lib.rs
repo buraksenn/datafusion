@@ -18,10 +18,9 @@
 use std::sync::Arc;
 
 use abi_stable::{export_root_module, prefix_type::PrefixTypeTrait};
-use arrow_array::RecordBatch;
+use arrow_array::{record_batch, RecordBatch};
 use datafusion::{
     arrow::datatypes::{DataType, Field, Schema},
-    common::record_batch,
     datasource::MemTable,
 };
 use datafusion_ffi::table_provider::FFI_TableProvider;
@@ -32,7 +31,7 @@ fn create_record_batch(start_value: i32, num_values: usize) -> RecordBatch {
     let a_vals: Vec<i32> = (start_value..end_value).collect();
     let b_vals: Vec<f64> = a_vals.iter().map(|v| *v as f64).collect();
 
-    record_batch!(("a", Int32, a_vals), ("b", Float64, b_vals)).unwrap()
+    record_batch!(("a", Int32, &a_vals[..]), ("b", Float64, &b_vals[..])).unwrap()
 }
 
 /// Here we only wish to create a simple table provider as an example.
@@ -62,5 +61,5 @@ pub fn get_simple_memory_table() -> TableProviderModuleRef {
     TableProviderModule {
         create_table: construct_simple_table_provider,
     }
-    .leak_into_prefix()
+        .leak_into_prefix()
 }

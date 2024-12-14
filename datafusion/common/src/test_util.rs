@@ -280,6 +280,7 @@ pub fn get_data_dir(
 }
 
 #[macro_export]
+#[deprecated(since = "44.0.0", note = "Please use `record_batch!` instead")]
 macro_rules! create_array {
     (Boolean, $values: expr) => {
         std::sync::Arc::new(arrow::array::BooleanArray::from($values))
@@ -335,6 +336,10 @@ macro_rules! create_array {
 /// );
 /// ```
 #[macro_export]
+#[deprecated(
+    since = "44.0.0",
+    note = "Please use `record_batch!` in arrow_array crate instead"
+)]
 macro_rules! record_batch {
     ($(($name: expr, $type: ident, $values: expr)),*) => {
         {
@@ -358,9 +363,6 @@ macro_rules! record_batch {
 
 #[cfg(test)]
 mod tests {
-    use crate::cast::{as_float64_array, as_int32_array, as_string_array};
-    use crate::error::Result;
-
     use super::*;
     use std::env;
 
@@ -412,45 +414,5 @@ mod tests {
 
         let res = parquet_test_data();
         assert!(PathBuf::from(res).is_dir());
-    }
-
-    #[test]
-    fn test_create_record_batch() -> Result<()> {
-        use arrow_array::Array;
-
-        let batch = record_batch!(
-            ("a", Int32, vec![1, 2, 3, 4]),
-            ("b", Float64, vec![Some(4.0), None, Some(5.0), None]),
-            ("c", Utf8, vec!["alpha", "beta", "gamma", "delta"])
-        )?;
-
-        assert_eq!(3, batch.num_columns());
-        assert_eq!(4, batch.num_rows());
-
-        let values: Vec<_> = as_int32_array(batch.column(0))?
-            .values()
-            .iter()
-            .map(|v| v.to_owned())
-            .collect();
-        assert_eq!(values, vec![1, 2, 3, 4]);
-
-        let values: Vec<_> = as_float64_array(batch.column(1))?
-            .values()
-            .iter()
-            .map(|v| v.to_owned())
-            .collect();
-        assert_eq!(values, vec![4.0, 0.0, 5.0, 0.0]);
-
-        let nulls: Vec<_> = as_float64_array(batch.column(1))?
-            .nulls()
-            .unwrap()
-            .iter()
-            .collect();
-        assert_eq!(nulls, vec![true, false, true, false]);
-
-        let values: Vec<_> = as_string_array(batch.column(2))?.iter().flatten().collect();
-        assert_eq!(values, vec!["alpha", "beta", "gamma", "delta"]);
-
-        Ok(())
     }
 }

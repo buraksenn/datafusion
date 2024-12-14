@@ -159,8 +159,8 @@ pub trait SchemaMapper: Debug + Send + Sync {
 /// ```
 /// # use std::sync::Arc;
 /// # use arrow::datatypes::{DataType, Field, Schema};
+/// # use arrow_array::record_batch;
 /// # use datafusion::datasource::schema_adapter::{DefaultSchemaAdapterFactory, SchemaAdapterFactory};
-/// # use datafusion_common::record_batch;
 /// // Table has fields "a",  "b" and "c"
 /// let table_schema = Schema::new(vec![
 ///     Field::new("a", DataType::Int32, true),
@@ -182,17 +182,17 @@ pub trait SchemaMapper: Debug + Send + Sync {
 /// let (mapper, _indices) = adapter.map_schema(&file_schema).unwrap();
 ///
 /// let file_batch = record_batch!(
-///     ("c", Utf8, vec!["foo", "bar"]),
-///     ("b", Float64, vec![1.0, 2.0])
+///     ("c", Utf8, ["foo", "bar"]),
+///     ("b", Float64, [1.0, 2.0])
 /// ).unwrap();
 ///
 /// let mapped_batch = mapper.map_batch(file_batch).unwrap();
 ///
 /// // the mapped batch has the correct schema and the "b" column has been cast to Utf8
 /// let expected_batch = record_batch!(
-///    ("a", Int32, vec![None, None]),  // missing column filled with nulls
-///    ("b", Utf8, vec!["1.0", "2.0"]), // b was cast to string and order was changed
-///    ("c", Utf8, vec!["foo", "bar"])
+///    ("a", Int32, [None, None]),  // missing column filled with nulls
+///    ("b", Utf8, ["1.0", "2.0"]), // b was cast to string and order was changed
+///    ("c", Utf8, ["foo", "bar"])
 /// ).unwrap();
 /// assert_eq!(mapped_batch, expected_batch);
 /// ```
@@ -436,7 +436,7 @@ mod tests {
     use crate::assert_batches_sorted_eq;
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{record_batch, Int32Array, StringArray};
     use arrow_schema::{DataType, SchemaRef};
     use object_store::path::Path;
     use object_store::ObjectMeta;
@@ -450,7 +450,6 @@ mod tests {
     use crate::datasource::schema_adapter::{
         DefaultSchemaAdapterFactory, SchemaAdapter, SchemaAdapterFactory, SchemaMapper,
     };
-    use datafusion_common::record_batch;
     #[cfg(feature = "parquet")]
     use parquet::arrow::ArrowWriter;
     use tempfile::TempDir;
@@ -541,14 +540,14 @@ mod tests {
         let (mapper, indices) = adapter.map_schema(&file_schema).unwrap();
         assert_eq!(indices, vec![1]);
 
-        let file_batch = record_batch!(("b", Float64, vec![1.0, 2.0])).unwrap();
+        let file_batch = record_batch!(("b", Float64, [1.0, 2.0])).unwrap();
 
         let mapped_batch = mapper.map_batch(file_batch).unwrap();
 
         // the mapped batch has the correct schema and the "b" column has been cast to Utf8
         let expected_batch = record_batch!(
-            ("a", Int32, vec![None, None]), // missing column filled with nulls
-            ("b", Utf8, vec!["1.0", "2.0"])  // b was cast to string and order was changed
+            ("a", Int32, [None, None]),  // missing column filled with nulls
+            ("b", Utf8, ["1.0", "2.0"])  // b was cast to string and order was changed
         )
         .unwrap();
         assert_eq!(mapped_batch, expected_batch);
@@ -569,7 +568,7 @@ mod tests {
         let (mapper, indices) = adapter.map_schema(&file_schema).unwrap();
         assert_eq!(indices, vec![0]);
 
-        let file_batch = record_batch!(("b", Float64, vec![1.0, 2.0])).unwrap();
+        let file_batch = record_batch!(("b", Float64, [1.0, 2.0])).unwrap();
 
         // Mapping fails because it tries to fill in a non-nullable column with nulls
         let err = mapper.map_batch(file_batch).unwrap_err().to_string();
