@@ -25,6 +25,7 @@ use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::udaf::{AggregateFunctionExpr, StatisticsArgs};
 use datafusion_physical_plan::{expressions, ExecutionPlan};
+use recursive::recursive;
 use std::sync::Arc;
 
 use crate::PhysicalOptimizerRule;
@@ -41,7 +42,7 @@ impl AggregateStatistics {
 }
 
 impl PhysicalOptimizerRule for AggregateStatistics {
-    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
+    #[recursive]
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,

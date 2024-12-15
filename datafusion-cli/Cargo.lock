@@ -1332,6 +1332,7 @@ dependencies = [
  "object_store",
  "parquet",
  "paste",
+ "recursive",
  "sqlparser",
  "tokio",
  "web-time",
@@ -1530,6 +1531,7 @@ dependencies = [
  "indexmap",
  "itertools",
  "log",
+ "recursive",
  "regex",
  "regex-syntax",
 ]
