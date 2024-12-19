@@ -24,11 +24,14 @@ use datafusion_catalog::TableFunctionImpl;
 use datafusion_catalog::TableProvider;
 use datafusion_common::{not_impl_err, plan_err, Result, ScalarValue};
 use datafusion_expr::{Expr, TableType};
-use datafusion_physical_plan::memory::{LazyBatchGenerator, LazyMemoryExec};
+use datafusion_physical_plan::memory::LazyMemoryExec;
 use datafusion_physical_plan::ExecutionPlan;
+use futures::Stream;
 use parking_lot::RwLock;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 /// Table that generates a series of integers from `start`(inclusive) to `end`(inclusive)
 #[derive(Debug, Clone)]
@@ -63,11 +66,16 @@ impl fmt::Display for GenerateSeriesState {
     }
 }
 
-impl LazyBatchGenerator for GenerateSeriesState {
-    fn generate_next_batch(&mut self) -> Result<Option<RecordBatch>> {
+impl Stream for GenerateSeriesState {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         // Check if we've reached the end
         if self.current > self.end {
-            return Ok(None);
+            return Poll::Ready(None);
         }
 
         // Construct batch
@@ -78,7 +86,7 @@ impl LazyBatchGenerator for GenerateSeriesState {
         // Update current position for next batch
         self.current = batch_end + 1;
 
-        Ok(Some(batch))
+        Poll::Ready(Some(Ok(batch)))
     }
 }
 

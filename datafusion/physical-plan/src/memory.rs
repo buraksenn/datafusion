@@ -91,7 +91,7 @@ impl DisplayAs for MemoryExec {
                         partition_sizes.len(),
                     )
                 } else {
-                    write!(f, "MemoryExec: partitions={}", partition_sizes.len(),)
+                    write!(f, "MemoryExec: partitions={}", partition_sizes.len(), )
                 }
             }
         }
@@ -366,6 +366,10 @@ impl RecordBatchStream for MemoryStream {
     }
 }
 
+#[deprecated(
+    since = "44.0.0",
+    note = "Please use SendableRecordBatchStream trait instead"
+)]
 pub trait LazyBatchGenerator: Send + Sync + fmt::Debug + fmt::Display {
     /// Generate the next batch, return `None` when no more batches are available
     fn generate_next_batch(&mut self) -> Result<Option<RecordBatch>>;
@@ -379,7 +383,8 @@ pub struct LazyMemoryExec {
     /// Schema representing the data
     schema: SchemaRef,
     /// Functions to generate batches for each partition
-    batch_generators: Vec<Arc<RwLock<dyn LazyBatchGenerator>>>,
+    batch_generators:
+        Vec<Arc<RwLock<dyn Stream<Item=Result<RecordBatch>> + Send + Sync>>>,
     /// Plan properties cache storing equivalence properties, partitioning, and execution mode
     cache: PlanProperties,
 }
@@ -388,7 +393,9 @@ impl LazyMemoryExec {
     /// Create a new lazy memory execution plan
     pub fn try_new(
         schema: SchemaRef,
-        generators: Vec<Arc<RwLock<dyn LazyBatchGenerator>>>,
+        generators: Vec<
+            Arc<RwLock<dyn Stream<Item=Result<RecordBatch>> + Send + Sync>>,
+        >,
     ) -> Result<Self> {
         let cache = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -407,7 +414,6 @@ impl fmt::Debug for LazyMemoryExec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("LazyMemoryExec")
             .field("schema", &self.schema)
-            .field("batch_generators", &self.batch_generators)
             .finish()
     }
 }
@@ -418,13 +424,8 @@ impl DisplayAs for LazyMemoryExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "LazyMemoryExec: partitions={}, batch_generators=[{}]",
+                    "LazyMemoryExec: partitions={}",
                     self.batch_generators.len(),
-                    self.batch_generators
-                        .iter()
-                        .map(|g| g.read().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
                 )
             }
         }
@@ -497,7 +498,7 @@ pub struct LazyMemoryStream {
     /// construct multiple `LazyMemoryStream`s during planning to enable
     /// parallel execution.
     /// Sharing generators between streams should be used with caution.
-    generator: Arc<RwLock<dyn LazyBatchGenerator>>,
+    generator: Arc<RwLock<SendableRecordBatchStream>>,
 }
 
 impl Stream for LazyMemoryStream {
@@ -507,7 +508,7 @@ impl Stream for LazyMemoryStream {
         self: std::pin::Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let batch = self.generator.write().generate_next_batch();
+        let batch = self.generator.write().poll_next();
 
         match batch {
             Ok(Some(batch)) => Poll::Ready(Some(Ok(batch))),
@@ -581,6 +582,7 @@ mod lazy_memory_tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use futures::StreamExt;
+    use std::pin::Pin;
 
     #[derive(Debug, Clone)]
     struct TestGenerator {
@@ -600,10 +602,15 @@ mod lazy_memory_tests {
         }
     }
 
-    impl LazyBatchGenerator for TestGenerator {
-        fn generate_next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    impl Stream for TestGenerator {
+        type Item = Result<RecordBatch>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
             if self.counter >= self.max_batches {
-                return Ok(None);
+                return Poll::Ready(None);
             }
 
             let array = Int64Array::from_iter_values(
@@ -611,10 +618,11 @@ mod lazy_memory_tests {
                     ..(self.counter * self.batch_size as i64 + self.batch_size as i64),
             );
             self.counter += 1;
-            Ok(Some(RecordBatch::try_new(
+
+            Poll::Ready(Some(Ok(RecordBatch::try_new(
                 Arc::clone(&self.schema),
                 vec![Arc::new(array)],
-            )?))
+            )?)))
         }
     }
 
