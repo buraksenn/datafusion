@@ -48,6 +48,7 @@ futures = { workspace = true }
 itertools = { workspace = true }
 log = { workspace = true }
 recursive = { workspace = true, optional = true }
+url = "2.5.4"
 
 [dev-dependencies]
 datafusion-expr = { workspace = true }

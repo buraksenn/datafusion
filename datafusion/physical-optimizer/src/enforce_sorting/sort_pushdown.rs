@@ -18,18 +18,11 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use super::utils::{add_sort_above, is_sort};
-use crate::physical_optimizer::utils::{is_sort_preserving_merge, is_union, is_window};
-use crate::physical_plan::filter::FilterExec;
-use crate::physical_plan::joins::utils::calculate_join_output_ordering;
-use crate::physical_plan::joins::SortMergeJoinExec;
-use crate::physical_plan::projection::ProjectionExec;
-use crate::physical_plan::repartition::RepartitionExec;
-use crate::physical_plan::sorts::sort::SortExec;
-use crate::physical_plan::tree_node::PlanContext;
-use crate::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use arrow_schema::SchemaRef;
 
+use crate::enforce_sorting::utils::{
+    add_sort_above, is_sort, is_sort_preserving_merge, is_union, is_window,
+};
 use datafusion_common::tree_node::{
     ConcreteTreeNode, Transformed, TreeNode, TreeNodeRecursion,
 };
@@ -39,8 +32,16 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::PhysicalSortRequirement;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
-use datafusion_physical_plan::joins::utils::ColumnIndex;
-use datafusion_physical_plan::joins::HashJoinExec;
+use datafusion_physical_plan::filter::FilterExec;
+use datafusion_physical_plan::joins::utils::{
+    calculate_join_output_ordering, ColumnIndex,
+};
+use datafusion_physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::sorts::sort::SortExec;
+use datafusion_physical_plan::tree_node::PlanContext;
+use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 /// This is a "data class" we use within the [`EnforceSorting`] rule to push
 /// down [`SortExec`] in the plan. In some cases, we can reduce the total

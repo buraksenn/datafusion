@@ -30,7 +30,8 @@ use datafusion::datasource::{
     physical_plan::{FileScanConfig, ParquetExec},
 };
 use datafusion_execution::object_store::ObjectStoreUrl;
-use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion_physical_plan::ExecutionPlan;
 
 /// create a single parquet file that is sorted
 pub(crate) fn parquet_exec_with_sort(
@@ -173,4 +174,28 @@ impl QueryCase {
         }
         Ok(())
     }
+}
+
+/// Create a non sorted parquet exec
+pub fn parquet_exec(schema: &SchemaRef) -> Arc<ParquetExec> {
+    ParquetExec::builder(
+        FileScanConfig::new(ObjectStoreUrl::parse("test:///").unwrap(), schema.clone())
+            .with_file(PartitionedFile::new("x".to_string(), 100)),
+    )
+    .build_arc()
+}
+
+// Created a sorted parquet exec
+pub fn parquet_exec_sorted(
+    schema: &SchemaRef,
+    sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
+) -> Arc<dyn ExecutionPlan> {
+    let sort_exprs = sort_exprs.into_iter().collect();
+
+    ParquetExec::builder(
+        FileScanConfig::new(ObjectStoreUrl::parse("test:///").unwrap(), schema.clone())
+            .with_file(PartitionedFile::new("x".to_string(), 100))
+            .with_output_ordering(vec![sort_exprs]),
+    )
+    .build_arc()
 }
