@@ -1311,6 +1311,7 @@ fn eq_dyn_null(
 ) -> Result<BooleanArray, ArrowError> {
     // Nested datatypes cannot use the underlying not_distinct/eq function and must use a special
     // implementation
+    // trigger ci
     // <https://github.com/apache/datafusion/issues/10749>
     if left.data_type().is_nested() {
         let op = if null_equals_null {
