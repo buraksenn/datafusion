@@ -118,7 +118,7 @@ impl ScalarUDFImpl for Flatten {
             }
         }
 
-        let data_type = get_base_type(&arg_types[0])?;
+        let data_type = (&arg_types[0])?;
         Ok(data_type)
     }
 
