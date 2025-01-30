@@ -105,6 +105,7 @@ impl ScalarUDFImpl for Flatten {
                 List(field) | FixedSizeList(field, _)
                     if matches!(field.data_type(), List(_) | FixedSizeList(_, _)) =>
                 {
+                    // some comment
                     get_base_type(field.data_type())
                 }
                 LargeList(field) if matches!(field.data_type(), LargeList(_)) => {
