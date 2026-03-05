@@ -19,14 +19,17 @@ use std::process::Command;
 
 use rstest::rstest;
 
-use insta::{glob, Settings};
+use async_trait::async_trait;
+use insta::{Settings, glob};
 use insta_cmd::{assert_cmd_snapshot, get_cargo_bin};
 use std::path::PathBuf;
 use std::{env, fs};
-use testcontainers::core::{CmdWaitFor, ExecCommand, Mount};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt, TestcontainersError};
 use testcontainers_modules::minio;
+use testcontainers_modules::testcontainers::core::{CmdWaitFor, ExecCommand, Mount};
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{
+    ContainerAsync, ImageExt, TestcontainersError,
+};
 
 fn cli() -> Command {
     Command::new(get_cargo_bin("datafusion-cli"))
@@ -41,7 +44,7 @@ fn make_settings() -> Settings {
     settings
 }
 
-async fn setup_minio_container() -> ContainerAsync<minio::MinIO> {
+async fn setup_minio_container() -> Result<ContainerAsync<minio::MinIO>, String> {
     const MINIO_ROOT_USER: &str = "TEST-DataFusionLogin";
     const MINIO_ROOT_PASSWORD: &str = "TEST-DataFusionPassword";
 
@@ -96,25 +99,23 @@ async fn setup_minio_container() -> ContainerAsync<minio::MinIO> {
                     let stdout = container.stdout_to_vec().await.unwrap_or_default();
                     let stderr = container.stderr_to_vec().await.unwrap_or_default();
 
-                    panic!(
+                    return Err(format!(
                         "Failed to execute command: {}\nError: {}\nStdout: {:?}\nStderr: {:?}",
                         cmd_ref,
                         e,
                         String::from_utf8_lossy(&stdout),
                         String::from_utf8_lossy(&stderr)
-                    );
+                    ));
                 }
             }
 
-            container
+            Ok(container)
         }
 
-        Err(TestcontainersError::Client(e)) => {
-            panic!("Failed to start MinIO container. Ensure Docker is running and accessible: {e}");
-        }
-        Err(e) => {
-            panic!("Failed to start MinIO container: {e}");
-        }
+        Err(TestcontainersError::Client(e)) => Err(format!(
+            "Failed to start MinIO container. Ensure Docker is running and accessible: {e}"
+        )),
+        Err(e) => Err(format!("Failed to start MinIO container: {e}")),
     }
 }
 
@@ -248,7 +249,14 @@ async fn test_cli() {
         return;
     }
 
-    let container = setup_minio_container().await;
+    let container = match setup_minio_container().await {
+        Ok(c) => c,
+        Err(e) if e.contains("toomanyrequests") => {
+            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
+            return;
+        }
+        e @ Err(_) => e.unwrap(),
+    };
 
     let settings = make_settings();
     let _bound = settings.bind_to_scope();
@@ -257,13 +265,15 @@ async fn test_cli() {
 
     glob!("sql/integration/*.sql", |path| {
         let input = fs::read_to_string(path).unwrap();
-        assert_cmd_snapshot!(cli()
-            .env_clear()
-            .env("AWS_ACCESS_KEY_ID", "TEST-DataFusionLogin")
-            .env("AWS_SECRET_ACCESS_KEY", "TEST-DataFusionPassword")
-            .env("AWS_ENDPOINT", format!("http://localhost:{port}"))
-            .env("AWS_ALLOW_HTTP", "true")
-            .pass_stdin(input))
+        assert_cmd_snapshot!(
+            cli()
+                .env_clear()
+                .env("AWS_ACCESS_KEY_ID", "TEST-DataFusionLogin")
+                .env("AWS_SECRET_ACCESS_KEY", "TEST-DataFusionPassword")
+                .env("AWS_ENDPOINT", format!("http://localhost:{port}"))
+                .env("AWS_ALLOW_HTTP", "true")
+                .pass_stdin(input)
+        )
     });
 }
 
@@ -279,7 +289,14 @@ async fn test_aws_options() {
     let settings = make_settings();
     let _bound = settings.bind_to_scope();
 
-    let container = setup_minio_container().await;
+    let container = match setup_minio_container().await {
+        Ok(c) => c,
+        Err(e) if e.contains("toomanyrequests") => {
+            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
+            return;
+        }
+        e @ Err(_) => e.unwrap(),
+    };
     let port = container.get_host_port_ipv4(9000).await.unwrap();
 
     let input = format!(
@@ -327,10 +344,12 @@ SELECT COUNT(*) FROM hits;
 "#
     );
 
-    assert_cmd_snapshot!(cli()
-        .env("RUST_LOG", "warn")
-        .env_remove("AWS_ENDPOINT")
-        .pass_stdin(input));
+    assert_cmd_snapshot!(
+        cli()
+            .env("RUST_LOG", "warn")
+            .env_remove("AWS_ENDPOINT")
+            .pass_stdin(input)
+    );
 }
 
 /// Ensure backtrace will be printed, if executing `datafusion-cli` with a query
@@ -368,13 +387,18 @@ async fn test_s3_url_fallback() {
         return;
     }
 
-    let container = setup_minio_container().await;
+    let container = match setup_minio_container().await {
+        Ok(c) => c,
+        Err(e) if e.contains("toomanyrequests") => {
+            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
+            return;
+        }
+        e @ Err(_) => e.unwrap(),
+    };
 
     let mut settings = make_settings();
     settings.set_snapshot_suffix("s3_url_fallback");
     let _bound = settings.bind_to_scope();
-
-    let port = container.get_host_port_ipv4(9000).await.unwrap();
 
     // Create a table using a prefix path (without trailing slash)
     // This should trigger the fallback logic where head() fails on the prefix
@@ -389,11 +413,89 @@ OPTIONS (
 SELECT * FROM partitioned_data ORDER BY column_1, column_2 LIMIT 5;
 "#;
 
-    assert_cmd_snapshot!(cli()
-        .env_clear()
-        .env("AWS_ACCESS_KEY_ID", "TEST-DataFusionLogin")
-        .env("AWS_SECRET_ACCESS_KEY", "TEST-DataFusionPassword")
-        .env("AWS_ENDPOINT", format!("http://localhost:{port}"))
-        .env("AWS_ALLOW_HTTP", "true")
-        .pass_stdin(input));
+    assert_cmd_snapshot!(cli().with_minio(&container).await.pass_stdin(input));
+}
+
+/// Validate object store profiling output
+#[tokio::test]
+async fn test_object_store_profiling() {
+    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
+        eprintln!("Skipping external storages integration tests");
+        return;
+    }
+
+    let container = match setup_minio_container().await {
+        Ok(c) => c,
+        Err(e) if e.contains("toomanyrequests") => {
+            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
+            return;
+        }
+        e @ Err(_) => e.unwrap(),
+    };
+    let mut settings = make_settings();
+
+    // as the object store profiling contains timestamps and durations, we must
+    // filter them out to have stable snapshots
+    //
+    // Example line to filter:
+    // 2025-10-11T12:02:59.722646+00:00 operation=Get duration=0.001495s size=1006 path=cars.csv
+    // Output:
+    // <TIMESTAMP> operation=Get duration=[DURATION] size=1006 path=cars.csv
+    settings.add_filter(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2} operation=(Get|Put|Delete|List|Head) duration=\d+\.\d{6}s (size=\d+\s+)?path=(.*)",
+        "<TIMESTAMP> operation=$1 duration=[DURATION] ${2}path=$3",
+    );
+
+    // We also need to filter out the summary statistics (anything with an 's' at the end)
+    // Example line(s) to filter:
+    // | Get       | duration | 5.000000s | 5.000000s | 5.000000s |           | 1         |
+    settings.add_filter(
+        r"\| (Get|Put|Delete|List|Head)( +)\| duration \| .*? \| .*? \| .*? \| .*? \| (.*?) \|",
+        "| $1$2 | duration | ...NORMALIZED...| $3 |",
+    );
+
+    let _bound = settings.bind_to_scope();
+
+    let input = r#"
+    CREATE EXTERNAL TABLE CARS
+STORED AS CSV
+LOCATION 's3://data/cars.csv';
+
+-- Initial query should not show any profiling as the object store is not instrumented yet
+SELECT * from CARS LIMIT 1;
+\object_store_profiling trace
+-- Query again to see the full profiling output
+SELECT * from CARS LIMIT 1;
+\object_store_profiling summary
+-- Query again to see the summarized profiling output
+SELECT * from CARS LIMIT 1;
+\object_store_profiling disabled
+-- Final query should not show any profiling as we disabled it again
+SELECT * from CARS LIMIT 1;
+"#;
+
+    assert_cmd_snapshot!(cli().with_minio(&container).await.pass_stdin(input));
+}
+
+/// Extension trait to Add the minio connection information to a Command
+#[async_trait]
+trait MinioCommandExt {
+    async fn with_minio(&mut self, container: &ContainerAsync<minio::MinIO>)
+    -> &mut Self;
+}
+
+#[async_trait]
+impl MinioCommandExt for Command {
+    async fn with_minio(
+        &mut self,
+        container: &ContainerAsync<minio::MinIO>,
+    ) -> &mut Self {
+        let port = container.get_host_port_ipv4(9000).await.unwrap();
+
+        self.env_clear()
+            .env("AWS_ACCESS_KEY_ID", "TEST-DataFusionLogin")
+            .env("AWS_SECRET_ACCESS_KEY", "TEST-DataFusionPassword")
+            .env("AWS_ENDPOINT", format!("http://localhost:{port}"))
+            .env("AWS_ALLOW_HTTP", "true")
+    }
 }

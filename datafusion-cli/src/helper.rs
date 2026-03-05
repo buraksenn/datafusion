@@ -20,10 +20,11 @@
 
 use std::borrow::Cow;
 
-use crate::highlighter::{NoSyntaxHighlighter, SyntaxHighlighter};
+use crate::highlighter::{Color, NoSyntaxHighlighter, SyntaxHighlighter};
 
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::dialect_from_str;
+use datafusion_common::config::Dialect;
 
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
@@ -32,14 +33,17 @@ use rustyline::hint::Hinter;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Context, Helper, Result};
 
+/// Default suggestion shown when the input line is empty.
+const DEFAULT_HINT_SUGGESTION: &str = " \\? for help, \\q to quit";
+
 pub struct CliHelper {
     completer: FilenameCompleter,
-    dialect: String,
+    dialect: Dialect,
     highlighter: Box<dyn Highlighter>,
 }
 
 impl CliHelper {
-    pub fn new(dialect: &str, color: bool) -> Self {
+    pub fn new(dialect: &Dialect, color: bool) -> Self {
         let highlighter: Box<dyn Highlighter> = if !color {
             Box::new(NoSyntaxHighlighter {})
         } else {
@@ -47,26 +51,26 @@ impl CliHelper {
         };
         Self {
             completer: FilenameCompleter::new(),
-            dialect: dialect.into(),
+            dialect: *dialect,
             highlighter,
         }
     }
 
-    pub fn set_dialect(&mut self, dialect: &str) {
-        if dialect != self.dialect {
-            self.dialect = dialect.to_string();
+    pub fn set_dialect(&mut self, dialect: &Dialect) {
+        if *dialect != self.dialect {
+            self.dialect = *dialect;
         }
     }
 
     fn validate_input(&self, input: &str) -> Result<ValidationResult> {
         if let Some(sql) = input.strip_suffix(';') {
-            let dialect = match dialect_from_str(&self.dialect) {
+            let dialect = match dialect_from_str(self.dialect) {
                 Some(dialect) => dialect,
                 None => {
                     return Ok(ValidationResult::Invalid(Some(format!(
                         "  🤔 Invalid dialect: {}",
                         self.dialect
-                    ))))
+                    ))));
                 }
             };
             let lines = split_from_semicolon(sql);
@@ -97,7 +101,7 @@ impl CliHelper {
 
 impl Default for CliHelper {
     fn default() -> Self {
-        Self::new("generic", false)
+        Self::new(&Dialect::Generic, false)
     }
 }
 
@@ -113,6 +117,15 @@ impl Highlighter for CliHelper {
 
 impl Hinter for CliHelper {
     type Hint = String;
+
+    fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        if line.trim().is_empty() {
+            let suggestion = Color::gray(DEFAULT_HINT_SUGGESTION);
+            Some(suggestion)
+        } else {
+            None
+        }
+    }
 }
 
 /// returns true if the current position is after the open quote for
@@ -120,10 +133,10 @@ impl Hinter for CliHelper {
 fn is_open_quote_for_location(line: &str, pos: usize) -> bool {
     let mut sql = line[..pos].to_string();
     sql.push('\'');
-    if let Ok(stmts) = DFParser::parse_sql(&sql) {
-        if let Some(Statement::CreateExternalTable(_)) = stmts.back() {
-            return true;
-        }
+    if let Ok(stmts) = DFParser::parse_sql(&sql)
+        && let Some(Statement::CreateExternalTable(_)) = stmts.back()
+    {
+        return true;
     }
     false
 }
@@ -289,7 +302,7 @@ mod tests {
         );
 
         // valid in postgresql dialect
-        validator.set_dialect("postgresql");
+        validator.set_dialect(&Dialect::PostgreSQL);
         let result =
             readline_direct(Cursor::new(r"select 1 # 2;".as_bytes()), &validator)?;
         assert!(matches!(result, ValidationResult::Valid(None)));

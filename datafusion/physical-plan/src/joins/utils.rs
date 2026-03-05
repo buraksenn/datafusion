@@ -17,7 +17,7 @@
 
 //! Join related functionality used both on logical and physical plans
 
-use std::cmp::min;
+use std::cmp::{Ordering, min};
 use std::collections::HashSet;
 use std::fmt::{self, Debug};
 use std::future::Future;
@@ -27,7 +27,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::joins::SharedBitmapBuilder;
-use crate::metrics::{self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder};
+use crate::metrics::{
+    self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricType,
+};
 use crate::projection::{ProjectionExec, ProjectionExpr};
 use crate::{
     ColumnStatistics, ExecutionPlan, ExecutionPlanProperties, Partitioning, Statistics,
@@ -39,37 +41,45 @@ pub use crate::joins::{JoinOn, JoinOnRef};
 
 use ahash::RandomState;
 use arrow::array::{
-    builder::UInt64Builder, downcast_array, new_null_array, Array, ArrowPrimitiveType,
-    BooleanBufferBuilder, NativeAdapter, PrimitiveArray, RecordBatch, RecordBatchOptions,
-    UInt32Array, UInt32Builder, UInt64Array,
+    Array, ArrowPrimitiveType, BooleanBufferBuilder, NativeAdapter, PrimitiveArray,
+    RecordBatch, RecordBatchOptions, UInt32Array, UInt32Builder, UInt64Array,
+    builder::UInt64Builder, downcast_array, new_null_array,
 };
-use arrow::array::{ArrayRef, BooleanArray};
+use arrow::array::{
+    ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+    Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array,
+};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::compute::kernels::cmp::eq;
-use arrow::compute::{self, and, take, FilterBuilder};
+use arrow::compute::{self, FilterBuilder, and, take};
 use arrow::datatypes::{
     ArrowNativeType, Field, Schema, SchemaBuilder, UInt32Type, UInt64Type,
 };
 use arrow_ord::cmp::not_distinct;
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType, SortOptions, TimeUnit};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::stats::Precision;
 use datafusion_common::{
-    plan_err, DataFusionError, JoinSide, JoinType, NullEquality, Result, SharedResult,
+    DataFusionError, JoinSide, JoinType, NullEquality, Result, SharedResult,
+    not_impl_err, plan_err,
 };
-use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_expr::Operator;
+use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
-    add_offset_to_expr, add_offset_to_physical_sort_exprs, LexOrdering, PhysicalExpr,
-    PhysicalExprRef,
+    LexOrdering, PhysicalExpr, PhysicalExprRef, add_offset_to_expr,
+    add_offset_to_physical_sort_exprs,
 };
 
 use datafusion_physical_expr_common::datum::compare_op_for_nested;
+use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::future::{BoxFuture, Shared};
-use futures::{ready, FutureExt};
+use futures::{FutureExt, ready};
 use parking_lot::Mutex;
 
 /// Checks whether the schemas "left" and "right" and columns "on" represent a valid join.
@@ -149,20 +159,21 @@ pub fn calculate_join_output_ordering(
     match maintains_input_order {
         [true, false] => {
             // Special case, we can prefix ordering of right side with the ordering of left side.
-            if join_type == JoinType::Inner && probe_side == Some(JoinSide::Left) {
-                if let Some(right_ordering) = right_ordering.cloned() {
-                    let right_offset = add_offset_to_physical_sort_exprs(
-                        right_ordering,
-                        left_columns_len as _,
-                    )?;
-                    return if let Some(left_ordering) = left_ordering {
-                        let mut result = left_ordering.clone();
-                        result.extend(right_offset);
-                        Ok(Some(result))
-                    } else {
-                        Ok(LexOrdering::new(right_offset))
-                    };
-                }
+            if join_type == JoinType::Inner
+                && probe_side == Some(JoinSide::Left)
+                && let Some(right_ordering) = right_ordering.cloned()
+            {
+                let right_offset = add_offset_to_physical_sort_exprs(
+                    right_ordering,
+                    left_columns_len as _,
+                )?;
+                return if let Some(left_ordering) = left_ordering {
+                    let mut result = left_ordering.clone();
+                    result.extend(right_offset);
+                    Ok(Some(result))
+                } else {
+                    Ok(LexOrdering::new(right_offset))
+                };
             }
             Ok(left_ordering.cloned())
         }
@@ -214,7 +225,6 @@ pub struct ColumnIndex {
 
 /// Returns the output field given the input field. Outer joins may
 /// insert nulls even if the input was not null
-///
 fn output_join_field(old_field: &Field, join_type: &JoinType, is_left: bool) -> Field {
     let force_nullable = match join_type {
         JoinType::Inner => false,
@@ -284,7 +294,7 @@ pub fn build_join_schema(
         JoinType::LeftSemi | JoinType::LeftAnti => left_fields().unzip(),
         JoinType::LeftMark => {
             let right_field = once((
-                Field::new("mark", arrow::datatypes::DataType::Boolean, false),
+                Field::new("mark", DataType::Boolean, false),
                 ColumnIndex {
                     index: 0,
                     side: JoinSide::None,
@@ -295,7 +305,7 @@ pub fn build_join_schema(
         JoinType::RightSemi | JoinType::RightAnti => right_fields().unzip(),
         JoinType::RightMark => {
             let left_field = once((
-                Field::new("mark", arrow_schema::DataType::Boolean, false),
+                Field::new("mark", DataType::Boolean, false),
                 ColumnIndex {
                     index: 0,
                     side: JoinSide::None,
@@ -401,15 +411,43 @@ struct PartialJoinStatistics {
     pub column_statistics: Vec<ColumnStatistics>,
 }
 
-/// Estimate the statistics for the given join's output.
+/// Estimates the output statistics for a join operation based on input statistics.
+///
+/// # Statistics Propagation
+///
+/// This function estimates join output statistics using the following approach:
+/// - **Row count estimation**: Uses the `on` parameter (equijoin keys) to estimate
+///   output cardinality via [`estimate_join_cardinality`]. The estimation is based on
+///   column-level statistics (distinct counts, min/max values) of the join keys.
+/// - **Column statistics**: Combines column statistics from both inputs. For join types
+///   that preserve all columns (Inner, Left, Right, Full), statistics from both sides
+///   are concatenated. For semi/anti joins, only the relevant side's statistics are kept.
+/// - **Byte size**: Always returns `Precision::Absent` as join output size is difficult
+///   to estimate without knowing the actual data.
+///
+/// # The `on` Parameter
+///
+/// The `on` parameter represents equijoin keys (e.g., `t1.id = t2.id`). When `on` is
+/// empty (as in NestedLoopJoinExec which handles non-equijoin predicates), the
+/// cardinality estimation cannot compute selectivity from join keys, and this function
+/// returns unknown statistics (`num_rows: Precision::Absent`).
+///
+/// # Limitations
+///
+/// - Does not account for selectivity of arbitrary join filter expressions
+///   (e.g., `(t1.v1 + t2.v1) % 2 = 0`). Such filters, common in NestedLoopJoinExec,
+///   are not factored into the cardinality estimation.
+/// - Column statistics for the output are simply combined from inputs without
+///   adjusting for join selectivity (acknowledged in the code as needing
+///   "filter selectivity analysis").
 pub(crate) fn estimate_join_statistics(
     left_stats: Statistics,
     right_stats: Statistics,
-    on: JoinOn,
+    on: &JoinOn,
     join_type: &JoinType,
     schema: &Schema,
 ) -> Result<Statistics> {
-    let join_stats = estimate_join_cardinality(join_type, left_stats, right_stats, &on);
+    let join_stats = estimate_join_cardinality(join_type, left_stats, right_stats, on);
     let (num_rows, column_statistics) = match join_stats {
         Some(stats) => (Precision::Inexact(stats.num_rows), stats.column_statistics),
         None => (Precision::Absent, Statistics::unknown_column(schema)),
@@ -558,16 +596,26 @@ fn estimate_inner_join_cardinality(
         return Some(estimation);
     };
 
+    let Statistics {
+        num_rows: left_num_rows,
+        column_statistics: left_column_statistics,
+        ..
+    } = left_stats;
+    let Statistics {
+        num_rows: right_num_rows,
+        column_statistics: right_column_statistics,
+        ..
+    } = right_stats;
+
     // The algorithm here is partly based on the non-histogram selectivity estimation
     // from Spark's Catalyst optimizer.
     let mut join_selectivity = Precision::Absent;
-    for (left_stat, right_stat) in left_stats
-        .column_statistics
+    for (left_stat, right_stat) in left_column_statistics
         .iter()
-        .zip(right_stats.column_statistics.iter())
+        .zip(right_column_statistics.iter())
     {
-        let left_max_distinct = max_distinct_count(&left_stats.num_rows, left_stat);
-        let right_max_distinct = max_distinct_count(&right_stats.num_rows, right_stat);
+        let left_max_distinct = max_distinct_count(&left_num_rows, left_stat);
+        let right_max_distinct = max_distinct_count(&right_num_rows, right_stat);
         let max_distinct = left_max_distinct.max(&right_max_distinct);
         if max_distinct.get_value().is_some() {
             // Seems like there are a few implementations of this algorithm that implement
@@ -685,27 +733,25 @@ fn max_distinct_count(
             // Cap the estimate using the number of possible values:
             if let (Some(min), Some(max)) =
                 (stats.min_value.get_value(), stats.max_value.get_value())
-            {
-                if let Some(range_dc) = Interval::try_new(min.clone(), max.clone())
+                && let Some(range_dc) = Interval::try_new(min.clone(), max.clone())
                     .ok()
                     .and_then(|e| e.cardinality())
+            {
+                let range_dc = range_dc as usize;
+                // Note that the `unwrap` calls in the below statement are safe.
+                return if result == Precision::Absent
+                    || &range_dc < result.get_value().unwrap()
                 {
-                    let range_dc = range_dc as usize;
-                    // Note that the `unwrap` calls in the below statement are safe.
-                    return if matches!(result, Precision::Absent)
-                        || &range_dc < result.get_value().unwrap()
+                    if stats.min_value.is_exact().unwrap()
+                        && stats.max_value.is_exact().unwrap()
                     {
-                        if stats.min_value.is_exact().unwrap()
-                            && stats.max_value.is_exact().unwrap()
-                        {
-                            Precision::Exact(range_dc)
-                        } else {
-                            Precision::Inexact(range_dc)
-                        }
+                        Precision::Exact(range_dc)
                     } else {
-                        result
-                    };
-                }
+                        Precision::Inexact(range_dc)
+                    }
+                } else {
+                    result
+                };
             }
 
             result
@@ -812,9 +858,10 @@ pub(crate) fn need_produce_result_in_final(join_type: JoinType) -> bool {
 pub(crate) fn get_final_indices_from_shared_bitmap(
     shared_bitmap: &SharedBitmapBuilder,
     join_type: JoinType,
+    piecewise: bool,
 ) -> (UInt64Array, UInt32Array) {
     let bitmap = shared_bitmap.lock();
-    get_final_indices_from_bit_map(&bitmap, join_type)
+    get_final_indices_from_bit_map(&bitmap, join_type, piecewise)
 }
 
 /// In the end of join execution, need to use bit map of the matched
@@ -829,16 +876,22 @@ pub(crate) fn get_final_indices_from_shared_bitmap(
 pub(crate) fn get_final_indices_from_bit_map(
     left_bit_map: &BooleanBufferBuilder,
     join_type: JoinType,
+    // We add a flag for whether this is being passed from the `PiecewiseMergeJoin`
+    // because the bitmap can be for left + right `JoinType`s
+    piecewise: bool,
 ) -> (UInt64Array, UInt32Array) {
     let left_size = left_bit_map.len();
-    if join_type == JoinType::LeftMark {
+    if join_type == JoinType::LeftMark || (join_type == JoinType::RightMark && piecewise)
+    {
         let left_indices = (0..left_size as u64).collect::<UInt64Array>();
         let right_indices = (0..left_size)
             .map(|idx| left_bit_map.get_bit(idx).then_some(0))
             .collect::<UInt32Array>();
         return (left_indices, right_indices);
     }
-    let left_indices = if join_type == JoinType::LeftSemi {
+    let left_indices = if join_type == JoinType::LeftSemi
+        || (join_type == JoinType::RightSemi && piecewise)
+    {
         (0..left_size)
             .filter_map(|idx| (left_bit_map.get_bit(idx)).then_some(idx as u64))
             .collect::<UInt64Array>()
@@ -924,6 +977,17 @@ pub(crate) fn apply_join_filter_to_indices(
     ))
 }
 
+/// Creates a [RecordBatch] with zero columns but the given row count.
+/// Used when a join has an empty projection (e.g. `SELECT count(1) ...`).
+fn new_empty_schema_batch(schema: &Schema, row_count: usize) -> Result<RecordBatch> {
+    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::new(schema.clone()),
+        vec![],
+        &options,
+    )?)
+}
+
 /// Returns a new [RecordBatch] by combining the `left` and `right` according to `indices`.
 /// The resulting batch has [Schema] `schema`.
 pub(crate) fn build_batch_from_indices(
@@ -936,15 +1000,7 @@ pub(crate) fn build_batch_from_indices(
     build_side: JoinSide,
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
-        let options = RecordBatchOptions::new()
-            .with_match_field_names(true)
-            .with_row_count(Some(build_indices.len()));
-
-        return Ok(RecordBatch::try_new_with_options(
-            Arc::new(schema.clone()),
-            vec![],
-            &options,
-        )?);
+        return new_empty_schema_batch(schema, build_indices.len());
     }
 
     // build the columns of the new [RecordBatch]:
@@ -1004,6 +1060,9 @@ pub(crate) fn build_batch_empty_build_side(
         // the remaining joins will return data for the right columns and null for the left ones
         JoinType::Right | JoinType::Full | JoinType::RightAnti | JoinType::RightMark => {
             let num_rows = probe_batch.num_rows();
+            if schema.fields().is_empty() {
+                return new_empty_schema_batch(schema, num_rows);
+            }
             let mut columns: Vec<Arc<dyn Array>> =
                 Vec::with_capacity(schema.fields().len());
 
@@ -1115,8 +1174,8 @@ pub(crate) fn append_right_indices(
 ) -> Result<(UInt64Array, UInt32Array)> {
     if preserve_order_for_right {
         Ok(append_probe_indices_in_order(
-            left_indices,
-            right_indices,
+            &left_indices,
+            &right_indices,
             adjust_range,
         ))
     } else {
@@ -1260,8 +1319,8 @@ fn build_range_bitmap<T: ArrowPrimitiveType>(
 /// - A `PrimitiveArray` of `UInt64Type` with the newly constructed build indices.
 /// - A `PrimitiveArray` of `UInt32Type` with the newly constructed probe indices.
 fn append_probe_indices_in_order(
-    build_indices: PrimitiveArray<UInt64Type>,
-    probe_indices: PrimitiveArray<UInt32Type>,
+    build_indices: &PrimitiveArray<UInt64Type>,
+    probe_indices: &PrimitiveArray<UInt32Type>,
     range: Range<usize>,
 ) -> (PrimitiveArray<UInt64Type>, PrimitiveArray<UInt32Type>) {
     // Builders for new indices:
@@ -1314,8 +1373,10 @@ pub(crate) struct BuildProbeJoinMetrics {
     pub(crate) input_batches: metrics::Count,
     /// Number of rows consumed by probe-side this operator
     pub(crate) input_rows: metrics::Count,
-    /// Number of batches produced by this operator
-    pub(crate) output_batches: metrics::Count,
+    /// Fraction of probe rows that found more than one match
+    pub(crate) probe_hit_rate: metrics::RatioMetrics,
+    /// Average number of build matches per matched probe row
+    pub(crate) avg_fanout: metrics::RatioMetrics,
 }
 
 // This Drop implementation updates the elapsed compute part of the metrics.
@@ -1359,8 +1420,13 @@ impl BuildProbeJoinMetrics {
 
         let input_rows = MetricBuilder::new(metrics).counter("input_rows", partition);
 
-        let output_batches =
-            MetricBuilder::new(metrics).counter("output_batches", partition);
+        let probe_hit_rate = MetricBuilder::new(metrics)
+            .with_type(MetricType::SUMMARY)
+            .ratio_metrics("probe_hit_rate", partition);
+
+        let avg_fanout = MetricBuilder::new(metrics)
+            .with_type(MetricType::SUMMARY)
+            .ratio_metrics("avg_fanout", partition);
 
         Self {
             build_time,
@@ -1370,8 +1436,9 @@ impl BuildProbeJoinMetrics {
             join_time,
             input_batches,
             input_rows,
-            output_batches,
             baseline,
+            probe_hit_rate,
+            avg_fanout,
         }
     }
 }
@@ -1613,7 +1680,7 @@ fn swap_reverting_projection(
 pub fn swap_join_projection(
     left_schema_len: usize,
     right_schema_len: usize,
-    projection: Option<&Vec<usize>>,
+    projection: Option<&[usize]>,
     join_type: &JoinType,
 ) -> Option<Vec<usize>> {
     match join_type {
@@ -1624,7 +1691,7 @@ pub fn swap_join_projection(
         | JoinType::RightAnti
         | JoinType::RightSemi
         | JoinType::LeftMark
-        | JoinType::RightMark => projection.cloned(),
+        | JoinType::RightMark => projection.map(|p| p.to_vec()),
         _ => projection.map(|p| {
             p.iter()
                 .map(|i| {
@@ -1649,22 +1716,19 @@ pub fn swap_join_projection(
 /// `fifo_hashmap` sets the order of iteration over `batch` rows while updating hashmap,
 /// which allows to keep either first (if set to true) or last (if set to false) row index
 /// as a chain head for rows with equal hash values.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn update_hash(
     on: &[PhysicalExprRef],
     batch: &RecordBatch,
     hash_map: &mut dyn JoinHashMapType,
     offset: usize,
     random_state: &RandomState,
-    hashes_buffer: &mut Vec<u64>,
+    hashes_buffer: &mut [u64],
     deleted_offset: usize,
     fifo_hashmap: bool,
 ) -> Result<()> {
     // evaluate the keys
-    let keys_values = on
-        .iter()
-        .map(|c| c.evaluate(batch)?.into_array(batch.num_rows()))
-        .collect::<Result<Vec<_>>>()?;
+    let keys_values = evaluate_expressions_to_arrays(on, batch)?;
 
     // calculate the hash values
     let hash_values = create_hashes(&keys_values, random_state, hashes_buffer)?;
@@ -1749,6 +1813,99 @@ fn eq_dyn_null(
     }
 }
 
+/// Get comparison result of two rows of join arrays
+pub fn compare_join_arrays(
+    left_arrays: &[ArrayRef],
+    left: usize,
+    right_arrays: &[ArrayRef],
+    right: usize,
+    sort_options: &[SortOptions],
+    null_equality: NullEquality,
+) -> Result<Ordering> {
+    let mut res = Ordering::Equal;
+    for ((left_array, right_array), sort_options) in
+        left_arrays.iter().zip(right_arrays).zip(sort_options)
+    {
+        macro_rules! compare_value {
+            ($T:ty) => {{
+                let left_array = left_array.as_any().downcast_ref::<$T>().unwrap();
+                let right_array = right_array.as_any().downcast_ref::<$T>().unwrap();
+                match (left_array.is_null(left), right_array.is_null(right)) {
+                    (false, false) => {
+                        let left_value = &left_array.value(left);
+                        let right_value = &right_array.value(right);
+                        res = left_value.partial_cmp(right_value).unwrap();
+                        if sort_options.descending {
+                            res = res.reverse();
+                        }
+                    }
+                    (true, false) => {
+                        res = if sort_options.nulls_first {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        };
+                    }
+                    (false, true) => {
+                        res = if sort_options.nulls_first {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        };
+                    }
+                    _ => {
+                        res = match null_equality {
+                            NullEquality::NullEqualsNothing => Ordering::Less,
+                            NullEquality::NullEqualsNull => Ordering::Equal,
+                        };
+                    }
+                }
+            }};
+        }
+
+        match left_array.data_type() {
+            DataType::Null => {}
+            DataType::Boolean => compare_value!(BooleanArray),
+            DataType::Int8 => compare_value!(Int8Array),
+            DataType::Int16 => compare_value!(Int16Array),
+            DataType::Int32 => compare_value!(Int32Array),
+            DataType::Int64 => compare_value!(Int64Array),
+            DataType::UInt8 => compare_value!(UInt8Array),
+            DataType::UInt16 => compare_value!(UInt16Array),
+            DataType::UInt32 => compare_value!(UInt32Array),
+            DataType::UInt64 => compare_value!(UInt64Array),
+            DataType::Float32 => compare_value!(Float32Array),
+            DataType::Float64 => compare_value!(Float64Array),
+            DataType::Binary => compare_value!(BinaryArray),
+            DataType::BinaryView => compare_value!(BinaryViewArray),
+            DataType::FixedSizeBinary(_) => compare_value!(FixedSizeBinaryArray),
+            DataType::LargeBinary => compare_value!(LargeBinaryArray),
+            DataType::Utf8 => compare_value!(StringArray),
+            DataType::Utf8View => compare_value!(StringViewArray),
+            DataType::LargeUtf8 => compare_value!(LargeStringArray),
+            DataType::Decimal128(..) => compare_value!(Decimal128Array),
+            DataType::Timestamp(time_unit, None) => match time_unit {
+                TimeUnit::Second => compare_value!(TimestampSecondArray),
+                TimeUnit::Millisecond => compare_value!(TimestampMillisecondArray),
+                TimeUnit::Microsecond => compare_value!(TimestampMicrosecondArray),
+                TimeUnit::Nanosecond => compare_value!(TimestampNanosecondArray),
+            },
+            DataType::Date32 => compare_value!(Date32Array),
+            DataType::Date64 => compare_value!(Date64Array),
+            dt => {
+                return not_impl_err!(
+                    "Unsupported data type in sort merge join comparator: {}",
+                    dt
+                );
+            }
+        }
+        if !res.is_eq() {
+            break;
+        }
+    }
+    Ok(res)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1760,7 +1917,7 @@ mod tests {
     use arrow::datatypes::{DataType, Fields};
     use arrow::error::{ArrowError, Result as ArrowResult};
     use datafusion_common::stats::Precision::{Absent, Exact, Inexact};
-    use datafusion_common::{arrow_datafusion_err, arrow_err, ScalarValue};
+    use datafusion_common::{ScalarValue, arrow_datafusion_err, arrow_err};
     use datafusion_physical_expr::PhysicalSortExpr;
 
     use rstest::rstest;
@@ -1960,6 +2117,7 @@ mod tests {
             max_value: max.map(ScalarValue::from),
             sum_value: Absent,
             null_count,
+            byte_size: Absent,
         }
     }
 
@@ -2544,18 +2702,21 @@ mod tests {
             &JoinType::LeftSemi,
             Statistics {
                 num_rows: Inexact(500),
-                total_byte_size: Absent,
+                    total_byte_size: Absent,
                 column_statistics: dummy_column_stats.clone(),
             },
             Statistics {
                 num_rows: Absent,
-                total_byte_size: Absent,
+                    total_byte_size: Absent,
                 column_statistics: dummy_column_stats.clone(),
             },
             &join_on,
         ).expect("Expected non-empty PartialJoinStatistics for SemiJoin with absent inner num_rows");
 
-        assert_eq!(absent_inner_estimation.num_rows, 500, "Expected outer.num_rows estimated SemiJoin cardinality for absent inner num_rows");
+        assert_eq!(
+            absent_inner_estimation.num_rows, 500,
+            "Expected outer.num_rows estimated SemiJoin cardinality for absent inner num_rows"
+        );
 
         let absent_inner_estimation = estimate_join_cardinality(
             &JoinType::LeftSemi,
@@ -2571,7 +2732,10 @@ mod tests {
             },
             &join_on,
         );
-        assert!(absent_inner_estimation.is_none(), "Expected \"None\" estimated SemiJoin cardinality for absent outer and inner num_rows");
+        assert!(
+            absent_inner_estimation.is_none(),
+            "Expected \"None\" estimated SemiJoin cardinality for absent outer and inner num_rows"
+        );
 
         Ok(())
     }
@@ -2728,6 +2892,37 @@ mod tests {
             join_schema.metadata(),
             &HashMap::from([("key".to_string(), "right".to_string())])
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_batch_empty_build_side_empty_schema() -> Result<()> {
+        // When the output schema has no fields (empty projection pushed into
+        // the join), build_batch_empty_build_side should return a RecordBatch
+        // with the correct row count but no columns.
+        let empty_schema = Schema::empty();
+
+        let build_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)])),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]))],
+        )?;
+
+        let probe_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, true)])),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![4, 5, 6, 7]))],
+        )?;
+
+        let result = build_batch_empty_build_side(
+            &empty_schema,
+            &build_batch,
+            &probe_batch,
+            &[], // no column indices with empty projection
+            JoinType::Right,
+        )?;
+
+        assert_eq!(result.num_rows(), 4);
+        assert_eq!(result.num_columns(), 0);
 
         Ok(())
     }

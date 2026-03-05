@@ -28,8 +28,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{internal_err, plan_err, Result};
+use datafusion_common::{Result, internal_err, plan_err};
 use datafusion_expr::ColumnarValue;
+use datafusion_expr_common::placement::ExpressionPlacement;
 
 /// Represents the column at a given index in a RecordBatch
 ///
@@ -49,9 +50,9 @@ use datafusion_expr::ColumnarValue;
 /// # use arrow::datatypes::{DataType, Field, Schema};
 /// // Schema with columns a, b, c
 /// let schema = Schema::new(vec![
-///    Field::new("a", DataType::Int32, false),
-///    Field::new("b", DataType::Int32, false),
-///    Field::new("c", DataType::Int32, false),
+///     Field::new("a", DataType::Int32, false),
+///     Field::new("b", DataType::Int32, false),
+///     Field::new("c", DataType::Int32, false),
 /// ]);
 ///
 /// // reference to column b is index 1
@@ -146,6 +147,10 @@ impl PhysicalExpr for Column {
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name)
     }
+
+    fn placement(&self) -> ExpressionPlacement {
+        ExpressionPlacement::Column
+    }
 }
 
 impl Column {
@@ -158,7 +163,11 @@ impl Column {
                 self.name,
                 self.index,
                 input_schema.fields.len(),
-                input_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+                input_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect::<Vec<_>>()
             )
         }
     }

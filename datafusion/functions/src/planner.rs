@@ -19,13 +19,13 @@
 
 use datafusion_common::Result;
 use datafusion_expr::{
+    Expr,
     expr::ScalarFunction,
     planner::{ExprPlanner, PlannerResult},
-    Expr,
 };
 
 #[deprecated(
-    since = "0.50.0",
+    since = "50.0.0",
     note = "Use UnicodeFunctionPlanner and DateTimeFunctionPlanner instead"
 )]
 #[derive(Default, Debug)]

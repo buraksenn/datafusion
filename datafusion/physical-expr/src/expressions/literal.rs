@@ -28,11 +28,12 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::expr::FieldMetadata;
 use datafusion_expr::Expr;
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
+use datafusion_expr_common::placement::ExpressionPlacement;
 use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
 
 /// Represents a literal value
@@ -134,9 +135,14 @@ impl PhysicalExpr for Literal {
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }
+
+    fn placement(&self) -> ExpressionPlacement {
+        ExpressionPlacement::Literal
+    }
 }
 
 /// Create a literal expression
+#[expect(clippy::needless_pass_by_value)]
 pub fn lit<T: datafusion_expr::Literal>(value: T) -> Arc<dyn PhysicalExpr> {
     match value.lit() {
         Expr::Literal(v, _) => Arc::new(Literal::new(v)),

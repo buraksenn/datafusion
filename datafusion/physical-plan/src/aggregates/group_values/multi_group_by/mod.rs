@@ -20,28 +20,28 @@
 mod boolean;
 mod bytes;
 pub mod bytes_view;
-mod primitive;
+pub mod primitive;
 
 use std::mem::{self, size_of};
 
+use crate::aggregates::group_values::GroupValues;
 use crate::aggregates::group_values::multi_group_by::{
     boolean::BooleanGroupValueBuilder, bytes::ByteGroupValueBuilder,
     bytes_view::ByteViewGroupValueBuilder, primitive::PrimitiveGroupValueBuilder,
 };
-use crate::aggregates::group_values::GroupValues;
 use ahash::RandomState;
-use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::array::{Array, ArrayRef};
 use arrow::compute::cast;
 use arrow::datatypes::{
     BinaryViewType, DataType, Date32Type, Date64Type, Decimal128Type, Float32Type,
-    Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Schema, SchemaRef,
+    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
     StringViewType, Time32MillisecondType, Time32SecondType, Time64MicrosecondType,
     Time64NanosecondType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
-    TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type,
-    UInt8Type,
+    TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
+    UInt64Type,
 };
 use datafusion_common::hash_utils::create_hashes;
-use datafusion_common::{internal_datafusion_err, not_impl_err, Result};
+use datafusion_common::{Result, internal_datafusion_err, not_impl_err};
 use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
 use datafusion_expr::EmitTo;
 use datafusion_physical_expr::binary_map::OutputType;
@@ -77,7 +77,6 @@ pub trait GroupColumn: Send + Sync {
     ///
     /// And if found nth result in `equal_to_results` is already
     /// `false`, the check for nth row will be skipped.
-    ///
     fn vectorized_equal_to(
         &self,
         lhs_rows: &[usize],
@@ -137,7 +136,6 @@ pub fn nulls_equal_to(lhs_null: bool, rhs_null: bool) -> Option<bool> {
 ///   +---------------------+---------------------------------------------+
 ///
 /// `inlined flag`: 1 represents `non-inlined`, and 0 represents `inlined`
-///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GroupIndexView(u64);
 
@@ -166,7 +164,6 @@ impl GroupIndexView {
 
 /// A [`GroupValues`] that stores multiple columns of group values,
 /// and supports vectorized operators for them
-///
 pub struct GroupValuesColumn<const STREAMING: bool> {
     /// The output schema
     schema: SchemaRef,
@@ -184,7 +181,6 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     /// instead we store the `group indices` pointing to values in `GroupValues`.
     /// And we use [`GroupIndexView`] to represent such `group indices` in table.
     ///
-    ///
     map: HashTable<(u64, GroupIndexView)>,
 
     /// The size of `map` in bytes
@@ -197,7 +193,6 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     ///
     /// The chained indices is like:
     ///   `latest group index -> older group index -> even older group index -> ...`
-    ///
     group_index_lists: Vec<Vec<usize>>,
 
     /// When emitting first n, we need to decrease/erase group indices in
@@ -323,7 +318,6 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     ///
     /// `Group indices` order are against with their input order, and this will lead to error
     /// in `streaming aggregation`.
-    ///
     fn scalarized_intern(
         &mut self,
         cols: &[ArrayRef],
@@ -425,7 +419,6 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     ///
     /// The vectorized approach can offer higher performance for avoiding row by row
     /// downcast for `cols` and being able to implement even more optimizations(like simd).
-    ///
     fn vectorized_intern(
         &mut self,
         cols: &[ArrayRef],
@@ -493,7 +486,6 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     ///   - Check if the `group index view` is `inlined` or `non_inlined`:
     ///     If it is inlined, add to `vectorized_equal_to_group_indices` directly.
     ///     Otherwise get all group indices from `group_index_lists`, and add them.
-    ///
     fn collect_vectorized_process_context(
         &mut self,
         batch_hashes: &[u64],
@@ -548,14 +540,13 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                 // into `vectorized_equal_to_row_indices` and `vectorized_equal_to_group_indices`.
                 let list_offset = group_index_view.value() as usize;
                 let group_index_list = &self.group_index_lists[list_offset];
-                for &group_index in group_index_list {
-                    self.vectorized_operation_buffers
-                        .equal_to_row_indices
-                        .push(row);
-                    self.vectorized_operation_buffers
-                        .equal_to_group_indices
-                        .push(group_index);
-                }
+
+                self.vectorized_operation_buffers
+                    .equal_to_group_indices
+                    .extend_from_slice(group_index_list);
+                self.vectorized_operation_buffers
+                    .equal_to_row_indices
+                    .extend(std::iter::repeat_n(row, group_index_list.len()));
             } else {
                 let group_index = group_index_view.value() as usize;
                 self.vectorized_operation_buffers
@@ -721,7 +712,6 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
     /// The hash collision may be not frequent, so the fallback will indeed hardly happen.
     /// In most situations, `scalarized_indices` will found to be empty after finishing to
     /// preform `vectorized_equal_to`.
-    ///
     fn scalarized_intern_remaining(
         &mut self,
         cols: &[ArrayRef],
@@ -886,7 +876,6 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
 /// `$v`: the vector to push the new builder into
 /// `$nullable`: whether the input can contains nulls
 /// `$t`: the primitive type of the builder
-///
 macro_rules! instantiate_primitive {
     ($v:expr, $nullable:expr, $t:ty, $data_type:ident) => {
         if $nullable {
@@ -1058,7 +1047,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                         }
                     }
                     dt => {
-                        return not_impl_err!("{dt} not supported in GroupValuesColumn")
+                        return not_impl_err!("{dt} not supported in GroupValuesColumn");
                     }
                 }
             }
@@ -1191,14 +1180,13 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         Ok(output)
     }
 
-    fn clear_shrink(&mut self, batch: &RecordBatch) {
-        let count = batch.num_rows();
+    fn clear_shrink(&mut self, num_rows: usize) {
         self.group_values.clear();
         self.map.clear();
-        self.map.shrink_to(count, |_| 0); // hasher does not matter since the map is cleared
+        self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
         self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
         self.hashes_buffer.clear();
-        self.hashes_buffer.shrink_to(count);
+        self.hashes_buffer.shrink_to(num_rows);
 
         // Such structures are only used in `non-streaming` case
         if !STREAMING {
@@ -1250,6 +1238,16 @@ fn supported_type(data_type: &DataType) -> bool {
     )
 }
 
+///Shows how many `null`s there are in an array
+enum Nulls {
+    /// All array items are `null`s
+    All,
+    /// There are both `null`s and non-`null`s in the array items
+    Some,
+    /// There are no `null`s in the array items
+    None,
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -1261,7 +1259,7 @@ mod tests {
     use datafusion_expr::EmitTo;
 
     use crate::aggregates::group_values::{
-        multi_group_by::GroupValuesColumn, GroupValues,
+        GroupValues, multi_group_by::GroupValuesColumn,
     };
 
     use super::GroupIndexView;
@@ -1458,7 +1456,6 @@ mod tests {
     ///   - Group not exist + bucket not found in `map`
     ///   - Group not exist + not equal to inlined group view(tested in hash collision)
     ///   - Group not exist + not equal to non-inlined group view(tested in hash collision)
-    ///
     struct VectorizedTestDataSet {
         test_batches: Vec<Vec<ArrayRef>>,
         expected_batch: RecordBatch,

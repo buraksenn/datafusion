@@ -16,15 +16,15 @@
 // under the License.
 
 use crate::fuzz_cases::equivalence::utils::{
-    apply_projection, create_random_schema, generate_table_for_eq_properties,
-    is_table_same_after_sort, TestScalarUDF,
+    TestScalarUDF, apply_projection, create_random_schema,
+    generate_table_for_eq_properties, is_table_same_after_sort,
 };
 use arrow::compute::SortOptions;
-use datafusion_common::config::ConfigOptions;
 use datafusion_common::Result;
+use datafusion_common::config::ConfigOptions;
 use datafusion_expr::{Operator, ScalarUDF};
 use datafusion_physical_expr::equivalence::ProjectionMapping;
-use datafusion_physical_expr::expressions::{col, BinaryExpr};
+use datafusion_physical_expr::expressions::{BinaryExpr, col};
 use datafusion_physical_expr::{PhysicalExprRef, ScalarFunctionExpr};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
@@ -58,7 +58,7 @@ fn project_orderings_random() -> Result<()> {
             Operator::Plus,
             col("b", &test_schema)?,
         )) as Arc<dyn PhysicalExpr>;
-        let proj_exprs = vec![
+        let proj_exprs = [
             (col("a", &test_schema)?, "a_new"),
             (col("b", &test_schema)?, "b_new"),
             (col("c", &test_schema)?, "c_new"),
@@ -132,7 +132,7 @@ fn ordering_satisfy_after_projection_random() -> Result<()> {
             Operator::Plus,
             col("b", &test_schema)?,
         )) as Arc<dyn PhysicalExpr>;
-        let proj_exprs = vec![
+        let proj_exprs = [
             (col("a", &test_schema)?, "a_new"),
             (col("b", &test_schema)?, "b_new"),
             (col("c", &test_schema)?, "c_new"),

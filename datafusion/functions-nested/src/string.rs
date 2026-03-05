@@ -19,22 +19,22 @@
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, GenericListArray,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, ListBuilder,
-    OffsetSizeTrait, StringArray, StringBuilder, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, ListBuilder,
+    OffsetSizeTrait, StringArray, StringBuilder, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::datatypes::{DataType, Field};
 
 use datafusion_common::utils::ListCoercion;
-use datafusion_common::{not_impl_err, DataFusionError, Result};
+use datafusion_common::{DataFusionError, Result, not_impl_err};
 
 use std::any::Any;
 
 use crate::utils::make_scalar_function;
 use arrow::array::{
+    GenericStringArray, StringArrayType, StringViewArray,
     builder::{ArrayBuilder, LargeStringBuilder, StringViewBuilder},
     cast::AsArray,
-    GenericStringArray, StringArrayType, StringViewArray,
 };
 use arrow::compute::cast;
 use arrow::datatypes::DataType::{
@@ -329,8 +329,7 @@ impl ScalarUDFImpl for StringToArray {
     }
 }
 
-/// Array_to_string SQL function
-pub(super) fn array_to_string_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
+fn array_to_string_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
     if args.len() < 2 || args.len() > 3 {
         return exec_err!("array_to_string expects two or three arguments");
     }
@@ -341,55 +340,73 @@ pub(super) fn array_to_string_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
         Utf8 => args[1].as_string::<i32>().iter().collect(),
         Utf8View => args[1].as_string_view().iter().collect(),
         LargeUtf8 => args[1].as_string::<i64>().iter().collect(),
-        other => return exec_err!("unsupported type for second argument to array_to_string function as {other:?}")
+        other => {
+            return exec_err!(
+                "unsupported type for second argument to array_to_string function as {other:?}"
+            );
+        }
     };
 
-    let mut null_string = String::from("");
-    let mut with_null_string = false;
-    if args.len() == 3 {
-        null_string = match args[2].data_type() {
-            Utf8 => args[2].as_string::<i32>().value(0).to_string(),
-            Utf8View => args[2].as_string_view().value(0).to_string(),
-            LargeUtf8 => args[2].as_string::<i64>().value(0).to_string(),
-            other => return exec_err!("unsupported type for second argument to array_to_string function as {other:?}")
-        };
-        with_null_string = true;
-    }
+    let null_strings = if args.len() == 3 {
+        Some(match args[2].data_type() {
+            Utf8 => args[2].as_string::<i32>().iter().collect(),
+            Utf8View => args[2].as_string_view().iter().collect(),
+            LargeUtf8 => args[2].as_string::<i64>().iter().collect(),
+            other => {
+                return exec_err!(
+                    "unsupported type for third argument to array_to_string function as {other:?}"
+                );
+            }
+        })
+    } else {
+        None
+    };
 
     /// Creates a single string from single element of a ListArray (which is
     /// itself another Array)
-    fn compute_array_to_string(
-        arg: &mut String,
-        arr: ArrayRef,
+    fn compute_array_to_string<'a>(
+        arg: &'a mut String,
+        arr: &ArrayRef,
         delimiter: String,
         null_string: String,
         with_null_string: bool,
-    ) -> Result<&mut String> {
+    ) -> Result<&'a mut String> {
         match arr.data_type() {
             List(..) => {
                 let list_array = as_list_array(&arr)?;
                 for i in 0..list_array.len() {
-                    compute_array_to_string(
-                        arg,
-                        list_array.value(i),
-                        delimiter.clone(),
-                        null_string.clone(),
-                        with_null_string,
-                    )?;
+                    if !list_array.is_null(i) {
+                        compute_array_to_string(
+                            arg,
+                            &list_array.value(i),
+                            delimiter.clone(),
+                            null_string.clone(),
+                            with_null_string,
+                        )?;
+                    } else if with_null_string {
+                        arg.push_str(&null_string);
+                        arg.push_str(&delimiter);
+                    }
                 }
 
                 Ok(arg)
             }
             FixedSizeList(..) => {
                 let list_array = as_fixed_size_list_array(&arr)?;
+
                 for i in 0..list_array.len() {
-                    compute_array_to_string(
-                        arg,
-                        list_array.value(i),
-                        delimiter.clone(),
-                        null_string.clone(),
-                        with_null_string,
-                    )?;
+                    if !list_array.is_null(i) {
+                        compute_array_to_string(
+                            arg,
+                            &list_array.value(i),
+                            delimiter.clone(),
+                            null_string.clone(),
+                            with_null_string,
+                        )?;
+                    } else if with_null_string {
+                        arg.push_str(&null_string);
+                        arg.push_str(&delimiter);
+                    }
                 }
 
                 Ok(arg)
@@ -397,13 +414,18 @@ pub(super) fn array_to_string_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
             LargeList(..) => {
                 let list_array = as_large_list_array(&arr)?;
                 for i in 0..list_array.len() {
-                    compute_array_to_string(
-                        arg,
-                        list_array.value(i),
-                        delimiter.clone(),
-                        null_string.clone(),
-                        with_null_string,
-                    )?;
+                    if !list_array.is_null(i) {
+                        compute_array_to_string(
+                            arg,
+                            &list_array.value(i),
+                            delimiter.clone(),
+                            null_string.clone(),
+                            with_null_string,
+                        )?;
+                    } else if with_null_string {
+                        arg.push_str(&null_string);
+                        arg.push_str(&delimiter);
+                    }
                 }
 
                 Ok(arg)
@@ -418,7 +440,7 @@ pub(super) fn array_to_string_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
                 })?;
                 compute_array_to_string(
                     arg,
-                    values,
+                    &values,
                     delimiter,
                     null_string,
                     with_null_string,
@@ -445,19 +467,25 @@ pub(super) fn array_to_string_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
 
     fn generate_string_array<O: OffsetSizeTrait>(
         list_arr: &GenericListArray<O>,
-        delimiters: Vec<Option<&str>>,
-        null_string: String,
-        with_null_string: bool,
+        delimiters: &[Option<&str>],
+        null_strings: &Option<Vec<Option<&str>>>,
     ) -> Result<StringArray> {
         let mut res: Vec<Option<String>> = Vec::new();
-        for (arr, &delimiter) in list_arr.iter().zip(delimiters.iter()) {
+        for (i, (arr, &delimiter)) in list_arr.iter().zip(delimiters.iter()).enumerate() {
             if let (Some(arr), Some(delimiter)) = (arr, delimiter) {
+                let (null_string, with_null_string) = match null_strings {
+                    Some(ns) => match ns[i] {
+                        Some(s) => (s.to_string(), true),
+                        None => (String::new(), false),
+                    },
+                    None => (String::new(), false),
+                };
                 let mut arg = String::from("");
                 let s = compute_array_to_string(
                     &mut arg,
-                    arr,
+                    &arr,
                     delimiter.to_string(),
-                    null_string.clone(),
+                    null_string,
                     with_null_string,
                 )?
                 .clone();
@@ -478,21 +506,11 @@ pub(super) fn array_to_string_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
     let string_arr = match arr.data_type() {
         List(_) => {
             let list_array = as_list_array(&arr)?;
-            generate_string_array::<i32>(
-                list_array,
-                delimiters,
-                null_string,
-                with_null_string,
-            )?
+            generate_string_array::<i32>(list_array, &delimiters, &null_strings)?
         }
         LargeList(_) => {
             let list_array = as_large_list_array(&arr)?;
-            generate_string_array::<i64>(
-                list_array,
-                delimiters,
-                null_string,
-                with_null_string,
-            )?
+            generate_string_array::<i64>(list_array, &delimiters, &null_strings)?
         }
         // Signature guards against this arm
         _ => return exec_err!("array_to_string expects list as first argument"),
@@ -512,26 +530,46 @@ fn string_to_array_inner<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayR
     match args[0].data_type() {
         Utf8 => {
             let string_array = args[0].as_string::<T>();
-            let builder = StringBuilder::with_capacity(string_array.len(), string_array.get_buffer_memory_size());
-            string_to_array_inner_2::<&GenericStringArray<T>, StringBuilder>(args, string_array, builder)
+            let builder = StringBuilder::with_capacity(
+                string_array.len(),
+                string_array.get_buffer_memory_size(),
+            );
+            string_to_array_inner_2::<&GenericStringArray<T>, StringBuilder>(
+                args,
+                &string_array,
+                builder,
+            )
         }
         Utf8View => {
             let string_array = args[0].as_string_view();
             let builder = StringViewBuilder::with_capacity(string_array.len());
-            string_to_array_inner_2::<&StringViewArray, StringViewBuilder>(args, string_array, builder)
+            string_to_array_inner_2::<&StringViewArray, StringViewBuilder>(
+                args,
+                &string_array,
+                builder,
+            )
         }
         LargeUtf8 => {
             let string_array = args[0].as_string::<T>();
-            let builder = LargeStringBuilder::with_capacity(string_array.len(), string_array.get_buffer_memory_size());
-            string_to_array_inner_2::<&GenericStringArray<T>, LargeStringBuilder>(args, string_array, builder)
+            let builder = LargeStringBuilder::with_capacity(
+                string_array.len(),
+                string_array.get_buffer_memory_size(),
+            );
+            string_to_array_inner_2::<&GenericStringArray<T>, LargeStringBuilder>(
+                args,
+                &string_array,
+                builder,
+            )
         }
-        other =>  exec_err!("unsupported type for first argument to string_to_array function as {other:?}")
+        other => exec_err!(
+            "unsupported type for first argument to string_to_array function as {other:?}"
+        ),
     }
 }
 
 fn string_to_array_inner_2<'a, StringArrType, StringBuilderType>(
     args: &'a [ArrayRef],
-    string_array: StringArrType,
+    string_array: &StringArrType,
     string_builder: StringBuilderType,
 ) -> Result<ArrayRef>
 where
@@ -547,11 +585,13 @@ where
                     &GenericStringArray<i32>,
                     &StringViewArray,
                     StringBuilderType,
-                >(string_array, delimiter_array, None, string_builder)
+                >(string_array, &delimiter_array, None, string_builder)
             } else {
-                string_to_array_inner_3::<StringArrType,
+                string_to_array_inner_3::<
+                    StringArrType,
                     &GenericStringArray<i32>,
-                    StringBuilderType>(args, string_array, delimiter_array, string_builder)
+                    StringBuilderType,
+                >(args, string_array, &delimiter_array, string_builder)
             }
         }
         Utf8View => {
@@ -563,11 +603,13 @@ where
                     &StringViewArray,
                     &StringViewArray,
                     StringBuilderType,
-                >(string_array, delimiter_array, None, string_builder)
+                >(string_array, &delimiter_array, None, string_builder)
             } else {
-                string_to_array_inner_3::<StringArrType,
+                string_to_array_inner_3::<
+                    StringArrType,
                     &StringViewArray,
-                    StringBuilderType>(args, string_array, delimiter_array, string_builder)
+                    StringBuilderType,
+                >(args, string_array, &delimiter_array, string_builder)
             }
         }
         LargeUtf8 => {
@@ -578,21 +620,25 @@ where
                     &GenericStringArray<i64>,
                     &StringViewArray,
                     StringBuilderType,
-                >(string_array, delimiter_array, None, string_builder)
+                >(string_array, &delimiter_array, None, string_builder)
             } else {
-                string_to_array_inner_3::<StringArrType,
+                string_to_array_inner_3::<
+                    StringArrType,
                     &GenericStringArray<i64>,
-                    StringBuilderType>(args, string_array, delimiter_array, string_builder)
+                    StringBuilderType,
+                >(args, string_array, &delimiter_array, string_builder)
             }
         }
-        other =>  exec_err!("unsupported type for second argument to string_to_array function as {other:?}")
+        other => exec_err!(
+            "unsupported type for second argument to string_to_array function as {other:?}"
+        ),
     }
 }
 
 fn string_to_array_inner_3<'a, StringArrType, DelimiterArrType, StringBuilderType>(
     args: &'a [ArrayRef],
-    string_array: StringArrType,
-    delimiter_array: DelimiterArrType,
+    string_array: &StringArrType,
+    delimiter_array: &DelimiterArrType,
     string_builder: StringBuilderType,
 ) -> Result<ArrayRef>
 where
@@ -656,8 +702,8 @@ fn string_to_array_impl<
     NullValueArrType,
     StringBuilderType,
 >(
-    string_array: StringArrType,
-    delimiter_array: DelimiterArrType,
+    string_array: &StringArrType,
+    delimiter_array: &DelimiterArrType,
     null_value_array: Option<NullValueArrType>,
     string_builder: StringBuilderType,
 ) -> Result<ArrayRef>

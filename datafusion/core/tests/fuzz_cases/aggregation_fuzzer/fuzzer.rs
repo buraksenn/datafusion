@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
-use datafusion_common::{internal_datafusion_err, Result};
+use datafusion_common::{Result, internal_datafusion_err};
 use datafusion_common_runtime::JoinSet;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 
 use crate::fuzz_cases::aggregation_fuzzer::query_builder::QueryBuilder;
 use crate::fuzz_cases::aggregation_fuzzer::{
@@ -253,7 +253,6 @@ impl AggregationFuzzer {
 ///
 ///   - `dataset_ref`, the input dataset, store it for error reported when found
 ///     the inconsistency between the one for `ctx` and `expected results`.
-///
 struct AggregationFuzzTestTask {
     /// Generated session context in current test case
     ctx_with_params: SessionContextWithParams,

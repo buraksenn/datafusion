@@ -16,10 +16,10 @@
 // under the License.
 
 use arrow::datatypes::{DataType, Field, FieldRef};
-use datafusion_common::{exec_err, internal_err, plan_err, Result};
+use datafusion_common::{Result, exec_err, internal_err, plan_err};
 use datafusion_expr::binary::try_type_union_resolution;
 use datafusion_expr::conditional_expressions::CaseBuilder;
-use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyInfo};
+use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion_expr::{
     ColumnarValue, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs,
 };
@@ -47,7 +47,7 @@ use std::any::Any;
 )]
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct CoalesceFunc {
-    signature: Signature,
+    pub(super) signature: Signature,
 }
 
 impl Default for CoalesceFunc {
@@ -97,7 +97,7 @@ impl ScalarUDFImpl for CoalesceFunc {
     fn simplify(
         &self,
         args: Vec<Expr>,
-        _info: &dyn SimplifyInfo,
+        _info: &SimplifyContext,
     ) -> Result<ExprSimplifyResult> {
         if args.is_empty() {
             return plan_err!("coalesce must have at least one argument");
@@ -124,6 +124,15 @@ impl ScalarUDFImpl for CoalesceFunc {
     /// coalesce evaluates to the first value which is not NULL
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         internal_err!("coalesce should have been simplified to case")
+    }
+
+    fn conditional_arguments<'a>(
+        &self,
+        args: &'a [Expr],
+    ) -> Option<(Vec<&'a Expr>, Vec<&'a Expr>)> {
+        let eager = vec![&args[0]];
+        let lazy = args[1..].iter().collect();
+        Some((eager, lazy))
     }
 
     fn short_circuits(&self) -> bool {

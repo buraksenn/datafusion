@@ -15,17 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-extern crate criterion;
-
 use arrow::array::{ArrayRef, StringArray, StringViewBuilder};
 use arrow::datatypes::{DataType, Field};
 use arrow::util::bench_util::{
     create_string_array_with_len, create_string_view_array_with_len,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion_common::config::ConfigOptions;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs};
 use datafusion_functions::string;
+use std::hint::black_box;
 use std::sync::Arc;
 
 /// Create an array of args containing a StringArray, where all the values in the

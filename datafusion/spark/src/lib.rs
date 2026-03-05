@@ -22,6 +22,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Make cheap clones clear: https://github.com/apache/datafusion/issues/11143
 #![deny(clippy::clone_on_ref_ptr)]
+#![cfg_attr(test, allow(clippy::needless_pass_by_value))]
 
 //! Spark Expression packages for [DataFusion].
 //!
@@ -37,7 +38,8 @@
 //! # Example: using all function packages
 //!
 //! You can register all the functions in all packages using the [`register_all`]
-//! function as shown below.
+//! function as shown below. Any existing functions will be overwritten, with these
+//! Spark functions taking priority.
 //!
 //! ```
 //! # use datafusion_execution::FunctionRegistry;
@@ -68,10 +70,9 @@
 //! # async fn stub() -> Result<()> {
 //! // Create a new session context
 //! let mut ctx = SessionContext::new();
-//! // register all spark functions with the context
+//! // Register all Spark functions with the context
 //! datafusion_spark::register_all(&mut ctx)?;
-//! // run a query. Note the `sha2` function is now available which
-//! // has Spark semantics
+//! // Run a query using the `sha2` function which is now available and has Spark semantics
 //! let df = ctx.sql("SELECT sha2('The input String', 256)").await?;
 //! # Ok(())
 //! # }
@@ -88,11 +89,51 @@
 //! use datafusion_spark::expr_fn::sha2;
 //! // Create the expression `sha2(my_data, 256)`
 //! let expr = sha2(col("my_data"), lit(256));
-//!```
+//! ```
+//!
+//! # Example: using the Spark expression planner
+//!
+//! The [`planner::SparkFunctionPlanner`] provides Spark-compatible expression
+//! planning, such as mapping SQL `EXTRACT` expressions to Spark's `date_part`
+//! function. To use it, register it with your session context:
+//!
+//! ```ignore
+//! use std::sync::Arc;
+//! use datafusion::prelude::SessionContext;
+//! use datafusion_spark::planner::SparkFunctionPlanner;
+//!
+//! let mut ctx = SessionContext::new();
+//! // Register the Spark expression planner
+//! ctx.register_expr_planner(Arc::new(SparkFunctionPlanner))?;
+//! // Now EXTRACT expressions will use Spark semantics
+//! let df = ctx.sql("SELECT EXTRACT(YEAR FROM timestamp_col) FROM my_table").await?;
+//! ```
 //!
 //![`Expr`]: datafusion_expr::Expr
+//!
+//! # Example: enabling Apache Spark features with SessionStateBuilder
+//!
+//! The recommended way to enable Apache Spark compatibility is to use the
+//! `SessionStateBuilderSpark` extension trait. This registers all
+//! Apache Spark functions (scalar, aggregate, window, and table) as well as the Apache Spark
+//! expression planner.
+//!
+//! Enable the `core` feature in your `Cargo.toml`:
+//! ```toml
+//! datafusion-spark = { version = "X", features = ["core"] }
+//! ```
+//!
+//! Then use the extension trait - see [`SessionStateBuilderSpark::with_spark_features`]
+//! for an example.
 
 pub mod function;
+pub mod planner;
+
+#[cfg(feature = "core")]
+mod session_state;
+
+#[cfg(feature = "core")]
+pub use session_state::SessionStateBuilderSpark;
 
 use datafusion_catalog::TableFunction;
 use datafusion_common::Result;
@@ -102,7 +143,7 @@ use log::debug;
 use std::sync::Arc;
 
 /// Fluent-style API for creating `Expr`s
-#[allow(unused)]
+#[expect(unused_imports)]
 pub mod expr_fn {
     pub use super::function::aggregate::expr_fn::*;
     pub use super::function::array::expr_fn::*;
@@ -121,8 +162,8 @@ pub mod expr_fn {
     pub use super::function::math::expr_fn::*;
     pub use super::function::misc::expr_fn::*;
     pub use super::function::predicate::expr_fn::*;
-    pub use super::function::r#struct::expr_fn::*;
     pub use super::function::string::expr_fn::*;
+    pub use super::function::r#struct::expr_fn::*;
     pub use super::function::table::expr_fn::*;
     pub use super::function::url::expr_fn::*;
     pub use super::function::window::expr_fn::*;
@@ -170,7 +211,8 @@ pub fn all_default_table_functions() -> Vec<Arc<TableFunction>> {
     function::table::functions()
 }
 
-/// Registers all enabled packages with a [`FunctionRegistry`]
+/// Registers all enabled packages with a [`FunctionRegistry`], overriding any existing
+/// functions if there is a name clash.
 pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
     let scalar_functions: Vec<Arc<ScalarUDF>> = all_default_scalar_functions();
     scalar_functions.into_iter().try_for_each(|udf| {

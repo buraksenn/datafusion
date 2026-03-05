@@ -15,8 +15,13 @@
 .. specific language governing permissions and limitations
 .. under the License.
 
-.. image:: _static/images/2x_bgwhite_original.png
-  :alt: DataFusion Logo
+.. image:: _static/images/original.svg
+   :alt: DataFusion Logo
+   :class: light-logo
+
+.. image:: _static/images/original_dark.svg
+   :alt: DataFusion Logo
+   :class: dark-logo
 
 =================
 Apache DataFusion
@@ -56,7 +61,7 @@ The following related subprojects target end users and have separate documentati
 "Out of the box," DataFusion offers `SQL <https://datafusion.apache.org/user-guide/sql/index.html>`_
 and `Dataframe <https://docs.rs/datafusion/latest/datafusion/dataframe/struct.DataFrame.html>`_ APIs,
 excellent `performance <https://benchmark.clickhouse.com/>`_, built-in support for CSV, Parquet, JSON, and Avro,
-extensive customization, and a great community.
+extensive customization, and a great `community`_.
 `Python Bindings <https://github.com/apache/datafusion-python>`_ are also available.
 `Ballista <https://datafusion.apache.org/ballista/>`_ is Apache DataFusion extension enabling the parallelized execution of workloads across multiple nodes in a distributed environment.
 
@@ -76,6 +81,7 @@ To get started, see
 .. _datafusion-examples: https://github.com/apache/datafusion/tree/main/datafusion-examples
 .. _developer’s guide: contributor-guide/index.html#developer-s-guide
 .. _library user guide: library-user-guide/index.html
+.. _community: contributor-guide/communication.html
 .. _communication: contributor-guide/communication.html
 
 .. _toc.asf-links:
@@ -113,10 +119,12 @@ To get started, see
    user-guide/crate-configuration
    user-guide/cli/index
    user-guide/dataframe
+   user-guide/arrow-introduction
    user-guide/expressions
    user-guide/sql/index
    user-guide/configs
    user-guide/explain-usage
+   user-guide/metrics
    user-guide/faq
 
 .. _toc.library-user-guide:
@@ -126,9 +134,10 @@ To get started, see
    :caption: Library User Guide
    
    library-user-guide/index
-   library-user-guide/upgrading
+   library-user-guide/upgrading/index
    library-user-guide/extensions
    library-user-guide/using-the-sql-api
+   library-user-guide/extending-sql
    library-user-guide/working-with-exprs
    library-user-guide/using-the-dataframe-api
    library-user-guide/building-logical-plans
@@ -150,6 +159,7 @@ To get started, see
    contributor-guide/communication
    contributor-guide/development_environment
    contributor-guide/architecture
+   contributor-guide/architecture/dependency-graph
    contributor-guide/testing
    contributor-guide/api-health
    contributor-guide/howtos

@@ -29,9 +29,9 @@
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::collect;
-use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::prelude::{
-    col, lit, lit_timestamp_nano, Expr, ParquetReadOptions, SessionContext,
+    Expr, ParquetReadOptions, SessionContext, col, lit, lit_timestamp_nano,
 };
 use datafusion::test_util::parquet::{ParquetScanOptions, TestParquetFile};
 use datafusion_expr::utils::{conjunction, disjunction, split_conjunction};
@@ -63,7 +63,7 @@ async fn single_file() {
 
     // Set the row group size smaller so can test with fewer rows
     let props = WriterProperties::builder()
-        .set_max_row_group_size(1024)
+        .set_max_row_group_row_count(Some(1024))
         .build();
 
     // Only create the parquet file once as it is fairly large
@@ -220,7 +220,6 @@ async fn single_file() {
 }
 
 #[tokio::test]
-#[allow(dead_code)]
 async fn single_file_small_data_pages() {
     let batches = read_parquet_test_data(
         "tests/data/filter_pushdown/single_file_small_pages.gz.parquet",
@@ -231,7 +230,7 @@ async fn single_file_small_data_pages() {
 
     // Set a low row count limit to improve page filtering
     let props = WriterProperties::builder()
-        .set_max_row_group_size(2048)
+        .set_max_row_group_row_count(Some(2048))
         .set_data_page_row_count_limit(512)
         .set_write_batch_size(512)
         .build();
@@ -563,9 +562,9 @@ impl<'a> TestCase<'a> {
             }
         };
 
-        let page_index_rows_pruned = get_value(&metrics, "page_index_rows_pruned");
+        let (page_index_rows_pruned, page_index_rows_matched) =
+            get_pruning_metrics(&metrics, "page_index_rows_pruned");
         println!(" page_index_rows_pruned: {page_index_rows_pruned}");
-        let page_index_rows_matched = get_value(&metrics, "page_index_rows_matched");
         println!(" page_index_rows_matched: {page_index_rows_matched}");
 
         let page_index_filtering_expected = if scan_options.enable_page_index {
@@ -592,14 +591,29 @@ impl<'a> TestCase<'a> {
     }
 }
 
+fn get_pruning_metrics(metrics: &MetricsSet, metric_name: &str) -> (usize, usize) {
+    match metrics.sum_by_name(metric_name) {
+        Some(MetricValue::PruningMetrics {
+            pruning_metrics, ..
+        }) => (pruning_metrics.pruned(), pruning_metrics.matched()),
+        Some(_) => {
+            panic!("Metric '{metric_name}' is not a pruning metric in\n\n{metrics:#?}")
+        }
+        None => panic!(
+            "Expected metric not found. Looking for '{metric_name}' in\n\n{metrics:#?}"
+        ),
+    }
+}
+
 fn get_value(metrics: &MetricsSet, metric_name: &str) -> usize {
     match metrics.sum_by_name(metric_name) {
+        Some(MetricValue::PruningMetrics {
+            pruning_metrics, ..
+        }) => pruning_metrics.pruned(),
         Some(v) => v.as_usize(),
-        _ => {
-            panic!(
-                "Expected metric not found. Looking for '{metric_name}' in\n\n{metrics:#?}"
-            );
-        }
+        None => panic!(
+            "Expected metric not found. Looking for '{metric_name}' in\n\n{metrics:#?}"
+        ),
     }
 }
 
@@ -623,6 +637,43 @@ async fn predicate_cache_pushdown_default() -> datafusion_common::Result<()> {
     // The cache is on by default, and used when filter pushdown is enabled
     PredicateCacheTest {
         expected_inner_records: 8,
+        expected_records: 7, // reads more than necessary from the cache as then another bitmap is applied
+    }
+    .run(&ctx)
+    .await
+}
+
+#[tokio::test]
+async fn predicate_cache_stats_issue_19561() -> datafusion_common::Result<()> {
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.pushdown_filters = true;
+    // force to get multiple batches to trigger repeated metric compound bug
+    config.options_mut().execution.batch_size = 1;
+    let ctx = SessionContext::new_with_config(config);
+    // The cache is on by default, and used when filter pushdown is enabled
+    PredicateCacheTest {
+        expected_inner_records: 8,
+        expected_records: 4,
+    }
+    .run(&ctx)
+    .await
+}
+
+#[tokio::test]
+async fn predicate_cache_pushdown_default_selections_only()
+-> datafusion_common::Result<()> {
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.pushdown_filters = true;
+    // forcing filter selections minimizes the number of rows read from the cache
+    config
+        .options_mut()
+        .execution
+        .parquet
+        .force_filter_selections = true;
+    let ctx = SessionContext::new_with_config(config);
+    // The cache is on by default, and used when filter pushdown is enabled
+    PredicateCacheTest {
+        expected_inner_records: 8,
         expected_records: 4,
     }
     .run(&ctx)
@@ -631,8 +682,8 @@ async fn predicate_cache_pushdown_default() -> datafusion_common::Result<()> {
 
 #[tokio::test]
 async fn predicate_cache_pushdown_disable() -> datafusion_common::Result<()> {
-    // Can disable the cache even with filter pushdown by setting the size to 0. In this case we
-    // expect the inner records are reported but no records are read from the cache
+    // Can disable the cache even with filter pushdown by setting the size to 0.
+    // This results in no records read from the cache and no metrics reported
     let mut config = SessionConfig::new();
     config.options_mut().execution.parquet.pushdown_filters = true;
     config
@@ -641,13 +692,10 @@ async fn predicate_cache_pushdown_disable() -> datafusion_common::Result<()> {
         .parquet
         .max_predicate_cache_size = Some(0);
     let ctx = SessionContext::new_with_config(config);
+    // Since the cache is disabled, there is no reporting or use of the cache
     PredicateCacheTest {
-        // file has 8 rows, which need to be read twice, one for filter, one for
-        // final output
-        expected_inner_records: 16,
-        // Expect this to 0 records read as the cache is disabled. However, it is
-        // non zero due to https://github.com/apache/arrow-rs/issues/8307
-        expected_records: 3,
+        expected_inner_records: 0,
+        expected_records: 0,
     }
     .run(&ctx)
     .await
