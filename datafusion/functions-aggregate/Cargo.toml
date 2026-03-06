@@ -76,3 +76,7 @@ harness = false
 [[bench]]
 harness = false
 name = "min_max_bytes"
+
+[[bench]]
+name = "nth_value"
+harness = false

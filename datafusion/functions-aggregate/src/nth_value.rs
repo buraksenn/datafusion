@@ -28,10 +28,10 @@ use arrow::array::{
     StructArray, new_empty_array,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer};
-use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
+use arrow::row::{RowConverter, RowParser, SortField};
 
-use datafusion_common::utils::{SingleRowListArrayBuilder, compare_rows, get_row_at_idx};
+use datafusion_common::utils::{SingleRowListArrayBuilder, get_row_at_idx};
 use datafusion_common::{
     Result, ScalarValue, assert_or_internal_err, exec_err, internal_err, not_impl_err,
 };
@@ -42,7 +42,7 @@ use datafusion_expr::{
     GroupsAccumulator, ReversedUDAF, Signature, SortExpr, Volatility, lit,
 };
 use datafusion_functions_aggregate_common::merge_arrays::merge_ordered_arrays;
-use datafusion_functions_aggregate_common::utils::{get_sort_options, ordering_fields};
+use datafusion_functions_aggregate_common::utils::ordering_fields;
 use datafusion_macros::user_doc;
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
@@ -677,16 +677,17 @@ struct NthPrimitiveGroupsAccumulator<T: ArrowPrimitiveType + Send> {
     n: i64,
     ordering_req: LexOrdering,
     ordering_dtypes: Vec<DataType>,
-    sort_options: Vec<SortOptions>,
     ignore_nulls: bool,
     data_type: DataType,
+    row_converter: RowConverter,
+    row_parser: RowParser,
     groups: Vec<Vec<NthGroupCandidate<T::Native>>>,
 }
 
 struct NthGroupCandidate<T> {
     value: T,
     is_null: bool,
-    ordering: Vec<ScalarValue>,
+    ordering: Vec<u8>,
 }
 
 impl<T> NthPrimitiveGroupsAccumulator<T>
@@ -703,14 +704,21 @@ where
         if n == 0 {
             return internal_err!("Nth value indices are 1 based. 0 is invalid index");
         }
-        let sort_options = get_sort_options(&ordering_req);
+        let sort_fields: Vec<SortField> = ordering_req
+            .iter()
+            .zip(ordering_dtypes.iter())
+            .map(|(expr, dt)| SortField::new_with_options(dt.clone(), expr.options))
+            .collect();
+        let row_converter = RowConverter::new(sort_fields)?;
+        let row_parser = row_converter.parser();
         Ok(Self {
             n,
             ordering_req,
             ordering_dtypes: ordering_dtypes.to_vec(),
-            sort_options,
             ignore_nulls,
             data_type: data_type.clone(),
+            row_converter,
+            row_parser,
             groups: Vec::new(),
         })
     }
@@ -734,26 +742,31 @@ where
         group_idx: usize,
         value: T::Native,
         is_null: bool,
-        ordering: Vec<ScalarValue>,
+        ordering: &[u8],
     ) {
         let keep_smallest_n = self.keep_smallest_n();
         let n_required = self.n_required();
-        let sort_options = &self.sort_options;
         let group = &mut self.groups[group_idx];
 
-        // Keep per-group candidates ordered by sort key and preserve batch order
-        // for ties by inserting after existing equal elements.
+        if group.len() >= n_required {
+            if keep_smallest_n {
+                if ordering >= group[n_required - 1].ordering.as_slice() {
+                    return;
+                }
+            } else if ordering <= group[0].ordering.as_slice() {
+                return;
+            }
+        }
+
         let insert_idx = group.partition_point(|candidate| {
-            compare_rows(&candidate.ordering, &ordering, sort_options)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                != std::cmp::Ordering::Greater
+            candidate.ordering.as_slice().cmp(ordering) != std::cmp::Ordering::Greater
         });
         group.insert(
             insert_idx,
             NthGroupCandidate {
                 value,
                 is_null,
-                ordering,
+                ordering: ordering.to_vec(),
             },
         );
 
@@ -795,6 +808,9 @@ where
     ) -> Result<()> {
         self.resize(total_num_groups);
         let vals = values_and_order_cols[0].as_primitive::<T>();
+        let order_cols = &values_and_order_cols[1..];
+
+        let rows = self.row_converter.convert_columns(order_cols)?;
 
         for (idx, &group_idx) in group_indices.iter().enumerate() {
             if let Some(filter) = opt_filter {
@@ -806,12 +822,11 @@ where
                 continue;
             }
 
-            let ordering = get_row_at_idx(&values_and_order_cols[1..], idx)?;
             self.insert_candidate(
                 group_idx,
                 vals.value(idx),
                 vals.is_null(idx),
-                ordering,
+                rows.row(idx).as_ref(),
             );
         }
 
@@ -888,24 +903,34 @@ where
                     &DataType::Null,
                 )));
             } else {
-                let struct_fields = Fields::from(order_fields.clone());
-                let mut columns: Vec<ArrayRef> = Vec::with_capacity(order_fields.len());
-                for col_idx in 0..order_fields.len() {
-                    let col_scalars: Vec<ScalarValue> = group
+                if group.is_empty() {
+                    let struct_fields = Fields::from(order_fields.clone());
+                    let empty_columns: Vec<ArrayRef> = order_fields
                         .iter()
-                        .map(|candidate| candidate.ordering[col_idx].clone())
+                        .map(|f| new_empty_array(f.data_type()))
                         .collect();
-                    if col_scalars.is_empty() {
-                        columns.push(new_empty_array(order_fields[col_idx].data_type()));
-                    } else {
-                        columns.push(ScalarValue::iter_to_array(col_scalars)?);
-                    }
+                    let struct_array =
+                        StructArray::try_new(struct_fields, empty_columns, None)?;
+                    ordering_scalars.push(
+                        SingleRowListArrayBuilder::new(Arc::new(struct_array))
+                            .build_list_scalar(),
+                    );
+                } else {
+                    let row_refs: Vec<_> = group
+                        .iter()
+                        .map(|c| self.row_parser.parse(&c.ordering))
+                        .collect();
+                    let ordering_arrays =
+                        self.row_converter.convert_rows(row_refs.iter().copied())?;
+
+                    let struct_fields = Fields::from(order_fields.clone());
+                    let struct_array =
+                        StructArray::try_new(struct_fields, ordering_arrays, None)?;
+                    ordering_scalars.push(
+                        SingleRowListArrayBuilder::new(Arc::new(struct_array))
+                            .build_list_scalar(),
+                    );
                 }
-                let struct_array = StructArray::try_new(struct_fields, columns, None)?;
-                ordering_scalars.push(
-                    SingleRowListArrayBuilder::new(Arc::new(struct_array))
-                        .build_list_scalar(),
-                );
             }
         }
 
@@ -942,21 +967,25 @@ where
                 return exec_err!("Expected ordering state as StructArray");
             };
 
+            if inner_vals.is_empty() {
+                continue;
+            }
+
+            let ordering_cols: Vec<ArrayRef> =
+                inner_orderings.columns().iter().map(Arc::clone).collect();
+            let rows = self.row_converter.convert_columns(&ordering_cols)?;
+
             for row_idx in 0..inner_vals.len() {
                 let is_null = inner_vals.is_null(row_idx);
                 if self.ignore_nulls && is_null {
                     continue;
                 }
 
-                let mut ordering_row = Vec::with_capacity(inner_orderings.num_columns());
-                for col in inner_orderings.columns() {
-                    ordering_row.push(ScalarValue::try_from_array(col, row_idx)?);
-                }
                 self.insert_candidate(
                     group_idx,
                     inner_vals.value(row_idx),
                     is_null,
-                    ordering_row,
+                    rows.row(row_idx).as_ref(),
                 );
             }
         }
@@ -975,7 +1004,7 @@ where
         for group in &self.groups {
             total += group.capacity() * size_of::<NthGroupCandidate<T::Native>>();
             for candidate in group {
-                total += ScalarValue::size_of_vec(&candidate.ordering);
+                total += candidate.ordering.capacity();
             }
         }
         total
@@ -986,6 +1015,7 @@ where
 mod tests {
     use super::*;
     use arrow::array::Int64Array;
+    use arrow::compute::SortOptions;
     use arrow::datatypes::{Int64Type, Schema};
     use datafusion_physical_expr::expressions::col;
 
@@ -1255,6 +1285,80 @@ mod tests {
         let result_arr = result.as_primitive::<Int64Type>();
         assert_eq!(result_arr.value(0), 10);
         assert!(result_arr.is_null(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nth_group_acc_ignore_nulls() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+
+        let sort_keys = [PhysicalSortExpr {
+            expr: col("c", &schema).unwrap(),
+            options: SortOptions::default(),
+        }];
+
+        let mut group_acc = NthPrimitiveGroupsAccumulator::<Int64Type>::try_new(
+            1,
+            sort_keys.into(),
+            true,
+            &DataType::Int64,
+            &[DataType::Int64],
+        )?;
+
+        let val_with_orderings = {
+            let vals = Arc::new(Int64Array::from(vec![None, Some(20), None, Some(40)]))
+                as Arc<dyn Array>;
+            let orderings =
+                Arc::new(Int64Array::from(vec![-9, 1, -6, 3])) as Arc<dyn Array>;
+            vec![vals, orderings]
+        };
+
+        group_acc.update_batch(&val_with_orderings, &[0, 0, 0, 0], None, 1)?;
+
+        let result = group_acc.evaluate(EmitTo::All)?;
+        let result_arr = result.as_primitive::<Int64Type>();
+        assert!(!result_arr.is_null(0));
+        assert_eq!(result_arr.value(0), 20);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nth_group_acc_ignore_nulls_all_null() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+
+        let sort_keys = [PhysicalSortExpr {
+            expr: col("c", &schema).unwrap(),
+            options: SortOptions::default(),
+        }];
+
+        let mut group_acc = NthPrimitiveGroupsAccumulator::<Int64Type>::try_new(
+            1,
+            sort_keys.into(),
+            true,
+            &DataType::Int64,
+            &[DataType::Int64],
+        )?;
+
+        let val_with_orderings = {
+            let vals =
+                Arc::new(Int64Array::from(vec![None, None, None])) as Arc<dyn Array>;
+            let orderings = Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>;
+            vec![vals, orderings]
+        };
+
+        group_acc.update_batch(&val_with_orderings, &[0, 0, 0], None, 1)?;
+
+        let result = group_acc.evaluate(EmitTo::All)?;
+        let result_arr = result.as_primitive::<Int64Type>();
+        assert!(result_arr.is_null(0));
 
         Ok(())
     }
