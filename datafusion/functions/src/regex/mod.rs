@@ -27,6 +27,7 @@ pub mod regexpinstr;
 pub mod regexplike;
 pub mod regexpmatch;
 pub mod regexpreplace;
+pub mod regexpsplittoarray;
 
 // create UDFs
 make_udf_function!(regexpcount::RegexpCountFunc, regexp_count);
@@ -34,6 +35,7 @@ make_udf_function!(regexpinstr::RegexpInstrFunc, regexp_instr);
 make_udf_function!(regexpmatch::RegexpMatchFunc, regexp_match);
 make_udf_function!(regexplike::RegexpLikeFunc, regexp_like);
 make_udf_function!(regexpreplace::RegexpReplaceFunc, regexp_replace);
+make_udf_function!(regexpsplittoarray::RegexpSplitToArrayFunc, regexp_split_to_array);
 
 pub mod expr_fn {
     use datafusion_expr::Expr;
@@ -115,6 +117,19 @@ pub mod expr_fn {
         };
         super::regexp_replace().call(args)
     }
+
+    /// Splits a string by a regular expression pattern and returns a text array.
+    pub fn regexp_split_to_array(
+        values: Expr,
+        regex: Expr,
+        flags: Option<Expr>,
+    ) -> Expr {
+        let mut args = vec![values, regex];
+        if let Some(flags) = flags {
+            args.push(flags);
+        };
+        super::regexp_split_to_array().call(args)
+    }
 }
 
 /// Returns all DataFusion functions defined in this package
@@ -125,6 +140,7 @@ pub fn functions() -> Vec<Arc<datafusion_expr::ScalarUDF>> {
         regexp_instr(),
         regexp_like(),
         regexp_replace(),
+        regexp_split_to_array(),
     ]
 }
 
