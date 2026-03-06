@@ -35,7 +35,10 @@ make_udf_function!(regexpinstr::RegexpInstrFunc, regexp_instr);
 make_udf_function!(regexpmatch::RegexpMatchFunc, regexp_match);
 make_udf_function!(regexplike::RegexpLikeFunc, regexp_like);
 make_udf_function!(regexpreplace::RegexpReplaceFunc, regexp_replace);
-make_udf_function!(regexpsplittoarray::RegexpSplitToArrayFunc, regexp_split_to_array);
+make_udf_function!(
+    regexpsplittoarray::RegexpSplitToArrayFunc,
+    regexp_split_to_array
+);
 
 pub mod expr_fn {
     use datafusion_expr::Expr;
@@ -119,11 +122,7 @@ pub mod expr_fn {
     }
 
     /// Splits a string by a regular expression pattern and returns a text array.
-    pub fn regexp_split_to_array(
-        values: Expr,
-        regex: Expr,
-        flags: Option<Expr>,
-    ) -> Expr {
+    pub fn regexp_split_to_array(values: Expr, regex: Expr, flags: Option<Expr>) -> Expr {
         let mut args = vec![values, regex];
         if let Some(flags) = flags {
             args.push(flags);

@@ -112,9 +112,7 @@ impl ScalarUDFImpl for RegexpSplitToArrayFunc {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         Ok(match &arg_types[0] {
-            LargeUtf8 => {
-                DataType::List(Arc::new(Field::new_list_field(LargeUtf8, true)))
-            }
+            LargeUtf8 => DataType::List(Arc::new(Field::new_list_field(LargeUtf8, true))),
             _ => DataType::List(Arc::new(Field::new_list_field(Utf8, true))),
         })
     }
@@ -266,9 +264,7 @@ fn compile_regex_for_split(
     };
 
     Regex::new(&pattern).map_err(|_| {
-        ArrowError::ComputeError(format!(
-            "Regular expression did not compile: {pattern}"
-        ))
+        ArrowError::ComputeError(format!("Regular expression did not compile: {pattern}"))
     })
 }
 
@@ -320,8 +316,7 @@ where
         None
     };
 
-    let mut list_builder =
-        ListBuilder::new(GenericStringBuilder::<O>::new());
+    let mut list_builder = ListBuilder::new(GenericStringBuilder::<O>::new());
     let mut regex_cache = HashMap::new();
 
     match (is_regex_scalar, is_flags_scalar) {
@@ -373,11 +368,7 @@ where
                             flags,
                             &mut regex_cache,
                         )?;
-                        split_and_append(
-                            &mut list_builder,
-                            values.value(i),
-                            pattern,
-                        );
+                        split_and_append(&mut list_builder, values.value(i), pattern);
                     }
                 }
             }
@@ -387,8 +378,7 @@ where
             for i in 0..values.len() {
                 if values.is_null(i) {
                     list_builder.append(false);
-                } else if regex_array.is_null(i) || regex_array.value(i).is_empty()
-                {
+                } else if regex_array.is_null(i) || regex_array.value(i).is_empty() {
                     split_chars_and_append(&mut list_builder, values.value(i));
                 } else {
                     let regex_str = regex_array.value(i);
@@ -397,11 +387,7 @@ where
                         flags,
                         &mut regex_cache,
                     )?;
-                    split_and_append(
-                        &mut list_builder,
-                        values.value(i),
-                        pattern,
-                    );
+                    split_and_append(&mut list_builder, values.value(i), pattern);
                 }
             }
         }
@@ -410,8 +396,7 @@ where
             for i in 0..values.len() {
                 if values.is_null(i) {
                     list_builder.append(false);
-                } else if regex_array.is_null(i) || regex_array.value(i).is_empty()
-                {
+                } else if regex_array.is_null(i) || regex_array.value(i).is_empty() {
                     split_chars_and_append(&mut list_builder, values.value(i));
                 } else {
                     let regex_str = regex_array.value(i);
@@ -425,11 +410,7 @@ where
                         flags,
                         &mut regex_cache,
                     )?;
-                    split_and_append(
-                        &mut list_builder,
-                        values.value(i),
-                        pattern,
-                    );
+                    split_and_append(&mut list_builder, values.value(i), pattern);
                 }
             }
         }
@@ -441,9 +422,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        Array, GenericStringArray, ListArray, StringViewArray,
-    };
+    use arrow::array::{Array, GenericStringArray, ListArray, StringViewArray};
     use arrow::datatypes::Field;
     use datafusion_common::config::ConfigOptions;
     use datafusion_expr::ScalarFunctionArgs;
@@ -457,9 +436,7 @@ mod tests {
         let arg_fields = args
             .iter()
             .enumerate()
-            .map(|(idx, a)| {
-                Field::new(format!("arg_{idx}"), a.data_type(), true).into()
-            })
+            .map(|(idx, a)| Field::new(format!("arg_{idx}"), a.data_type(), true).into())
             .collect::<Vec<_>>();
 
         let return_type = match args[0].data_type() {
@@ -554,10 +531,7 @@ mod tests {
             ScalarValue::Utf8(Some(",".to_string())),
         ])
         .unwrap();
-        assert_eq!(
-            result_to_string_vec(&result),
-            vec!["", "a", "", "b", ""]
-        );
+        assert_eq!(result_to_string_vec(&result), vec!["", "a", "", "b", ""]);
     }
 
     #[test]
@@ -618,14 +592,10 @@ mod tests {
     fn test_array_input() {
         let values: GenericStringArray<i32> =
             vec!["hello world", "foo-bar-baz", "abc"].into();
-        let patterns: GenericStringArray<i32> =
-            vec!["\\s+", "-", "b"].into();
+        let patterns: GenericStringArray<i32> = vec!["\\s+", "-", "b"].into();
 
-        let result = regexp_split_to_array_func(&[
-            Arc::new(values),
-            Arc::new(patterns),
-        ])
-        .unwrap();
+        let result =
+            regexp_split_to_array_func(&[Arc::new(values), Arc::new(patterns)]).unwrap();
 
         let list_arr = result.as_any().downcast_ref::<ListArray>().unwrap();
 
@@ -653,10 +623,8 @@ mod tests {
 
     #[test]
     fn test_array_input_with_flags() {
-        let values: GenericStringArray<i32> =
-            vec!["Hello World", "FOO"].into();
-        let patterns: GenericStringArray<i32> =
-            vec!["l", "o"].into();
+        let values: GenericStringArray<i32> = vec!["Hello World", "FOO"].into();
+        let patterns: GenericStringArray<i32> = vec!["l", "o"].into();
         let flags: GenericStringArray<i32> = vec!["i", "i"].into();
 
         let result = regexp_split_to_array_func(&[
@@ -688,11 +656,8 @@ mod tests {
         let values = StringViewArray::from(vec!["hello world", "foo bar"]);
         let patterns = StringViewArray::from(vec!["\\s+", "\\s+"]);
 
-        let result = regexp_split_to_array_func(&[
-            Arc::new(values),
-            Arc::new(patterns),
-        ])
-        .unwrap();
+        let result =
+            regexp_split_to_array_func(&[Arc::new(values), Arc::new(patterns)]).unwrap();
 
         let list_arr = result.as_any().downcast_ref::<ListArray>().unwrap();
 
