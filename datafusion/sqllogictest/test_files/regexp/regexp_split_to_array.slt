@@ -45,11 +45,11 @@ SELECT regexp_split_to_array(NULL, '\s+');
 ----
 NULL
 
-# NULL pattern splits into characters
+# NULL pattern returns NULL
 query ?
 SELECT regexp_split_to_array('hello', NULL);
 ----
-[h, e, l, l, o]
+NULL
 
 # empty string
 query ?

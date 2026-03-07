@@ -2193,6 +2193,7 @@ The following regular expression functions are supported:
 - [regexp_like](#regexp_like)
 - [regexp_match](#regexp_match)
 - [regexp_replace](#regexp_replace)
+- [regexp_split_to_array](#regexp_split_to_array)
 
 ### `regexp_count`
 
@@ -2375,6 +2376,44 @@ SELECT regexp_replace('aBc', '(b|d)', 'Ab\\1a', 'i');
 ```
 
 Additional examples can be found [here](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/builtin_functions/regexp.rs)
+
+### `regexp_split_to_array`
+
+Splits a string by a [regular expression](https://docs.rs/regex/latest/regex/#syntax) pattern and returns a text array of the splits.
+
+```sql
+regexp_split_to_array(str, regexp[, flags])
+```
+
+#### Arguments
+
+- **str**: String expression to operate on. Can be a constant, column, or function, and any combination of operators.
+- **regexp**: Regular expression to split by. Can be a constant, column, or function.
+- **flags**: Optional regular expression flags that control the behavior of the regular expression. The following flags are supported:
+  - **g**: (global) Accepted but has no effect, as splitting is inherently global
+  - **i**: case-insensitive: letters match both upper and lower case
+  - **m**: multi-line mode: ^ and $ match begin/end of line
+  - **s**: allow . to match \n
+  - **R**: enables CRLF mode: when multi-line mode is enabled, \r\n is used
+  - **U**: swap the meaning of x* and x*?
+
+#### Example
+
+```sql
+> select regexp_split_to_array('hello world', '\s+');
++-----------------------------------------------------+
+| regexp_split_to_array(Utf8("hello world"),Utf8("\s+")) |
++-----------------------------------------------------+
+| [hello, world]                                      |
++-----------------------------------------------------+
+
+> select regexp_split_to_array('HeLLo', 'l', 'i');
++---------------------------------------------------------------+
+| regexp_split_to_array(Utf8("HeLLo"),Utf8("l"),Utf8("i"))     |
++---------------------------------------------------------------+
+| [He, , o]                                                     |
++---------------------------------------------------------------+
+```
 
 ## Time and Date Functions
 

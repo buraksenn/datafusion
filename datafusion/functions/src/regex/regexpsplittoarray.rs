@@ -61,6 +61,7 @@ use std::sync::Arc;
     argument(
         name = "flags",
         description = r#"Optional regular expression flags that control the behavior of the regular expression. The following flags are supported:
+  - **g**: (global) Accepted but has no effect, as splitting is inherently global
   - **i**: case-insensitive: letters match both upper and lower case
   - **m**: multi-line mode: ^ and $ match begin/end of line
   - **s**: allow . to match \n
@@ -112,6 +113,7 @@ impl ScalarUDFImpl for RegexpSplitToArrayFunc {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         Ok(match &arg_types[0] {
+            DataType::Null => DataType::Null,
             LargeUtf8 => DataType::List(Arc::new(Field::new_list_field(LargeUtf8, true))),
             _ => DataType::List(Arc::new(Field::new_list_field(Utf8, true))),
         })
@@ -300,23 +302,28 @@ where
     let is_regex_scalar = regex_array.len() == 1;
     let is_flags_scalar = flags_array.is_none_or(|f| f.len() == 1);
 
-    let regex_scalar = if is_regex_scalar {
+    let regex_is_null_scalar = is_regex_scalar && regex_array.is_null(0);
+
+    let regex_scalar = if is_regex_scalar && !regex_array.is_null(0) {
         Some(regex_array.value(0))
     } else {
         None
     };
 
-    let flags_scalar = if let Some(fa) = flags_array {
-        if is_flags_scalar {
-            Some(fa.value(0))
-        } else {
-            None
-        }
-    } else {
-        None
+    let flags_scalar = match flags_array {
+        Some(fa) if is_flags_scalar && !fa.is_null(0) => Some(fa.value(0)),
+        _ => None,
     };
 
     let mut list_builder = ListBuilder::new(GenericStringBuilder::<O>::new());
+
+    if regex_is_null_scalar {
+        for _ in 0..values.len() {
+            list_builder.append(false);
+        }
+        return Ok(Arc::new(list_builder.finish()));
+    }
+
     let mut regex_cache = HashMap::new();
 
     match (is_regex_scalar, is_flags_scalar) {
@@ -376,9 +383,9 @@ where
         (false, true) => {
             let flags = flags_scalar;
             for i in 0..values.len() {
-                if values.is_null(i) {
+                if values.is_null(i) || regex_array.is_null(i) {
                     list_builder.append(false);
-                } else if regex_array.is_null(i) || regex_array.value(i).is_empty() {
+                } else if regex_array.value(i).is_empty() {
                     split_chars_and_append(&mut list_builder, values.value(i));
                 } else {
                     let regex_str = regex_array.value(i);
@@ -394,9 +401,9 @@ where
         (false, false) => {
             let flags_array = flags_array.unwrap();
             for i in 0..values.len() {
-                if values.is_null(i) {
+                if values.is_null(i) || regex_array.is_null(i) {
                     list_builder.append(false);
-                } else if regex_array.is_null(i) || regex_array.value(i).is_empty() {
+                } else if regex_array.value(i).is_empty() {
                     split_chars_and_append(&mut list_builder, values.value(i));
                 } else {
                     let regex_str = regex_array.value(i);
@@ -503,6 +510,22 @@ mod tests {
         let result = invoke_with_scalars(&[
             ScalarValue::Utf8(None),
             ScalarValue::Utf8(Some("\\s+".to_string())),
+        ])
+        .unwrap();
+        match result {
+            ColumnarValue::Scalar(ScalarValue::List(arr)) => {
+                let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+                assert!(list_arr.is_null(0));
+            }
+            _ => panic!("Expected scalar list result"),
+        }
+    }
+
+    #[test]
+    fn test_null_pattern() {
+        let result = invoke_with_scalars(&[
+            ScalarValue::Utf8(Some("hello".to_string())),
+            ScalarValue::Utf8(None),
         ])
         .unwrap();
         match result {
