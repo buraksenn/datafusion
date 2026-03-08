@@ -881,3 +881,74 @@ impl TableFunctionImpl for ListFilesCacheFunc {
         Ok(Arc::new(list_files_cache))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_function_select() {
+        assert!(matches!(
+            "SELECT".parse::<Function>().unwrap(),
+            Function::Select
+        ));
+        assert!(matches!(
+            "select".parse::<Function>().unwrap(),
+            Function::Select
+        ));
+    }
+
+    #[test]
+    fn parse_function_explain() {
+        assert!(matches!(
+            "EXPLAIN".parse::<Function>().unwrap(),
+            Function::Explain
+        ));
+    }
+
+    #[test]
+    fn parse_function_show() {
+        assert!(matches!(
+            "SHOW".parse::<Function>().unwrap(),
+            Function::Show
+        ));
+    }
+
+    #[test]
+    fn parse_function_create_table() {
+        assert!(matches!(
+            "CREATE TABLE".parse::<Function>().unwrap(),
+            Function::CreateTable
+        ));
+    }
+
+    #[test]
+    fn parse_function_invalid() {
+        assert!("INVALID".parse::<Function>().is_err());
+        assert!("".parse::<Function>().is_err());
+    }
+
+    #[test]
+    fn display_functions() {
+        assert_eq!(Function::Select.to_string(), "SELECT");
+        assert_eq!(Function::Explain.to_string(), "EXPLAIN");
+        assert_eq!(Function::Show.to_string(), "SHOW");
+        assert_eq!(Function::CreateTable.to_string(), "CREATE TABLE");
+        assert_eq!(Function::CreateTableAs.to_string(), "CREATE TABLE AS");
+        assert_eq!(Function::Insert.to_string(), "INSERT");
+        assert_eq!(Function::DropTable.to_string(), "DROP TABLE");
+    }
+
+    #[test]
+    fn all_functions_have_details() {
+        for func in &ALL_FUNCTIONS {
+            let details = func.function_details().unwrap();
+            assert!(!details.is_empty());
+        }
+    }
+
+    #[test]
+    fn display_all_functions_succeeds() {
+        assert!(display_all_functions().is_ok());
+    }
+}

@@ -96,3 +96,38 @@ impl CliSessionContext for SessionContext {
         self.execute_logical_plan(plan).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_context_task_ctx() {
+        let ctx = SessionContext::new();
+        let task_ctx = CliSessionContext::task_ctx(&ctx);
+        assert!(task_ctx.session_config().options().execution.batch_size > 0);
+    }
+
+    #[test]
+    fn session_context_session_state() {
+        let ctx = SessionContext::new();
+        let state = CliSessionContext::session_state(&ctx);
+        assert!(state.config().options().execution.batch_size > 0);
+    }
+
+    #[tokio::test]
+    async fn session_context_execute_plan() {
+        let ctx = SessionContext::new();
+        let plan = ctx
+            .state()
+            .create_logical_plan("SELECT 1 AS a")
+            .await
+            .unwrap();
+        let df = CliSessionContext::execute_logical_plan(&ctx, plan)
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+}

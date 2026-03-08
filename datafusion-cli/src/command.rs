@@ -335,4 +335,134 @@ mod tests {
             .expect("expected parse to succeed");
         assert!(cmd.execute(&ctx, &mut print_options).await.is_err());
     }
+
+    #[test]
+    fn parse_quit() {
+        assert!(matches!("q".parse::<Command>().unwrap(), Command::Quit));
+    }
+
+    #[test]
+    fn parse_list_tables() {
+        assert!(matches!(
+            "d".parse::<Command>().unwrap(),
+            Command::ListTables
+        ));
+    }
+
+    #[test]
+    fn parse_describe_table() {
+        match "d my_table".parse::<Command>().unwrap() {
+            Command::DescribeTableStmt(name) => assert_eq!(name, "my_table"),
+            other => panic!("expected DescribeTableStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_help() {
+        assert!(matches!("?".parse::<Command>().unwrap(), Command::Help));
+    }
+
+    #[test]
+    fn parse_list_functions() {
+        assert!(matches!(
+            "h".parse::<Command>().unwrap(),
+            Command::ListFunctions
+        ));
+    }
+
+    #[test]
+    fn parse_search_functions() {
+        match "h SELECT".parse::<Command>().unwrap() {
+            Command::SearchFunctions(f) => assert_eq!(f, "SELECT"),
+            other => panic!("expected SearchFunctions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_include() {
+        assert!(matches!(
+            "i".parse::<Command>().unwrap(),
+            Command::Include(None)
+        ));
+        match "i file.sql".parse::<Command>().unwrap() {
+            Command::Include(Some(f)) => assert_eq!(f, "file.sql"),
+            other => panic!("expected Include(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_quiet_mode() {
+        assert!(matches!(
+            "quiet".parse::<Command>().unwrap(),
+            Command::QuietMode(None)
+        ));
+        assert!(matches!(
+            "quiet true".parse::<Command>().unwrap(),
+            Command::QuietMode(Some(true))
+        ));
+        assert!(matches!(
+            "quiet false".parse::<Command>().unwrap(),
+            Command::QuietMode(Some(false))
+        ));
+        assert!(matches!(
+            "quiet on".parse::<Command>().unwrap(),
+            Command::QuietMode(Some(true))
+        ));
+        assert!(matches!(
+            "quiet off".parse::<Command>().unwrap(),
+            Command::QuietMode(Some(false))
+        ));
+    }
+
+    #[test]
+    fn parse_output_format() {
+        assert!(matches!(
+            "pset".parse::<Command>().unwrap(),
+            Command::OutputFormat(None)
+        ));
+        match "pset format csv".parse::<Command>().unwrap() {
+            Command::OutputFormat(Some(s)) => assert_eq!(s, "format csv"),
+            other => panic!("expected OutputFormat(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_invalid_command() {
+        assert!("invalid".parse::<Command>().is_err());
+        assert!("xyz abc".parse::<Command>().is_err());
+    }
+
+    #[tokio::test]
+    async fn command_execute_quiet_mode() {
+        let ctx = SessionContext::new();
+        let mut print_options = PrintOptions {
+            format: PrintFormat::Automatic,
+            quiet: false,
+            maxrows: MaxRows::Unlimited,
+            color: true,
+            instrumented_registry: Arc::new(InstrumentedObjectStoreRegistry::new()),
+        };
+
+        let cmd: Command = "quiet true".parse().unwrap();
+        cmd.execute(&ctx, &mut print_options).await.unwrap();
+        assert!(print_options.quiet);
+
+        let cmd: Command = "quiet false".parse().unwrap();
+        cmd.execute(&ctx, &mut print_options).await.unwrap();
+        assert!(!print_options.quiet);
+    }
+
+    #[tokio::test]
+    async fn command_execute_help() {
+        let ctx = SessionContext::new();
+        let mut print_options = PrintOptions {
+            format: PrintFormat::Automatic,
+            quiet: false,
+            maxrows: MaxRows::Unlimited,
+            color: true,
+            instrumented_registry: Arc::new(InstrumentedObjectStoreRegistry::new()),
+        };
+        let cmd: Command = "?".parse().unwrap();
+        assert!(cmd.execute(&ctx, &mut print_options).await.is_ok());
+    }
 }

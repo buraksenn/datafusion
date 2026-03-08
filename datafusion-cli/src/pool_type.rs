@@ -46,3 +46,34 @@ impl Display for PoolType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_greedy() {
+        assert_eq!("greedy".parse::<PoolType>().unwrap(), PoolType::Greedy);
+        assert_eq!("Greedy".parse::<PoolType>().unwrap(), PoolType::Greedy);
+    }
+
+    #[test]
+    fn parse_fair() {
+        assert_eq!("fair".parse::<PoolType>().unwrap(), PoolType::Fair);
+        assert_eq!("Fair".parse::<PoolType>().unwrap(), PoolType::Fair);
+    }
+
+    #[test]
+    fn parse_invalid() {
+        assert!("invalid".parse::<PoolType>().is_err());
+        assert!("GREEDY".parse::<PoolType>().is_err());
+        assert!("FAIR".parse::<PoolType>().is_err());
+        assert!("".parse::<PoolType>().is_err());
+    }
+
+    #[test]
+    fn display() {
+        assert_eq!(PoolType::Greedy.to_string(), "greedy");
+        assert_eq!(PoolType::Fair.to_string(), "fair");
+    }
+}
