@@ -16,6 +16,7 @@
 // under the License.
 
 use std::fmt::{Display, Formatter};
+use std::fs;
 use std::io;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -82,6 +83,8 @@ pub struct PrintOptions {
     pub maxrows: MaxRows,
     pub color: bool,
     pub instrumented_registry: Arc<InstrumentedObjectStoreRegistry>,
+    pub timing: bool,
+    pub output_file: Option<String>,
 }
 
 // Returns the query execution details formatted
@@ -115,17 +118,37 @@ impl PrintOptions {
         row_count: usize,
         format_options: &FormatOptions,
     ) -> Result<()> {
-        let stdout = io::stdout();
-        let mut writer = stdout.lock();
-
-        self.format.print_batches(
-            &mut writer,
-            schema,
-            batches,
-            self.maxrows,
-            true,
-            format_options,
-        )?;
+        if let Some(ref path) = self.output_file {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to open output file '{path}': {e}"
+                    ))
+                })?;
+            let mut writer = io::BufWriter::new(file);
+            self.format.print_batches(
+                &mut writer,
+                schema,
+                batches,
+                self.maxrows,
+                true,
+                format_options,
+            )?;
+        } else {
+            let stdout = io::stdout();
+            let mut writer = stdout.lock();
+            self.format.print_batches(
+                &mut writer,
+                schema,
+                batches,
+                self.maxrows,
+                true,
+                format_options,
+            )?;
+        }
 
         let formatted_exec_details = get_execution_details_formatted(
             row_count,
@@ -137,6 +160,8 @@ impl PrintOptions {
             query_start_time,
         );
 
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
         self.write_output(&mut writer, &formatted_exec_details)
     }
 
@@ -153,24 +178,49 @@ impl PrintOptions {
             ));
         };
 
-        let stdout = io::stdout();
-        let mut writer = stdout.lock();
-
         let mut row_count = 0_usize;
         let mut with_header = true;
 
-        while let Some(maybe_batch) = stream.next().await {
-            let batch = maybe_batch?;
-            row_count += batch.num_rows();
-            self.format.print_batches(
-                &mut writer,
-                batch.schema(),
-                &[batch],
-                MaxRows::Unlimited,
-                with_header,
-                format_options,
-            )?;
-            with_header = false;
+        if let Some(ref path) = self.output_file {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to open output file '{path}': {e}"
+                    ))
+                })?;
+            let mut writer = io::BufWriter::new(file);
+            while let Some(maybe_batch) = stream.next().await {
+                let batch = maybe_batch?;
+                row_count += batch.num_rows();
+                self.format.print_batches(
+                    &mut writer,
+                    batch.schema(),
+                    &[batch],
+                    MaxRows::Unlimited,
+                    with_header,
+                    format_options,
+                )?;
+                with_header = false;
+            }
+        } else {
+            let stdout = io::stdout();
+            let mut writer = stdout.lock();
+            while let Some(maybe_batch) = stream.next().await {
+                let batch = maybe_batch?;
+                row_count += batch.num_rows();
+                self.format.print_batches(
+                    &mut writer,
+                    batch.schema(),
+                    &[batch],
+                    MaxRows::Unlimited,
+                    with_header,
+                    format_options,
+                )?;
+                with_header = false;
+            }
         }
 
         let formatted_exec_details = get_execution_details_formatted(
@@ -179,6 +229,8 @@ impl PrintOptions {
             query_start_time,
         );
 
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
         self.write_output(&mut writer, &formatted_exec_details)
     }
 
@@ -187,7 +239,7 @@ impl PrintOptions {
         writer: &mut W,
         formatted_exec_details: &str,
     ) -> Result<()> {
-        if !self.quiet {
+        if !self.quiet || self.timing {
             writeln!(writer, "{formatted_exec_details}")?;
 
             let instrument_mode = self.instrumented_registry.instrument_mode();
@@ -233,6 +285,8 @@ mod tests {
             maxrows: MaxRows::Unlimited,
             color: true,
             instrumented_registry: Arc::clone(&instrumented_registry),
+            timing: false,
+            output_file: None,
         };
 
         let mut print_output: Vec<u8> = Vec::new();

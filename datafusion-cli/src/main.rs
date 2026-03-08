@@ -266,6 +266,8 @@ async fn main_inner() -> Result<()> {
         maxrows: args.maxrows,
         color: args.color,
         instrumented_registry: Arc::clone(&instrumented_registry),
+        timing: false,
+        output_file: None,
     };
 
     let commands = args.command;

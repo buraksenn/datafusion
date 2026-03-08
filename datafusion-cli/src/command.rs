@@ -31,6 +31,7 @@ use datafusion::common::{exec_datafusion_err, exec_err};
 use datafusion::error::Result;
 use std::fs::File;
 use std::io::BufReader;
+use std::process::Command as ProcessCommand;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -47,6 +48,10 @@ pub enum Command {
     QuietMode(Option<bool>),
     OutputFormat(Option<String>),
     ObjectStoreProfileMode(Option<String>),
+    ListViews,
+    Timing(Option<bool>),
+    ShellCommand(String),
+    OutputFile(Option<String>),
 }
 
 pub enum OutputFormat {
@@ -146,6 +151,58 @@ impl Command {
 
                 Ok(())
             }
+            Self::ListViews => {
+                exec_and_print(
+                    ctx,
+                    print_options,
+                    "SELECT table_name FROM information_schema.views".into(),
+                )
+                .await
+            }
+            Self::Timing(on) => {
+                if let Some(on) = on {
+                    print_options.timing = *on;
+                } else {
+                    print_options.timing = !print_options.timing;
+                }
+                println!(
+                    "Timing is {}",
+                    if print_options.timing { "on" } else { "off" }
+                );
+                Ok(())
+            }
+            Self::ShellCommand(cmd) => {
+                let output = ProcessCommand::new("sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .output()
+                    .map_err(|e| {
+                        exec_datafusion_err!("Failed to execute shell command: {e}")
+                    })?;
+                if !output.stdout.is_empty() {
+                    print!(
+                        "{}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                }
+                if !output.stderr.is_empty() {
+                    eprint!(
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Ok(())
+            }
+            Self::OutputFile(path) => {
+                if let Some(path) = path {
+                    println!("Output redirected to '{path}'");
+                    print_options.output_file = Some(path.clone());
+                } else {
+                    println!("Output reset to stdout");
+                    print_options.output_file = None;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -168,11 +225,15 @@ impl Command {
                 "\\object_store_profiling (disabled|summary|trace)",
                 "print or set object store profile mode",
             ),
+            Self::ListViews => ("\\dv", "list views"),
+            Self::Timing(_) => ("\\timing (on|off)?", "toggle or set timing of query execution"),
+            Self::ShellCommand(_) => ("\\! command", "execute a shell command"),
+            Self::OutputFile(_) => ("\\o [filename]", "redirect output to file or reset to stdout"),
         }
     }
 }
 
-const ALL_COMMANDS: [Command; 10] = [
+const ALL_COMMANDS: [Command; 14] = [
     Command::ListTables,
     Command::DescribeTableStmt(String::new()),
     Command::Quit,
@@ -183,6 +244,10 @@ const ALL_COMMANDS: [Command; 10] = [
     Command::QuietMode(None),
     Command::OutputFormat(None),
     Command::ObjectStoreProfileMode(None),
+    Command::ListViews,
+    Command::Timing(None),
+    Command::ShellCommand(String::new()),
+    Command::OutputFile(None),
 ];
 
 fn all_commands_info() -> RecordBatch {
@@ -215,10 +280,10 @@ impl FromStr for Command {
         };
         Ok(match (c, arg) {
             ("q", None) => Self::Quit,
-            ("d", None) => Self::ListTables,
+            ("d", None) | ("dt", None) => Self::ListTables,
             ("d", Some(name)) => Self::DescribeTableStmt(name.into()),
             ("?", None) => Self::Help,
-            ("h", None) => Self::ListFunctions,
+            ("h", None) | ("df", None) => Self::ListFunctions,
             ("h", Some(function)) => Self::SearchFunctions(function.into()),
             ("i", None) => Self::Include(None),
             ("i", Some(filename)) => Self::Include(Some(filename.to_owned())),
@@ -237,6 +302,20 @@ impl FromStr for Command {
                 Self::ObjectStoreProfileMode(Some(mode.to_string()))
             }
             ("object_store_profiling", None) => Self::ObjectStoreProfileMode(None),
+            ("dv", None) => Self::ListViews,
+            ("timing", Some("on" | "true" | "t" | "yes" | "y")) => {
+                Self::Timing(Some(true))
+            }
+            ("timing", Some("off" | "false" | "f" | "no" | "n")) => {
+                Self::Timing(Some(false))
+            }
+            ("timing", None) => Self::Timing(None),
+            ("!", Some(cmd)) => Self::ShellCommand(cmd.to_string()),
+            ("!", None) => {
+                return Err(());
+            }
+            ("o", Some(filename)) => Self::OutputFile(Some(filename.to_string())),
+            ("o", None) => Self::OutputFile(None),
             _ => return Err(()),
         })
     }
@@ -301,6 +380,8 @@ mod tests {
             maxrows: MaxRows::Unlimited,
             color: true,
             instrumented_registry: Arc::new(InstrumentedObjectStoreRegistry::new()),
+            timing: false,
+            output_file: None,
         };
 
         let mut cmd: Command = "object_store_profiling"

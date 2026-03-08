@@ -92,6 +92,8 @@ pub async fn main() {
         maxrows: datafusion_cli::print_options::MaxRows::Unlimited,
         color: true,
         instrumented_registry: Arc::new(InstrumentedObjectStoreRegistry::new()),
+        timing: false,
+        output_file: None,
     };
 
     exec_from_repl(&my_ctx, &mut print_options).await.unwrap();
