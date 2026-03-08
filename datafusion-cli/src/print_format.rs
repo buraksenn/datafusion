@@ -92,7 +92,9 @@ fn print_batches_with_sep<W: std::io::Write>(
 fn keep_only_maxrows(s: &str, maxrows: usize) -> String {
     let lines: Vec<String> = s.lines().map(String::from).collect();
 
-    assert!(lines.len() >= maxrows + 4); // 4 lines for top and bottom border
+    if lines.len() < maxrows + 4 {
+        return s.to_string();
+    }
 
     let last_line = &lines[lines.len() - 1]; // bottom border line
 

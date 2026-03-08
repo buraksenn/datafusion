@@ -114,8 +114,14 @@ pub async fn exec_from_files(
 ) -> Result<()> {
     let files = files
         .into_iter()
-        .map(|file_path| File::open(file_path).unwrap())
-        .collect::<Vec<_>>();
+        .map(|file_path| {
+            File::open(&file_path).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to open file '{file_path}': {e}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     for file in files {
         let mut reader = BufReader::new(file);
@@ -189,9 +195,11 @@ pub async fn exec_from_repl(
                         },
                     }
                     // dialect might have changed
-                    rl.helper_mut().unwrap().set_dialect(
-                        &ctx.task_ctx().session_config().options().sql_parser.dialect,
-                    );
+                    if let Some(helper) = rl.helper_mut() {
+                        helper.set_dialect(
+                            &ctx.task_ctx().session_config().options().sql_parser.dialect,
+                        );
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => {

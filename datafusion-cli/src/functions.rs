@@ -216,7 +216,7 @@ pub fn display_all_functions() -> Result<()> {
     );
     let schema = Schema::new(vec![Field::new("Function", DataType::Utf8, false)]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
-    println!("{}", pretty_format_batches(&[batch]).unwrap());
+    println!("{}", pretty_format_batches(&[batch])?);
     Ok(())
 }
 

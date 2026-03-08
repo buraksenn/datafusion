@@ -180,7 +180,12 @@ async fn main_inner() -> Result<()> {
 
     if let Some(ref path) = args.data_path {
         let p = Path::new(path);
-        env::set_current_dir(p).unwrap();
+        env::set_current_dir(p).map_err(|e| {
+            DataFusionError::Configuration(format!(
+                "Failed to set data path to '{}': {e}",
+                p.display()
+            ))
+        })?;
     };
 
     let session_config = get_session_config(&args)?;
@@ -195,14 +200,16 @@ async fn main_inner() -> Result<()> {
             }
             PoolType::Fair => Arc::new(TrackConsumersPool::new(
                 FairSpillPool::new(memory_limit),
-                NonZeroUsize::new(args.top_memory_consumers).unwrap(),
+                NonZeroUsize::new(args.top_memory_consumers)
+                    .expect("guaranteed non-zero by match guard"),
             )),
             PoolType::Greedy if args.top_memory_consumers == 0 => {
                 Arc::new(GreedyMemoryPool::new(memory_limit))
             }
             PoolType::Greedy => Arc::new(TrackConsumersPool::new(
                 GreedyMemoryPool::new(memory_limit),
-                NonZeroUsize::new(args.top_memory_consumers).unwrap(),
+                NonZeroUsize::new(args.top_memory_consumers)
+                    .expect("guaranteed non-zero by match guard"),
             )),
         };
 
@@ -213,7 +220,9 @@ async fn main_inner() -> Result<()> {
     if let Some(disk_limit) = args.disk_limit {
         let builder = DiskManagerBuilder::default()
             .with_mode(DiskManagerMode::OsTmpDirectory)
-            .with_max_temp_directory_size(disk_limit.try_into().unwrap());
+            .with_max_temp_directory_size(disk_limit.try_into().map_err(|e| {
+                DataFusionError::Configuration(format!("Invalid disk limit: {e}"))
+            })?);
         rt_builder = rt_builder.with_disk_manager_builder(builder);
     }
 
@@ -278,7 +287,10 @@ async fn main_inner() -> Result<()> {
             if let Some(p) = home {
                 let home_rc = p.join(".datafusionrc");
                 if home_rc.exists() {
-                    files.push(home_rc.into_os_string().into_string().unwrap());
+                    match home_rc.into_os_string().into_string() {
+                        Ok(s) => files.push(s),
+                        Err(_) => eprintln!("Warning: skipping .datafusionrc — path contains invalid UTF-8"),
+                    }
                 }
             }
             files
