@@ -985,7 +985,10 @@ mod tests {
         let duration = request
             .duration()
             .expect("duration should be set after consuming stream");
-        assert!(duration < delay, "duration {duration:?} should exclude the {delay:?} sleep before first poll");
+        assert!(
+            duration < delay,
+            "duration {duration:?} should exclude the {delay:?} sleep before first poll"
+        );
         assert!(request.size.is_none());
         assert!(request.range.is_none());
         assert!(request.extra_display.is_none());
