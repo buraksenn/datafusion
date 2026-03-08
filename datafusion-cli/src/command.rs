@@ -47,6 +47,7 @@ pub enum Command {
     QuietMode(Option<bool>),
     OutputFormat(Option<String>),
     ObjectStoreProfileMode(Option<String>),
+    SchemaOf(String),
 }
 
 pub enum OutputFormat {
@@ -146,6 +147,19 @@ impl Command {
 
                 Ok(())
             }
+            Self::SchemaOf(name) => {
+                let sql = format!(
+                    "SELECT column_name, data_type, is_nullable \
+                     FROM information_schema.columns \
+                     WHERE table_name = '{name}' \
+                     ORDER BY ordinal_position"
+                );
+                let results = exec_and_print(ctx, print_options, sql).await;
+                if let Err(e) = results {
+                    return exec_err!("Failed to get schema for '{name}': {e}");
+                }
+                Ok(())
+            }
         }
     }
 
@@ -168,11 +182,12 @@ impl Command {
                 "\\object_store_profiling (disabled|summary|trace)",
                 "print or set object store profile mode",
             ),
+            Self::SchemaOf(_) => ("\\schema table_name", "show CREATE TABLE statement for a table"),
         }
     }
 }
 
-const ALL_COMMANDS: [Command; 10] = [
+const ALL_COMMANDS: [Command; 11] = [
     Command::ListTables,
     Command::DescribeTableStmt(String::new()),
     Command::Quit,
@@ -183,6 +198,7 @@ const ALL_COMMANDS: [Command; 10] = [
     Command::QuietMode(None),
     Command::OutputFormat(None),
     Command::ObjectStoreProfileMode(None),
+    Command::SchemaOf(String::new()),
 ];
 
 fn all_commands_info() -> RecordBatch {
@@ -237,6 +253,7 @@ impl FromStr for Command {
                 Self::ObjectStoreProfileMode(Some(mode.to_string()))
             }
             ("object_store_profiling", None) => Self::ObjectStoreProfileMode(None),
+            ("schema", Some(name)) => Self::SchemaOf(name.to_string()),
             _ => return Err(()),
         })
     }
