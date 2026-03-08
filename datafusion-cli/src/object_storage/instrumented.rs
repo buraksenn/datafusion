@@ -995,6 +995,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn time_to_first_item_stream_captures_inner_latency() {
+        let inner_delay = Duration::from_millis(50);
+        let inner_stream = futures::stream::once(async move {
+            tokio::time::sleep(inner_delay).await;
+            Ok(ObjectMeta {
+                location: Path::from("test"),
+                last_modified: Utc::now(),
+                size: 0,
+                e_tag: None,
+                version: None,
+            })
+        })
+        .boxed();
+
+        let duration_nanos = Arc::new(AtomicU64::new(0));
+        let mut stream = Box::pin(TimeToFirstItemStream::new(
+            inner_stream,
+            Arc::clone(&duration_nanos),
+        ));
+        let _ = stream.next().await;
+
+        let recorded = Duration::from_nanos(duration_nanos.load(Ordering::Acquire));
+        assert!(
+            recorded >= inner_delay,
+            "recorded duration {recorded:?} should be >= inner stream delay {inner_delay:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn instrumented_store_list_with_delimiter() {
         let (instrumented, path) = setup_test_store().await;
 
