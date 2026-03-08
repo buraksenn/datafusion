@@ -16,8 +16,8 @@
 // under the License.
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, GenericStringBuilder, ListBuilder, OffsetSizeTrait,
-    StringArrayType,
+    Array, ArrayBuilder, ArrayRef, AsArray, GenericStringBuilder, ListBuilder,
+    OffsetSizeTrait, StringArrayType, StringViewBuilder,
 };
 use arrow::datatypes::DataType;
 use arrow::datatypes::DataType::{LargeUtf8, Utf8, Utf8View};
@@ -115,6 +115,7 @@ impl ScalarUDFImpl for RegexpSplitToArrayFunc {
         Ok(match &arg_types[0] {
             DataType::Null => DataType::Null,
             LargeUtf8 => DataType::List(Arc::new(Field::new_list_field(LargeUtf8, true))),
+            Utf8View => DataType::List(Arc::new(Field::new_list_field(Utf8View, true))),
             _ => DataType::List(Arc::new(Field::new_list_field(Utf8, true))),
         })
     }
@@ -186,37 +187,41 @@ fn regexp_split_to_array(
     flags_array: Option<&dyn Array>,
 ) -> Result<ArrayRef, ArrowError> {
     match (values.data_type(), regex_array.data_type(), flags_array) {
-        (Utf8, Utf8, None) => regexp_split_to_array_inner::<_, i32>(
+        (Utf8, Utf8, None) => regexp_split_to_array_inner::<_, GenericStringBuilder<i32>>(
             &values.as_string::<i32>(),
             &regex_array.as_string::<i32>(),
             None,
         ),
         (Utf8, Utf8, Some(flags)) if *flags.data_type() == Utf8 => {
-            regexp_split_to_array_inner::<_, i32>(
+            regexp_split_to_array_inner::<_, GenericStringBuilder<i32>>(
                 &values.as_string::<i32>(),
                 &regex_array.as_string::<i32>(),
                 Some(&flags.as_string::<i32>()),
             )
         }
-        (LargeUtf8, LargeUtf8, None) => regexp_split_to_array_inner::<_, i64>(
-            &values.as_string::<i64>(),
-            &regex_array.as_string::<i64>(),
-            None,
-        ),
+        (LargeUtf8, LargeUtf8, None) => {
+            regexp_split_to_array_inner::<_, GenericStringBuilder<i64>>(
+                &values.as_string::<i64>(),
+                &regex_array.as_string::<i64>(),
+                None,
+            )
+        }
         (LargeUtf8, LargeUtf8, Some(flags)) if *flags.data_type() == LargeUtf8 => {
-            regexp_split_to_array_inner::<_, i64>(
+            regexp_split_to_array_inner::<_, GenericStringBuilder<i64>>(
                 &values.as_string::<i64>(),
                 &regex_array.as_string::<i64>(),
                 Some(&flags.as_string::<i64>()),
             )
         }
-        (Utf8View, Utf8View, None) => regexp_split_to_array_inner::<_, i32>(
-            &values.as_string_view(),
-            &regex_array.as_string_view(),
-            None,
-        ),
+        (Utf8View, Utf8View, None) => {
+            regexp_split_to_array_inner::<_, StringViewBuilder>(
+                &values.as_string_view(),
+                &regex_array.as_string_view(),
+                None,
+            )
+        }
         (Utf8View, Utf8View, Some(flags)) if *flags.data_type() == Utf8View => {
-            regexp_split_to_array_inner::<_, i32>(
+            regexp_split_to_array_inner::<_, StringViewBuilder>(
                 &values.as_string_view(),
                 &regex_array.as_string_view(),
                 Some(&flags.as_string_view()),
@@ -228,23 +233,48 @@ fn regexp_split_to_array(
     }
 }
 
-fn split_and_append<O: OffsetSizeTrait>(
-    list_builder: &mut ListBuilder<GenericStringBuilder<O>>,
+trait StringListBuilder: ArrayBuilder {
+    fn new_builder() -> Self;
+    fn append_str_value(&mut self, val: &str);
+}
+
+impl<O: OffsetSizeTrait> StringListBuilder for GenericStringBuilder<O> {
+    fn new_builder() -> Self {
+        GenericStringBuilder::<O>::new()
+    }
+
+    fn append_str_value(&mut self, val: &str) {
+        self.append_value(val);
+    }
+}
+
+impl StringListBuilder for StringViewBuilder {
+    fn new_builder() -> Self {
+        StringViewBuilder::new()
+    }
+
+    fn append_str_value(&mut self, val: &str) {
+        self.append_value(val);
+    }
+}
+
+fn split_and_append<B: StringListBuilder>(
+    list_builder: &mut ListBuilder<B>,
     value: &str,
     pattern: &Regex,
 ) {
     for part in pattern.split(value) {
-        list_builder.values().append_value(part);
+        list_builder.values().append_str_value(part);
     }
     list_builder.append(true);
 }
 
-fn split_chars_and_append<O: OffsetSizeTrait>(
-    list_builder: &mut ListBuilder<GenericStringBuilder<O>>,
+fn split_chars_and_append<B: StringListBuilder>(
+    list_builder: &mut ListBuilder<B>,
     value: &str,
 ) {
     for c in value.chars() {
-        list_builder.values().append_value(c.to_string());
+        list_builder.values().append_str_value(&c.to_string());
     }
     list_builder.append(true);
 }
@@ -290,14 +320,14 @@ where
     Ok(result)
 }
 
-fn regexp_split_to_array_inner<'a, S, O>(
+fn regexp_split_to_array_inner<'a, S, B>(
     values: &S,
     regex_array: &S,
     flags_array: Option<&S>,
 ) -> Result<ArrayRef, ArrowError>
 where
     S: StringArrayType<'a>,
-    O: OffsetSizeTrait,
+    B: StringListBuilder,
 {
     let is_regex_scalar = regex_array.len() == 1;
     let is_flags_scalar = flags_array.is_none_or(|f| f.len() == 1);
@@ -315,7 +345,7 @@ where
         _ => None,
     };
 
-    let mut list_builder = ListBuilder::new(GenericStringBuilder::<O>::new());
+    let mut list_builder = ListBuilder::new(B::new_builder());
 
     if regex_is_null_scalar {
         for _ in 0..values.len() {
@@ -448,6 +478,7 @@ mod tests {
 
         let return_type = match args[0].data_type() {
             LargeUtf8 => DataType::List(Arc::new(Field::new_list_field(LargeUtf8, true))),
+            Utf8View => DataType::List(Arc::new(Field::new_list_field(Utf8View, true))),
             _ => DataType::List(Arc::new(Field::new_list_field(Utf8, true))),
         };
 
@@ -465,10 +496,20 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::List(arr)) => {
                 let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
                 let values = list_arr.value(0);
-                let str_arr = values.as_string::<i32>();
-                (0..str_arr.len())
-                    .map(|i| str_arr.value(i).to_string())
-                    .collect()
+                match values.data_type() {
+                    Utf8View => {
+                        let str_arr = values.as_string_view();
+                        (0..str_arr.len())
+                            .map(|i| str_arr.value(i).to_string())
+                            .collect()
+                    }
+                    _ => {
+                        let str_arr = values.as_string::<i32>();
+                        (0..str_arr.len())
+                            .map(|i| str_arr.value(i).to_string())
+                            .collect()
+                    }
+                }
             }
             _ => panic!("Expected scalar list result"),
         }
@@ -608,6 +649,13 @@ mod tests {
             ScalarValue::Utf8View(Some("\\s+".to_string())),
         ])
         .unwrap();
+        match &result {
+            ColumnarValue::Scalar(ScalarValue::List(arr)) => {
+                let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+                assert_eq!(*list_arr.value(0).data_type(), Utf8View);
+            }
+            _ => panic!("Expected scalar list result"),
+        }
         assert_eq!(result_to_string_vec(&result), vec!["hello", "world"]);
     }
 
@@ -685,7 +733,8 @@ mod tests {
         let list_arr = result.as_any().downcast_ref::<ListArray>().unwrap();
 
         let row0 = list_arr.value(0);
-        let arr0 = row0.as_string::<i32>();
+        assert_eq!(*row0.data_type(), Utf8View);
+        let arr0 = row0.as_string_view();
         assert_eq!(
             (0..arr0.len()).map(|i| arr0.value(i)).collect::<Vec<_>>(),
             vec!["hello", "world"]
