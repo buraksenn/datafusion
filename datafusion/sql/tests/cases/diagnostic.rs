@@ -471,8 +471,7 @@ fn test_duplicate_alias_non_overlapping_three_tables() -> Result<()> {
 
 #[test]
 fn test_duplicate_derived_subquery_alias() -> Result<()> {
-    let query =
-        "SELECT * FROM (SELECT 1) AS /*a*/t/*a*/, (SELECT 2) AS /*b*/t/*b*/";
+    let query = "SELECT * FROM (SELECT 1) AS /*a*/t/*a*/, (SELECT 2) AS /*b*/t/*b*/";
     let spans = get_spans(query);
     let diag = do_query(query);
     assert_snapshot!(diag.message, @"duplicate table alias in FROM clause");
@@ -485,8 +484,7 @@ fn test_duplicate_derived_subquery_alias() -> Result<()> {
 
 #[test]
 fn test_duplicate_alias_table_and_derived() -> Result<()> {
-    let query =
-        "SELECT * FROM person AS /*a*/t/*a*/, (SELECT 1) AS /*b*/t/*b*/";
+    let query = "SELECT * FROM person AS /*a*/t/*a*/, (SELECT 1) AS /*b*/t/*b*/";
     let spans = get_spans(query);
     let diag = do_query(query);
     assert_snapshot!(diag.message, @"duplicate table alias in FROM clause");
@@ -499,8 +497,7 @@ fn test_duplicate_alias_table_and_derived() -> Result<()> {
 
 #[test]
 fn test_duplicate_alias_derived_and_table() -> Result<()> {
-    let query =
-        "SELECT * FROM (SELECT 1) AS /*a*/t/*a*/, person AS /*b*/t/*b*/";
+    let query = "SELECT * FROM (SELECT 1) AS /*a*/t/*a*/, person AS /*b*/t/*b*/";
     let spans = get_spans(query);
     let diag = do_query(query);
     assert_snapshot!(diag.message, @"duplicate table alias in FROM clause");
@@ -513,8 +510,7 @@ fn test_duplicate_alias_derived_and_table() -> Result<()> {
 
 #[test]
 fn test_duplicate_nested_join_alias() -> Result<()> {
-    let query =
-        "SELECT * FROM (person CROSS JOIN j1) AS /*a*/t/*a*/, (person CROSS JOIN j2) AS /*b*/t/*b*/";
+    let query = "SELECT * FROM (person CROSS JOIN j1) AS /*a*/t/*a*/, (person CROSS JOIN j2) AS /*b*/t/*b*/";
     let spans = get_spans(query);
     let diag = do_query(query);
     assert_snapshot!(diag.message, @"duplicate table alias in FROM clause");
