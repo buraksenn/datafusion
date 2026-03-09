@@ -7003,9 +7003,6 @@ select count(*) from arrays where 'X'=any(column3);
 ----
 0
 
-query error DataFusion error: Error during planning: Unsupported AnyOp: '<>', only '=', '>', '<', '>=', '<=' are supported
-select count(*) from arrays where 'X'<>any(column3);
-
 # any operator with comparison operators
 # Use inline arrays so the test data is visible and the needle (5)
 # falls within the range of some arrays but not others.
@@ -7051,6 +7048,28 @@ select column1, column2 from any_op_test where 5 <= any(column2) order by column
 2 [4, 5, 6]
 3 [7, 8, 9]
 4 [3, 5, 7]
+
+# 5 <> ANY(arr): true when array_min != 5 OR array_max != 5
+# row1: [1,2,3] min=1!=5 ✓, row2: [4,5,6] min=4!=5 ✓, row3: [7,8,9] min=7!=5 ✓, row4: [3,5,7] min=3!=5 ✓
+query I?
+select column1, column2 from any_op_test where 5 <> any(column2) order by column1;
+----
+1 [1, 2, 3]
+2 [4, 5, 6]
+3 [7, 8, 9]
+4 [3, 5, 7]
+
+# For a single-element array where the element equals the needle, <> should return false
+query B
+select 5 <> any(make_array(5));
+----
+false
+
+# For a uniform array [5,5,5], <> should also return false
+query B
+select 5 <> any(make_array(5, 5, 5));
+----
+false
 
 statement ok
 DROP TABLE any_op_test;

@@ -616,6 +616,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let right_expr = self.sql_to_expr(*right, schema, planner_context)?;
                     match compare_op {
                         BinaryOperator::Eq => Ok(array_has(right_expr, left_expr)),
+                        BinaryOperator::NotEq => Ok(array_min(right_expr.clone())
+                            .not_eq(left_expr.clone())
+                            .or(array_max(right_expr).not_eq(left_expr))),
                         BinaryOperator::Gt => Ok(array_min(right_expr).lt(left_expr)),
                         BinaryOperator::Lt => Ok(array_max(right_expr).gt(left_expr)),
                         BinaryOperator::GtEq => {
@@ -625,7 +628,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             Ok(array_max(right_expr).gt_eq(left_expr))
                         }
                         _ => plan_err!(
-                            "Unsupported AnyOp: '{compare_op}', only '=', '>', '<', '>=', '<=' are supported"
+                            "Unsupported AnyOp: '{compare_op}', only '=', '<>', '>', '<', '>=', '<=' are supported"
                         ),
                     }
                 }
