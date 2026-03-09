@@ -7003,8 +7003,57 @@ select count(*) from arrays where 'X'=any(column3);
 ----
 0
 
-query error DataFusion error: Error during planning: Unsupported AnyOp: '>', only '=' is supported
-select count(*) from arrays where 'X'>any(column3);
+query error DataFusion error: Error during planning: Unsupported AnyOp: '<>', only '=', '>', '<', '>=', '<=' are supported
+select count(*) from arrays where 'X'<>any(column3);
+
+# any operator with comparison operators
+# Use inline arrays so the test data is visible and the needle (5)
+# falls within the range of some arrays but not others.
+statement ok
+CREATE TABLE any_op_test AS VALUES
+  (1, make_array(1, 2, 3)),
+  (2, make_array(4, 5, 6)),
+  (3, make_array(7, 8, 9)),
+  (4, make_array(3, 5, 7));
+
+# 5 > ANY(arr): true when array_min < 5
+# row1: min=1 < 5 ✓, row2: min=4 < 5 ✓, row3: min=7 < 5 ✗, row4: min=3 < 5 ✓
+query I?
+select column1, column2 from any_op_test where 5 > any(column2) order by column1;
+----
+1 [1, 2, 3]
+2 [4, 5, 6]
+4 [3, 5, 7]
+
+# 5 >= ANY(arr): true when array_min <= 5
+# row1: min=1 <= 5 ✓, row2: min=4 <= 5 ✓, row3: min=7 <= 5 ✗, row4: min=3 <= 5 ✓
+query I?
+select column1, column2 from any_op_test where 5 >= any(column2) order by column1;
+----
+1 [1, 2, 3]
+2 [4, 5, 6]
+4 [3, 5, 7]
+
+# 5 < ANY(arr): true when array_max > 5
+# row1: max=3 > 5 ✗, row2: max=6 > 5 ✓, row3: max=9 > 5 ✓, row4: max=7 > 5 ✓
+query I?
+select column1, column2 from any_op_test where 5 < any(column2) order by column1;
+----
+2 [4, 5, 6]
+3 [7, 8, 9]
+4 [3, 5, 7]
+
+# 5 <= ANY(arr): true when array_max >= 5
+# row1: max=3 >= 5 ✗, row2: max=6 >= 5 ✓, row3: max=9 >= 5 ✓, row4: max=7 >= 5 ✓
+query I?
+select column1, column2 from any_op_test where 5 <= any(column2) order by column1;
+----
+2 [4, 5, 6]
+3 [7, 8, 9]
+4 [3, 5, 7]
+
+statement ok
+DROP TABLE any_op_test;
 
 ## array_distinct
 

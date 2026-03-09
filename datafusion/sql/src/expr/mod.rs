@@ -40,7 +40,7 @@ use datafusion_expr::{
 };
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_functions_nested::expr_fn::array_has;
+use datafusion_functions_nested::expr_fn::{array_has, array_max, array_min};
 
 mod binary_op;
 mod function;
@@ -612,16 +612,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     planner_context,
                 ),
                 _ => {
-                    if compare_op != BinaryOperator::Eq {
-                        plan_err!(
-                            "Unsupported AnyOp: '{compare_op}', only '=' is supported"
-                        )
-                    } else {
-                        let left_expr =
-                            self.sql_to_expr(*left, schema, planner_context)?;
-                        let right_expr =
-                            self.sql_to_expr(*right, schema, planner_context)?;
-                        Ok(array_has(right_expr, left_expr))
+                    let left_expr = self.sql_to_expr(*left, schema, planner_context)?;
+                    let right_expr = self.sql_to_expr(*right, schema, planner_context)?;
+                    match compare_op {
+                        BinaryOperator::Eq => Ok(array_has(right_expr, left_expr)),
+                        BinaryOperator::Gt => Ok(array_min(right_expr).lt(left_expr)),
+                        BinaryOperator::Lt => Ok(array_max(right_expr).gt(left_expr)),
+                        BinaryOperator::GtEq => {
+                            Ok(array_min(right_expr).lt_eq(left_expr))
+                        }
+                        BinaryOperator::LtEq => {
+                            Ok(array_max(right_expr).gt_eq(left_expr))
+                        }
+                        _ => plan_err!(
+                            "Unsupported AnyOp: '{compare_op}', only '=', '>', '<', '>=', '<=' are supported"
+                        ),
                     }
                 }
             },
