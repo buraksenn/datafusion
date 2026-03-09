@@ -696,9 +696,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             _ => {
                 let extract_table_name =
                     |t: &TableWithJoins| -> Option<(String, Option<Span>)> {
-                        let span = Span::try_from_sqlparser_span(t.relation.span());
                         match &t.relation {
-                            TableFactor::Table { alias: Some(a), .. } => {
+                            TableFactor::Table { alias: Some(a), .. }
+                            | TableFactor::Derived { alias: Some(a), .. }
+                            | TableFactor::Function { alias: Some(a), .. }
+                            | TableFactor::UNNEST { alias: Some(a), .. }
+                            | TableFactor::NestedJoin { alias: Some(a), .. } => {
+                                let span = Span::try_from_sqlparser_span(a.name.span);
                                 let name =
                                     self.ident_normalizer.normalize(a.name.clone());
                                 Some((name, span))
@@ -706,6 +710,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             TableFactor::Table {
                                 name, alias: None, ..
                             } => {
+                                let span =
+                                    Span::try_from_sqlparser_span(t.relation.span());
                                 let table_name = name
                                     .0
                                     .iter()
