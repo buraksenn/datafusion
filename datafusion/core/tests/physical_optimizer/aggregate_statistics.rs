@@ -412,7 +412,7 @@ async fn utf8_grouping_min_max_limit_fallbacks() -> Result<()> {
 
 fn mock_data_with_distinct_count(
     distinct_count: Precision<usize>,
-) -> Arc<DataSourceExec> {
+) -> Arc<dyn ExecutionPlan> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int32, true),
         Field::new("b", DataType::Int32, true),
@@ -442,9 +442,10 @@ fn mock_data_with_distinct_count(
     DataSourceExec::from_data_source(config)
 }
 
-#[tokio::test]
-async fn test_count_distinct_with_exact_statistics() -> Result<()> {
-    let source = mock_data_with_distinct_count(Precision::Exact(42));
+fn optimize_count_distinct(
+    distinct_count: Precision<usize>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let source = mock_data_with_distinct_count(distinct_count);
     let schema = source.schema();
 
     let count_distinct_expr =
@@ -473,7 +474,12 @@ async fn test_count_distinct_with_exact_statistics() -> Result<()> {
     )?;
 
     let conf = ConfigOptions::new();
-    let optimized = AggregateStatistics::new().optimize(Arc::new(final_agg), &conf)?;
+    AggregateStatistics::new().optimize(Arc::new(final_agg), &conf)
+}
+
+#[tokio::test]
+async fn test_count_distinct_with_exact_statistics() -> Result<()> {
+    let optimized = optimize_count_distinct(Precision::Exact(42))?;
 
     assert!(optimized.as_any().is::<ProjectionExec>());
 
@@ -487,53 +493,35 @@ async fn test_count_distinct_with_exact_statistics() -> Result<()> {
 
 #[tokio::test]
 async fn test_count_distinct_with_absent_statistics() -> Result<()> {
-    let source = mock_data_with_distinct_count(Precision::Absent);
-    let schema = source.schema();
-
-    let count_distinct_expr =
-        AggregateExprBuilder::new(count_udaf(), vec![expressions::col("a", &schema)?])
-            .schema(Arc::clone(&schema))
-            .alias("COUNT(DISTINCT a)")
-            .distinct()
-            .build()?;
-
-    let partial_agg = AggregateExec::try_new(
-        AggregateMode::Partial,
-        PhysicalGroupBy::default(),
-        vec![Arc::new(count_distinct_expr.clone())],
-        vec![None],
-        source,
-        Arc::clone(&schema),
-    )?;
-
-    let final_agg = AggregateExec::try_new(
-        AggregateMode::Final,
-        PhysicalGroupBy::default(),
-        vec![Arc::new(count_distinct_expr)],
-        vec![None],
-        Arc::new(partial_agg),
-        Arc::clone(&schema),
-    )?;
-
-    let conf = ConfigOptions::new();
-    let optimized = AggregateStatistics::new().optimize(Arc::new(final_agg), &conf)?;
-
+    let optimized = optimize_count_distinct(Precision::Absent)?;
     assert!(optimized.as_any().is::<AggregateExec>());
-
     Ok(())
 }
 
 #[tokio::test]
 async fn test_count_distinct_with_inexact_statistics() -> Result<()> {
-    let source = mock_data_with_distinct_count(Precision::Inexact(42));
+    let optimized = optimize_count_distinct(Precision::Inexact(42))?;
+    assert!(optimized.as_any().is::<AggregateExec>());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_count_distinct_with_non_column_expr() -> Result<()> {
+    let source = mock_data_with_distinct_count(Precision::Exact(42));
     let schema = source.schema();
 
-    let count_distinct_expr =
-        AggregateExprBuilder::new(count_udaf(), vec![expressions::col("a", &schema)?])
-            .schema(Arc::clone(&schema))
-            .alias("COUNT(DISTINCT a)")
-            .distinct()
-            .build()?;
+    let expr = expressions::binary(
+        expressions::col("a", &schema)?,
+        Operator::Plus,
+        expressions::col("b", &schema)?,
+        &schema,
+    )?;
+
+    let count_distinct_expr = AggregateExprBuilder::new(count_udaf(), vec![expr])
+        .schema(Arc::clone(&schema))
+        .alias("COUNT(DISTINCT a + b)")
+        .distinct()
+        .build()?;
 
     let partial_agg = AggregateExec::try_new(
         AggregateMode::Partial,

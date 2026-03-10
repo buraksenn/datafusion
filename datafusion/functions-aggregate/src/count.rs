@@ -371,6 +371,8 @@ impl AggregateUDFImpl for Count {
         let col_stats = &statistics_args.statistics.column_statistics;
 
         if statistics_args.is_distinct {
+            // Only column references can be resolved from statistics;
+            // expressions like casts or literals are not supported.
             let col_expr = expr.as_any().downcast_ref::<expressions::Column>()?;
             if let Precision::Exact(dc) = col_stats[col_expr.index()].distinct_count {
                 return Some(ScalarValue::Int64(Some(dc as i64)));
