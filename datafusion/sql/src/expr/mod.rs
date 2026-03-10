@@ -618,14 +618,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         BinaryOperator::Eq => Ok(array_has(right_expr, left_expr)),
                         BinaryOperator::NotEq => Ok(array_min(right_expr.clone())
                             .not_eq(left_expr.clone())
-                            .or(array_max(right_expr).not_eq(left_expr))),
-                        BinaryOperator::Gt => Ok(array_min(right_expr).lt(left_expr)),
-                        BinaryOperator::Lt => Ok(array_max(right_expr).gt(left_expr)),
+                            .or(array_max(right_expr).not_eq(left_expr))
+                            .is_true()),
+                        BinaryOperator::Gt => {
+                            Ok(array_min(right_expr).lt(left_expr).is_true())
+                        }
+                        BinaryOperator::Lt => {
+                            Ok(array_max(right_expr).gt(left_expr).is_true())
+                        }
                         BinaryOperator::GtEq => {
-                            Ok(array_min(right_expr).lt_eq(left_expr))
+                            Ok(array_min(right_expr).lt_eq(left_expr).is_true())
                         }
                         BinaryOperator::LtEq => {
-                            Ok(array_max(right_expr).gt_eq(left_expr))
+                            Ok(array_max(right_expr).gt_eq(left_expr).is_true())
                         }
                         _ => plan_err!(
                             "Unsupported AnyOp: '{compare_op}', only '=', '<>', '>', '<', '>=', '<=' are supported"

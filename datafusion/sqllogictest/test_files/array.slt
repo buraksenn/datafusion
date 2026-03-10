@@ -7071,6 +7071,63 @@ select 5 <> any(make_array(5, 5, 5));
 ----
 false
 
+# Empty array: all operators should return false (no elements satisfy the condition)
+query B
+select 5 = any(make_array());
+----
+false
+
+query B
+select 5 <> any(make_array());
+----
+false
+
+query B
+select 5 > any(make_array());
+----
+false
+
+query B
+select 5 < any(make_array());
+----
+false
+
+query B
+select 5 >= any(make_array());
+----
+false
+
+query B
+select 5 <= any(make_array());
+----
+false
+
+# All-NULL array: all operators should return false
+query B
+select 5 > any(make_array(NULL::INT, NULL::INT));
+----
+false
+
+query B
+select 5 < any(make_array(NULL::INT, NULL::INT));
+----
+false
+
+query B
+select 5 >= any(make_array(NULL::INT, NULL::INT));
+----
+false
+
+query B
+select 5 <= any(make_array(NULL::INT, NULL::INT));
+----
+false
+
+query B
+select 5 <> any(make_array(NULL::INT, NULL::INT));
+----
+false
+
 statement ok
 DROP TABLE any_op_test;
 
