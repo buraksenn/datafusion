@@ -384,6 +384,7 @@ impl AggregateUDFImpl for Count {
             return None;
         };
 
+        // TODO optimize with exprs other than Column
         if let Some(col_expr) = expr.as_any().downcast_ref::<expressions::Column>() {
             if let Precision::Exact(val) = col_stats[col_expr.index()].null_count {
                 return Some(ScalarValue::Int64(Some((num_rows - val) as i64)));
