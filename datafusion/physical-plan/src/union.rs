@@ -49,6 +49,7 @@ use crate::stream::ObservedStream;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Result, assert_or_internal_err, exec_err, internal_datafusion_err,
@@ -853,13 +854,99 @@ fn col_stats_union(
     mut left: ColumnStatistics,
     right: &ColumnStatistics,
 ) -> ColumnStatistics {
-    left.distinct_count = left.distinct_count.add(&right.distinct_count).to_inexact();
+    left.distinct_count = union_distinct_count(&left, right);
     left.min_value = left.min_value.min(&right.min_value);
     left.max_value = left.max_value.max(&right.max_value);
     left.sum_value = left.sum_value.add(&right.sum_value);
     left.null_count = left.null_count.add(&right.null_count);
 
     left
+}
+
+fn union_distinct_count(
+    left: &ColumnStatistics,
+    right: &ColumnStatistics,
+) -> Precision<usize> {
+    let (ndv_left, ndv_right) = match (
+        left.distinct_count.get_value(),
+        right.distinct_count.get_value(),
+    ) {
+        (Some(&l), Some(&r)) => (l, r),
+        _ => return Precision::Absent,
+    };
+
+    // Even with exact inputs, the union NDV depends on how
+    // many distinct values are shared between the left and right.
+    // We can only estimate this via range overlap. Thus both paths
+    // below return `Inexact`.
+    if let Some(ndv) = estimate_ndv_with_overlap(left, right, ndv_left, ndv_right) {
+        return Precision::Inexact(ndv);
+    }
+
+    Precision::Inexact(ndv_left + ndv_right)
+}
+
+/// Estimates the distinct count for a union using range overlap, following
+/// the approach used by Trino:
+///
+/// overlap_a = fraction of A's range that overlaps with B
+/// overlap_b = fraction of B's range that overlaps with A
+/// NDV = max(overlap_a * NDV_a, overlap_b * NDV_b)   [intersection]
+///     + (1 - overlap_a) * NDV_a                      [only in A]
+///     + (1 - overlap_b) * NDV_b                      [only in B]
+fn estimate_ndv_with_overlap(
+    left: &ColumnStatistics,
+    right: &ColumnStatistics,
+    ndv_left: usize,
+    ndv_right: usize,
+) -> Option<usize> {
+    let min_left = left.min_value.get_value()?;
+    let max_left = left.max_value.get_value()?;
+    let min_right = right.min_value.get_value()?;
+    let max_right = right.max_value.get_value()?;
+
+    let range_left = max_left.distance(min_left)?;
+    let range_right = max_right.distance(min_right)?;
+
+    // Constant columns (range == 0) can't use the proportional overlap
+    // formula below, so check interval overlap directly instead.
+    if range_left == 0 || range_right == 0 {
+        let overlaps = min_left <= max_right && min_right <= max_left;
+        return Some(if overlaps {
+            usize::max(ndv_left, ndv_right)
+        } else {
+            ndv_left + ndv_right
+        });
+    }
+
+    let overlap_min = if min_left >= min_right {
+        min_left
+    } else {
+        min_right
+    };
+    let overlap_max = if max_left <= max_right {
+        max_left
+    } else {
+        max_right
+    };
+
+    if overlap_min > overlap_max {
+        return Some(ndv_left + ndv_right);
+    }
+
+    let overlap_range = overlap_max.distance(overlap_min)? as f64;
+
+    let overlap_left = overlap_range / range_left as f64;
+    let overlap_right = overlap_range / range_right as f64;
+
+    let intersection = f64::max(
+        overlap_left * ndv_left as f64,
+        overlap_right * ndv_right as f64,
+    );
+    let only_left = (1.0 - overlap_left) * ndv_left as f64;
+    let only_right = (1.0 - overlap_right) * ndv_right as f64;
+
+    Some((intersection + only_left + only_right).round() as usize)
 }
 
 fn stats_union(mut left: Statistics, right: Statistics) -> Statistics {
@@ -1014,7 +1101,7 @@ mod tests {
             total_byte_size: Precision::Exact(52),
             column_statistics: vec![
                 ColumnStatistics {
-                    distinct_count: Precision::Inexact(8),
+                    distinct_count: Precision::Inexact(6),
                     max_value: Precision::Exact(ScalarValue::Int64(Some(34))),
                     min_value: Precision::Exact(ScalarValue::Int64(Some(-4))),
                     sum_value: Precision::Exact(ScalarValue::Int64(Some(84))),
@@ -1043,60 +1130,194 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[tokio::test]
-    async fn test_stats_union_distinct_count_inexact() {
-        let left = Statistics {
-            num_rows: Precision::Exact(10),
-            total_byte_size: Precision::Absent,
-            column_statistics: vec![
-                ColumnStatistics {
-                    distinct_count: Precision::Exact(10),
-                    ..Default::default()
-                },
-                ColumnStatistics {
-                    distinct_count: Precision::Inexact(7),
-                    ..Default::default()
-                },
-                ColumnStatistics {
-                    distinct_count: Precision::Inexact(4),
-                    ..Default::default()
-                },
-            ],
-        };
+    #[test]
+    fn test_union_distinct_count() {
+        // (left_ndv, left_min, left_max, right_ndv, right_min, right_max, expected)
+        let cases: Vec<(
+            Precision<usize>,
+            Option<i64>,
+            Option<i64>,
+            Precision<usize>,
+            Option<i64>,
+            Option<i64>,
+            Precision<usize>,
+        )> = vec![
+            // disjoint ranges: NDV = 5 + 3
+            (
+                Precision::Exact(5),
+                Some(0),
+                Some(10),
+                Precision::Exact(3),
+                Some(20),
+                Some(30),
+                Precision::Inexact(8),
+            ),
+            // identical ranges: intersection = max(10, 8) = 10
+            (
+                Precision::Exact(10),
+                Some(0),
+                Some(100),
+                Precision::Exact(8),
+                Some(0),
+                Some(100),
+                Precision::Inexact(10),
+            ),
+            // partial overlap: 50 + 50 + 25 = 125
+            (
+                Precision::Exact(100),
+                Some(0),
+                Some(100),
+                Precision::Exact(50),
+                Some(50),
+                Some(150),
+                Precision::Inexact(125),
+            ),
+            // right contained in left: 50 + 50 + 0 = 100
+            (
+                Precision::Exact(100),
+                Some(0),
+                Some(100),
+                Precision::Exact(50),
+                Some(25),
+                Some(75),
+                Precision::Inexact(100),
+            ),
+            // both constant, same value
+            (
+                Precision::Exact(1),
+                Some(5),
+                Some(5),
+                Precision::Exact(1),
+                Some(5),
+                Some(5),
+                Precision::Inexact(1),
+            ),
+            // both constant, different values
+            (
+                Precision::Exact(1),
+                Some(5),
+                Some(5),
+                Precision::Exact(1),
+                Some(10),
+                Some(10),
+                Precision::Inexact(2),
+            ),
+            // left constant within right range
+            (
+                Precision::Exact(1),
+                Some(5),
+                Some(5),
+                Precision::Exact(10),
+                Some(0),
+                Some(10),
+                Precision::Inexact(10),
+            ),
+            // left constant outside right range
+            (
+                Precision::Exact(1),
+                Some(20),
+                Some(20),
+                Precision::Exact(10),
+                Some(0),
+                Some(10),
+                Precision::Inexact(11),
+            ),
+            // right constant within left range
+            (
+                Precision::Exact(10),
+                Some(0),
+                Some(10),
+                Precision::Exact(1),
+                Some(5),
+                Some(5),
+                Precision::Inexact(10),
+            ),
+            // right constant outside left range
+            (
+                Precision::Exact(10),
+                Some(0),
+                Some(10),
+                Precision::Exact(1),
+                Some(20),
+                Some(20),
+                Precision::Inexact(11),
+            ),
+            // missing min/max falls back to sum (exact + exact)
+            (
+                Precision::Exact(10),
+                None,
+                None,
+                Precision::Exact(5),
+                None,
+                None,
+                Precision::Inexact(15),
+            ),
+            // missing min/max falls back to sum (exact + inexact)
+            (
+                Precision::Exact(10),
+                None,
+                None,
+                Precision::Inexact(5),
+                None,
+                None,
+                Precision::Inexact(15),
+            ),
+            // missing min/max falls back to sum (inexact + inexact)
+            (
+                Precision::Inexact(7),
+                None,
+                None,
+                Precision::Inexact(3),
+                None,
+                None,
+                Precision::Inexact(10),
+            ),
+            // one side absent
+            (
+                Precision::Exact(10),
+                None,
+                None,
+                Precision::Absent,
+                None,
+                None,
+                Precision::Absent,
+            ),
+            // one side absent (inexact + absent)
+            (
+                Precision::Inexact(4),
+                None,
+                None,
+                Precision::Absent,
+                None,
+                None,
+                Precision::Absent,
+            ),
+        ];
 
-        let right = Statistics {
-            num_rows: Precision::Exact(8),
-            total_byte_size: Precision::Absent,
-            column_statistics: vec![
-                ColumnStatistics {
-                    distinct_count: Precision::Inexact(5),
-                    ..Default::default()
-                },
-                ColumnStatistics {
-                    distinct_count: Precision::Inexact(3),
-                    ..Default::default()
-                },
-                ColumnStatistics {
-                    distinct_count: Precision::Absent,
-                    ..Default::default()
-                },
-            ],
-        };
-
-        let result = stats_union(left, right);
-
-        assert_eq!(
-            result.column_statistics[0].distinct_count,
-            Precision::Inexact(15)
-        );
-        assert_eq!(
-            result.column_statistics[1].distinct_count,
-            Precision::Inexact(10)
-        );
-        assert_eq!(
-            result.column_statistics[2].distinct_count,
-            Precision::Absent
-        );
+        for (
+            i,
+            (left_ndv, left_min, left_max, right_ndv, right_min, right_max, expected),
+        ) in cases.into_iter().enumerate()
+        {
+            let to_sv = |v| Precision::Exact(ScalarValue::Int64(Some(v)));
+            let left = ColumnStatistics {
+                distinct_count: left_ndv,
+                min_value: left_min.map(to_sv).unwrap_or(Precision::Absent),
+                max_value: left_max.map(to_sv).unwrap_or(Precision::Absent),
+                ..Default::default()
+            };
+            let right = ColumnStatistics {
+                distinct_count: right_ndv,
+                min_value: right_min.map(to_sv).unwrap_or(Precision::Absent),
+                max_value: right_max.map(to_sv).unwrap_or(Precision::Absent),
+                ..Default::default()
+            };
+            assert_eq!(
+                union_distinct_count(&left, &right),
+                expected,
+                "case {i} failed"
+            );
+        }
     }
 
     #[tokio::test]
