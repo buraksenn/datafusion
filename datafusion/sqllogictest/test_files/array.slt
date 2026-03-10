@@ -7102,6 +7102,59 @@ select 5 <= any(make_array());
 ----
 false
 
+# Mixed NULL + non-NULL array where no non-NULL element satisfies the condition
+# These return false (NULLs are skipped by array_min/array_max)
+query B
+select 5 > any(make_array(6, NULL));
+----
+false
+
+query B
+select 5 < any(make_array(3, NULL));
+----
+false
+
+query B
+select 5 >= any(make_array(6, NULL));
+----
+false
+
+query B
+select 5 <= any(make_array(3, NULL));
+----
+false
+
+# Mixed NULL + non-NULL array where a non-NULL element satisfies the condition
+query B
+select 5 > any(make_array(3, NULL));
+----
+true
+
+query B
+select 5 < any(make_array(6, NULL));
+----
+true
+
+query B
+select 5 >= any(make_array(5, NULL));
+----
+true
+
+query B
+select 5 <= any(make_array(5, NULL));
+----
+true
+
+query B
+select 5 <> any(make_array(3, NULL));
+----
+true
+
+query B
+select 5 <> any(make_array(5, NULL));
+----
+false
+
 # All-NULL array: all operators should return false
 query B
 select 5 > any(make_array(NULL::INT, NULL::INT));
