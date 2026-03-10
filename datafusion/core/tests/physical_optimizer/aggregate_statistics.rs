@@ -23,16 +23,23 @@ use arrow::array::Int32Array;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemTable;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::physical_plan::ParquetSource;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_common::Result;
 use datafusion_common::assert_batches_eq;
 use datafusion_common::cast::as_int64_array;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::stats::Precision;
+use datafusion_common::{ColumnStatistics, Result, Statistics};
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_execution::TaskContext;
+use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::Operator;
+use datafusion_functions_aggregate::count::count_udaf;
+use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 use datafusion_physical_expr::expressions::{self, cast};
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::aggregate_statistics::AggregateStatistics;
@@ -399,6 +406,157 @@ async fn utf8_grouping_min_max_limit_fallbacks() -> Result<()> {
         ],
         &unsupported_batches
     );
+
+    Ok(())
+}
+
+fn mock_data_with_distinct_count(
+    distinct_count: Precision<usize>,
+) -> Arc<DataSourceExec> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+    ]));
+
+    let statistics = Statistics {
+        num_rows: Precision::Exact(100),
+        total_byte_size: Precision::Absent,
+        column_statistics: vec![
+            ColumnStatistics {
+                distinct_count,
+                null_count: Precision::Exact(10),
+                ..Default::default()
+            },
+            ColumnStatistics::default(),
+        ],
+    };
+
+    let config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::parse("test:///").unwrap(),
+        Arc::new(ParquetSource::new(Arc::clone(&schema))),
+    )
+    .with_file(PartitionedFile::new("x".to_string(), 100))
+    .with_statistics(statistics)
+    .build();
+
+    DataSourceExec::from_data_source(config)
+}
+
+#[tokio::test]
+async fn test_count_distinct_with_exact_statistics() -> Result<()> {
+    let source = mock_data_with_distinct_count(Precision::Exact(42));
+    let schema = source.schema();
+
+    let count_distinct_expr =
+        AggregateExprBuilder::new(count_udaf(), vec![expressions::col("a", &schema)?])
+            .schema(Arc::clone(&schema))
+            .alias("COUNT(DISTINCT a)")
+            .distinct()
+            .build()?;
+
+    let partial_agg = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::default(),
+        vec![Arc::new(count_distinct_expr.clone())],
+        vec![None],
+        source,
+        Arc::clone(&schema),
+    )?;
+
+    let final_agg = AggregateExec::try_new(
+        AggregateMode::Final,
+        PhysicalGroupBy::default(),
+        vec![Arc::new(count_distinct_expr)],
+        vec![None],
+        Arc::new(partial_agg),
+        Arc::clone(&schema),
+    )?;
+
+    let conf = ConfigOptions::new();
+    let optimized = AggregateStatistics::new().optimize(Arc::new(final_agg), &conf)?;
+
+    assert!(optimized.as_any().is::<ProjectionExec>());
+
+    let task_ctx = Arc::new(TaskContext::default());
+    let result = common::collect(optimized.execute(0, task_ctx)?).await?;
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int64_array(result[0].column(0)).unwrap().values(), &[42]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_count_distinct_with_absent_statistics() -> Result<()> {
+    let source = mock_data_with_distinct_count(Precision::Absent);
+    let schema = source.schema();
+
+    let count_distinct_expr =
+        AggregateExprBuilder::new(count_udaf(), vec![expressions::col("a", &schema)?])
+            .schema(Arc::clone(&schema))
+            .alias("COUNT(DISTINCT a)")
+            .distinct()
+            .build()?;
+
+    let partial_agg = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::default(),
+        vec![Arc::new(count_distinct_expr.clone())],
+        vec![None],
+        source,
+        Arc::clone(&schema),
+    )?;
+
+    let final_agg = AggregateExec::try_new(
+        AggregateMode::Final,
+        PhysicalGroupBy::default(),
+        vec![Arc::new(count_distinct_expr)],
+        vec![None],
+        Arc::new(partial_agg),
+        Arc::clone(&schema),
+    )?;
+
+    let conf = ConfigOptions::new();
+    let optimized = AggregateStatistics::new().optimize(Arc::new(final_agg), &conf)?;
+
+    assert!(optimized.as_any().is::<AggregateExec>());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_count_distinct_with_inexact_statistics() -> Result<()> {
+    let source = mock_data_with_distinct_count(Precision::Inexact(42));
+    let schema = source.schema();
+
+    let count_distinct_expr =
+        AggregateExprBuilder::new(count_udaf(), vec![expressions::col("a", &schema)?])
+            .schema(Arc::clone(&schema))
+            .alias("COUNT(DISTINCT a)")
+            .distinct()
+            .build()?;
+
+    let partial_agg = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::default(),
+        vec![Arc::new(count_distinct_expr.clone())],
+        vec![None],
+        source,
+        Arc::clone(&schema),
+    )?;
+
+    let final_agg = AggregateExec::try_new(
+        AggregateMode::Final,
+        PhysicalGroupBy::default(),
+        vec![Arc::new(count_distinct_expr)],
+        vec![None],
+        Arc::new(partial_agg),
+        Arc::clone(&schema),
+    )?;
+
+    let conf = ConfigOptions::new();
+    let optimized = AggregateStatistics::new().optimize(Arc::new(final_agg), &conf)?;
+
+    assert!(optimized.as_any().is::<AggregateExec>());
 
     Ok(())
 }
