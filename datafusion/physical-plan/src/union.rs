@@ -891,7 +891,7 @@ fn union_distinct_count(
 ///
 /// overlap_a = fraction of A's range that overlaps with B
 /// overlap_b = fraction of B's range that overlaps with A
-/// NDV = max(overlap_a * NDV_a, overlap_b * NDV_b)   [intersection]
+/// NDV = max(overlap_a * NDV_a, overlap_b * NDV_b)   \[intersection\]
 ///     + (1 - overlap_a) * NDV_a                      [only in A]
 ///     + (1 - overlap_b) * NDV_b                      [only in B]
 fn estimate_ndv_with_overlap(
@@ -1133,7 +1133,7 @@ mod tests {
     #[test]
     fn test_union_distinct_count() {
         // (left_ndv, left_min, left_max, right_ndv, right_min, right_max, expected)
-        let cases: Vec<(
+        type NdvTestCase = (
             Precision<usize>,
             Option<i64>,
             Option<i64>,
@@ -1141,7 +1141,8 @@ mod tests {
             Option<i64>,
             Option<i64>,
             Precision<usize>,
-        )> = vec![
+        );
+        let cases: Vec<NdvTestCase> = vec![
             // disjoint ranges: NDV = 5 + 3
             (
                 Precision::Exact(5),
