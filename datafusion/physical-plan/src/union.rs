@@ -930,6 +930,10 @@ fn estimate_ndv_with_overlap(
         max_right
     };
 
+    // Short-circuit: when there's no overlap the formula naturally
+    // degrades to ndv_left + ndv_right (overlap_range = 0 gives
+    // overlap_left = overlap_right = 0), but returning early avoids
+    // the floating-point math and a fallible `distance()` call.
     if overlap_min > overlap_max {
         return Some(ndv_left + ndv_right);
     }
