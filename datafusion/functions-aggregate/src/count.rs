@@ -375,7 +375,8 @@ impl AggregateUDFImpl for Count {
             // expressions like casts or literals are not supported.
             let col_expr = expr.as_any().downcast_ref::<expressions::Column>()?;
             if let Precision::Exact(dc) = col_stats[col_expr.index()].distinct_count {
-                return Some(ScalarValue::Int64(Some(dc as i64)));
+                let dc = i64::try_from(dc).ok()?;
+                return Some(ScalarValue::Int64(Some(dc)));
             }
             return None;
         }
@@ -387,13 +388,15 @@ impl AggregateUDFImpl for Count {
         // TODO optimize with exprs other than Column
         if let Some(col_expr) = expr.as_any().downcast_ref::<expressions::Column>() {
             if let Precision::Exact(val) = col_stats[col_expr.index()].null_count {
-                return Some(ScalarValue::Int64(Some((num_rows - val) as i64)));
+                let count = i64::try_from(num_rows - val).ok()?;
+                return Some(ScalarValue::Int64(Some(count)));
             }
         } else if let Some(lit_expr) =
             expr.as_any().downcast_ref::<expressions::Literal>()
             && lit_expr.value() == &COUNT_STAR_EXPANSION
         {
-            return Some(ScalarValue::Int64(Some(num_rows as i64)));
+            let num_rows = i64::try_from(num_rows).ok()?;
+            return Some(ScalarValue::Int64(Some(num_rows)));
         }
 
         None
