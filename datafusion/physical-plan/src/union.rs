@@ -49,7 +49,6 @@ use crate::stream::ObservedStream;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Result, assert_or_internal_err, exec_err, internal_datafusion_err,
@@ -843,7 +842,7 @@ fn col_stats_union(
     mut left: ColumnStatistics,
     right: &ColumnStatistics,
 ) -> ColumnStatistics {
-    left.distinct_count = Precision::Absent;
+    left.distinct_count = left.distinct_count.add(&right.distinct_count).to_inexact();
     left.min_value = left.min_value.min(&right.min_value);
     left.max_value = left.max_value.max(&right.max_value);
     left.sum_value = left.sum_value.add(&right.sum_value);
@@ -1003,7 +1002,7 @@ mod tests {
             total_byte_size: Precision::Exact(52),
             column_statistics: vec![
                 ColumnStatistics {
-                    distinct_count: Precision::Absent,
+                    distinct_count: Precision::Inexact(8),
                     max_value: Precision::Exact(ScalarValue::Int64(Some(34))),
                     min_value: Precision::Exact(ScalarValue::Int64(Some(-4))),
                     sum_value: Precision::Exact(ScalarValue::Int64(Some(84))),
@@ -1030,6 +1029,62 @@ mod tests {
         };
 
         assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn test_stats_union_distinct_count_inexact() {
+        let left = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(10),
+                    ..Default::default()
+                },
+                ColumnStatistics {
+                    distinct_count: Precision::Inexact(7),
+                    ..Default::default()
+                },
+                ColumnStatistics {
+                    distinct_count: Precision::Inexact(4),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let right = Statistics {
+            num_rows: Precision::Exact(8),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    distinct_count: Precision::Inexact(5),
+                    ..Default::default()
+                },
+                ColumnStatistics {
+                    distinct_count: Precision::Inexact(3),
+                    ..Default::default()
+                },
+                ColumnStatistics {
+                    distinct_count: Precision::Absent,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let result = stats_union(left, right);
+
+        assert_eq!(
+            result.column_statistics[0].distinct_count,
+            Precision::Inexact(15)
+        );
+        assert_eq!(
+            result.column_statistics[1].distinct_count,
+            Precision::Inexact(10)
+        );
+        assert_eq!(
+            result.column_statistics[2].distinct_count,
+            Precision::Absent
+        );
     }
 
     #[tokio::test]
