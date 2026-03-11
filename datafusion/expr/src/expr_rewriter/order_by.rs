@@ -75,8 +75,10 @@ fn rewrite_in_terms_of_projection(
     // assumption is that each item in exprs, such as "b + c" is
     // available as an output column named "b + c"
     expr.transform(|expr| {
-        // search for unnormalized names first such as "c1" (such as aliases)
-        if let Some(found) = proj_exprs.iter().find(|a| (**a) == expr) {
+        // search for unnormalized names first such as "c1" (such as aliases).
+        // Also look inside aliases so e.g. `count(Int64(1))` matches
+        // `count(Int64(1)) AS count(*)`.
+        if let Some(found) = proj_exprs.iter().find(|a| expr_match(&expr, a)) {
             let (qualifier, field_name) = found.qualified_name();
             let col = Expr::Column(Column::new(qualifier, field_name));
             return Ok(Transformed::yes(col));
