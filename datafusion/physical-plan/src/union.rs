@@ -886,14 +886,41 @@ fn union_distinct_count(
     Precision::Inexact(ndv_left + ndv_right)
 }
 
-/// Estimates the distinct count for a union using range overlap, following
-/// the approach used by Trino:
+/// Estimates the distinct count for a union using range overlap,
+/// following the approach used by Trino:
 ///
-/// overlap_a = fraction of A's range that overlaps with B
-/// overlap_b = fraction of B's range that overlaps with A
-/// NDV = max(overlap_a * NDV_a, overlap_b * NDV_b)   \[intersection\]
+/// Assumes values are distributed uniformly within each input's
+/// `[min, max]` range (the standard assumption when only summary
+/// statistics are available, classic for scalar-based statistics
+/// propagation). Under uniformity the fraction of an input's
+/// distinct values that land in a sub-range equals the fraction of
+/// the range that sub-range covers.
+///
+/// The combined value space is split into three disjoint regions:
+///
+/// ```text
+///   |-- only A --|-- overlap --|-- only B --|
+/// ```
+///
+/// * **Only in A/B** – values outside the other input's range
+///   contribute `(1 − overlap_a) · NDV_a` and `(1 − overlap_b) · NDV_b`.
+/// * **Overlap** – both inputs may produce values here. We take
+///   `max(overlap_a · NDV_a, overlap_b · NDV_b)` rather than the
+///   sum because values in the same sub-range are likely shared
+///   (the smaller set is assumed to be a subset of the larger).
+///   This is conservative: it avoids inflating the NDV estimate,
+///   which is safer for downstream join-order decisions.
+///
+/// The formula ranges between `[max(NDV_a, NDV_b), NDV_a + NDV_b]`,
+/// from full overlap to no overlap. Boundary cases confirm this:
+/// disjoint ranges → `NDV_a + NDV_b`, identical ranges →
+/// `max(NDV_a, NDV_b)`.
+///
+/// ```text
+/// NDV = max(overlap_a * NDV_a, overlap_b * NDV_b)   [intersection]
 ///     + (1 - overlap_a) * NDV_a                      [only in A]
 ///     + (1 - overlap_b) * NDV_b                      [only in B]
+/// ```
 fn estimate_ndv_with_overlap(
     left: &ColumnStatistics,
     right: &ColumnStatistics,
