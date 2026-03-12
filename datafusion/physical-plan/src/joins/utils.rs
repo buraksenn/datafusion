@@ -754,6 +754,16 @@ fn estimate_semi_join_cardinality(
     let mut has_ndv = false;
 
     for (outer_stat, inner_stat) in outer_col_stats.iter().zip(inner_col_stats.iter()) {
+        let outer_has_stats = outer_stat.distinct_count.get_value().is_some()
+            || (outer_stat.min_value.get_value().is_some()
+                && outer_stat.max_value.get_value().is_some());
+        let inner_has_stats = inner_stat.distinct_count.get_value().is_some()
+            || (inner_stat.min_value.get_value().is_some()
+                && inner_stat.max_value.get_value().is_some());
+        if !outer_has_stats && !inner_has_stats {
+            continue;
+        }
+
         let outer_ndv = max_distinct_count(outer_num_rows, outer_stat);
         let inner_ndv = max_distinct_count(inner_num_rows, inner_stat);
 
@@ -2689,7 +2699,7 @@ mod tests {
                 JoinType::LeftAnti,
                 (10, Absent, Absent, Absent, Absent),
                 (50, Absent, Absent, Absent, Absent),
-                Some(0),
+                Some(10),
             ),
             (
                 JoinType::LeftAnti,
