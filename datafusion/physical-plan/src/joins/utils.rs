@@ -529,35 +529,48 @@ fn estimate_join_cardinality(
             })
         }
 
-        // For SemiJoins estimation result is either zero, in cases when inputs
-        // are non-overlapping according to statistics, or equal to number of rows
-        // for outer input
-        JoinType::LeftSemi | JoinType::RightSemi => {
-            let (outer_stats, inner_stats) = match join_type {
-                JoinType::LeftSemi => (left_stats, right_stats),
-                _ => (right_stats, left_stats),
-            };
-            let cardinality = match estimate_disjoint_inputs(&outer_stats, &inner_stats) {
-                Some(estimation) => *estimation.get_value()?,
-                None => *outer_stats.num_rows.get_value()?,
-            };
+        JoinType::LeftSemi
+        | JoinType::RightSemi
+        | JoinType::LeftAnti
+        | JoinType::RightAnti => {
+            let is_left = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
+            let is_anti = matches!(join_type, JoinType::LeftAnti | JoinType::RightAnti);
 
+            let ((outer_stats, inner_stats), (outer_col_stats, inner_col_stats)) =
+                if is_left {
+                    (
+                        (&left_stats, &right_stats),
+                        (&left_col_stats, &right_col_stats),
+                    )
+                } else {
+                    (
+                        (&right_stats, &left_stats),
+                        (&right_col_stats, &left_col_stats),
+                    )
+                };
+
+            let outer_rows = *outer_stats.num_rows.get_value()?;
+
+            let cardinality =
+                if estimate_disjoint_inputs(outer_stats, inner_stats).is_some() {
+                    // Disjoint inputs: semi produces 0, anti keeps all rows.
+                    if is_anti { outer_rows } else { 0 }
+                } else {
+                    match estimate_semi_join_cardinality(
+                        &outer_stats.num_rows,
+                        &inner_stats.num_rows,
+                        outer_col_stats,
+                        inner_col_stats,
+                    ) {
+                        Some(semi) if is_anti => outer_rows.saturating_sub(semi),
+                        Some(semi) => semi,
+                        None => outer_rows,
+                    }
+                };
+
+            let outer_stats = if is_left { left_stats } else { right_stats };
             Some(PartialJoinStatistics {
                 num_rows: cardinality,
-                column_statistics: outer_stats.column_statistics,
-            })
-        }
-
-        // For AntiJoins estimation always equals to outer statistics, as
-        // non-overlapping inputs won't affect estimation
-        JoinType::LeftAnti | JoinType::RightAnti => {
-            let outer_stats = match join_type {
-                JoinType::LeftAnti => left_stats,
-                _ => right_stats,
-            };
-
-            Some(PartialJoinStatistics {
-                num_rows: *outer_stats.num_rows.get_value()?,
                 column_statistics: outer_stats.column_statistics,
             })
         }
@@ -695,6 +708,68 @@ fn estimate_disjoint_inputs(
     }
 
     None
+}
+
+/// Estimates the number of outer rows that have at least one matching
+/// key on the inner side (i.e. semi join cardinality) using NDV
+/// (Number of Distinct Values) statistics.
+///
+/// Assuming the smaller domain is contained in the larger, the number
+/// of overlapping distinct values is `min(outer_ndv, inner_ndv)`.
+/// Under the uniformity assumption (each distinct value contributes
+/// equally to row counts), the surviving fraction of outer rows is:
+///
+/// ```text
+/// overlap_fraction = min(outer_ndv, inner_ndv) / outer_ndv
+/// ```
+///
+/// For multi-column join keys, each column pair contributes an
+/// independent selectivity factor and the overall selectivity is the
+/// product of these factors:
+///
+/// ```text
+/// selectivity = product_i(min(outer_ndv_i, inner_ndv_i) / outer_ndv_i)
+/// semi_cardinality = outer_rows * selectivity
+/// ```
+///
+/// Anti join cardinality is derived as the complement:
+/// `outer_rows - semi_cardinality`.
+///
+/// Boundary cases:
+/// * `inner_ndv >= outer_ndv` → selectivity = 1.0 (all outer rows match)
+/// * `inner_ndv = 0` → selectivity = 0.0
+/// * Missing NDV statistics → returns `None` (fallback to `outer_rows`)
+fn estimate_semi_join_cardinality(
+    outer_num_rows: &Precision<usize>,
+    inner_num_rows: &Precision<usize>,
+    outer_col_stats: &[ColumnStatistics],
+    inner_col_stats: &[ColumnStatistics],
+) -> Option<usize> {
+    let outer_rows = *outer_num_rows.get_value()?;
+    if outer_rows == 0 {
+        return Some(0);
+    }
+
+    let mut selectivity = 1.0_f64;
+    let mut has_ndv = false;
+
+    for (outer_stat, inner_stat) in outer_col_stats.iter().zip(inner_col_stats.iter()) {
+        let outer_ndv = max_distinct_count(outer_num_rows, outer_stat);
+        let inner_ndv = max_distinct_count(inner_num_rows, inner_stat);
+
+        if let (Some(&o), Some(&i)) = (outer_ndv.get_value(), inner_ndv.get_value())
+            && o > 0
+        {
+            selectivity *= (o.min(i) as f64) / (o as f64);
+            has_ndv = true;
+        }
+    }
+
+    if has_ndv {
+        Some((outer_rows as f64 * selectivity).ceil() as usize)
+    } else {
+        None
+    }
 }
 
 /// Estimate the number of maximum distinct values that can be present in the
@@ -2566,7 +2641,7 @@ mod tests {
                 JoinType::LeftSemi,
                 (50, Inexact(10), Inexact(20), Absent, Absent),
                 (10, Inexact(15), Inexact(25), Absent, Absent),
-                Some(50),
+                Some(46),
             ),
             (
                 JoinType::RightSemi,
@@ -2602,19 +2677,19 @@ mod tests {
                 JoinType::LeftAnti,
                 (50, Inexact(10), Inexact(20), Absent, Absent),
                 (10, Inexact(15), Inexact(25), Absent, Absent),
-                Some(50),
+                Some(4),
             ),
             (
                 JoinType::RightAnti,
                 (50, Inexact(10), Inexact(20), Absent, Absent),
                 (10, Inexact(15), Inexact(25), Absent, Absent),
-                Some(10),
+                Some(0),
             ),
             (
                 JoinType::LeftAnti,
                 (10, Absent, Absent, Absent, Absent),
                 (50, Absent, Absent, Absent, Absent),
-                Some(10),
+                Some(0),
             ),
             (
                 JoinType::LeftAnti,
@@ -2633,6 +2708,49 @@ mod tests {
                 (50, Absent, Inexact(20), Absent, Absent),
                 (10, Inexact(30), Absent, Absent, Absent),
                 Some(50),
+            ),
+            // NDV-based semi join: outer_ndv=20, inner_ndv=10
+            // selectivity = 10/20 = 0.5, cardinality = ceil(50 * 0.5) = 25
+            (
+                JoinType::LeftSemi,
+                (50, Inexact(1), Inexact(100), Inexact(20), Absent),
+                (10, Inexact(1), Inexact(100), Inexact(10), Absent),
+                Some(25),
+            ),
+            // inner_ndv(30) >= outer_ndv(20) -> selectivity 1.0, no reduction
+            (
+                JoinType::LeftSemi,
+                (50, Inexact(1), Inexact(100), Inexact(20), Absent),
+                (100, Inexact(1), Inexact(100), Inexact(30), Absent),
+                Some(50),
+            ),
+            // NDV-based anti join: semi=25, anti = 50 - 25 = 25
+            (
+                JoinType::LeftAnti,
+                (50, Inexact(1), Inexact(100), Inexact(20), Absent),
+                (10, Inexact(1), Inexact(100), Inexact(10), Absent),
+                Some(25),
+            ),
+            // inner covers all outer: semi=50, anti = 0
+            (
+                JoinType::LeftAnti,
+                (50, Inexact(1), Inexact(100), Inexact(20), Absent),
+                (100, Inexact(1), Inexact(100), Inexact(30), Absent),
+                Some(0),
+            ),
+            // RightSemi with explicit NDV
+            (
+                JoinType::RightSemi,
+                (50, Inexact(1), Inexact(100), Inexact(10), Absent),
+                (10, Inexact(1), Inexact(100), Inexact(20), Absent),
+                Some(5),
+            ),
+            // RightAnti with explicit NDV
+            (
+                JoinType::RightAnti,
+                (50, Inexact(1), Inexact(100), Inexact(10), Absent),
+                (10, Inexact(1), Inexact(100), Inexact(20), Absent),
+                Some(5),
             ),
         ];
 
