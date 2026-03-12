@@ -739,6 +739,12 @@ fn estimate_disjoint_inputs(
 /// * `inner_ndv >= outer_ndv` → selectivity = 1.0 (all outer rows match)
 /// * `inner_ndv = 0` → selectivity = 0.0
 /// * Missing NDV statistics → returns `None` (fallback to `outer_rows`)
+///
+/// PostgreSQL uses a similar approach in `eqjoinsel_semi`
+/// (`src/backend/utils/adt/selfuncs.c`). When NDV statistics are
+/// available on both sides it computes selectivity as `nd2 / nd1`,
+/// which is equivalent to `min(outer_ndv, inner_ndv) / outer_ndv`.
+/// If either side lacks statistics it falls back to a default.
 fn estimate_semi_join_cardinality(
     outer_num_rows: &Precision<usize>,
     inner_num_rows: &Precision<usize>,
@@ -749,9 +755,13 @@ fn estimate_semi_join_cardinality(
     if outer_rows == 0 {
         return Some(0);
     }
+    let inner_rows = *inner_num_rows.get_value()?;
+    if inner_rows == 0 {
+        return Some(0);
+    }
 
     let mut selectivity = 1.0_f64;
-    let mut has_ndv = false;
+    let mut has_selectivity_estimate = false;
 
     for (outer_stat, inner_stat) in outer_col_stats.iter().zip(inner_col_stats.iter()) {
         let outer_has_stats = outer_stat.distinct_count.get_value().is_some()
@@ -760,7 +770,7 @@ fn estimate_semi_join_cardinality(
         let inner_has_stats = inner_stat.distinct_count.get_value().is_some()
             || (inner_stat.min_value.get_value().is_some()
                 && inner_stat.max_value.get_value().is_some());
-        if !outer_has_stats && !inner_has_stats {
+        if !outer_has_stats || !inner_has_stats {
             continue;
         }
 
@@ -771,11 +781,11 @@ fn estimate_semi_join_cardinality(
             && o > 0
         {
             selectivity *= (o.min(i) as f64) / (o as f64);
-            has_ndv = true;
+            has_selectivity_estimate = true;
         }
     }
 
-    if has_ndv {
+    if has_selectivity_estimate {
         Some((outer_rows as f64 * selectivity).ceil() as usize)
     } else {
         None
@@ -2762,6 +2772,13 @@ mod tests {
                 (10, Inexact(1), Inexact(100), Inexact(20), Absent),
                 Some(5),
             ),
+            // Empty inner table: no match possible, semi → 0
+            (
+                JoinType::LeftSemi,
+                (100, Absent, Absent, Absent, Absent),
+                (0, Absent, Absent, Absent, Absent),
+                Some(0),
+            ),
         ];
 
         let join_on = vec![(
@@ -2877,6 +2894,125 @@ mod tests {
             absent_inner_estimation.is_none(),
             "Expected \"None\" estimated SemiJoin cardinality for absent outer and inner num_rows"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_semi_join_multi_column_and_mixed_stats() -> Result<()> {
+        let join_on = vec![
+            (
+                Arc::new(Column::new("l_col0", 0)) as _,
+                Arc::new(Column::new("r_col0", 0)) as _,
+            ),
+            (
+                Arc::new(Column::new("l_col1", 1)) as _,
+                Arc::new(Column::new("r_col1", 1)) as _,
+            ),
+        ];
+
+        // Multi-column: both columns have NDV on both sides.
+        // col0: outer_ndv=20, inner_ndv=10 → selectivity = 10/20 = 0.5
+        // col1: outer_ndv=40, inner_ndv=10 → selectivity = 10/40 = 0.25
+        // total selectivity = 0.5 * 0.25 = 0.125
+        // semi = ceil(100 * 0.125) = 13
+        let result = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            Statistics {
+                num_rows: Inexact(100),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Inexact(20), Absent),
+                    create_column_stats(Absent, Absent, Inexact(40), Absent),
+                ],
+            },
+            Statistics {
+                num_rows: Inexact(200),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Inexact(10), Absent),
+                    create_column_stats(Absent, Absent, Inexact(10), Absent),
+                ],
+            },
+            &join_on,
+        )
+        .map(|c| c.num_rows);
+        assert_eq!(result, Some(13), "multi-column semi join");
+
+        // Multi-column anti: anti = 100 - 13 = 87
+        let result = estimate_join_cardinality(
+            &JoinType::LeftAnti,
+            Statistics {
+                num_rows: Inexact(100),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Inexact(20), Absent),
+                    create_column_stats(Absent, Absent, Inexact(40), Absent),
+                ],
+            },
+            Statistics {
+                num_rows: Inexact(200),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Inexact(10), Absent),
+                    create_column_stats(Absent, Absent, Inexact(10), Absent),
+                ],
+            },
+            &join_on,
+        )
+        .map(|c| c.num_rows);
+        assert_eq!(result, Some(87), "multi-column anti join");
+
+        // Mixed stats: col0 has NDV on both sides, col1 has NDV only on outer.
+        // col1 is skipped (either side missing), so selectivity comes from col0 only.
+        // col0: outer_ndv=20, inner_ndv=10 → selectivity = 0.5
+        // semi = ceil(100 * 0.5) = 50
+        let result = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            Statistics {
+                num_rows: Inexact(100),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Inexact(20), Absent),
+                    create_column_stats(Absent, Absent, Inexact(40), Absent),
+                ],
+            },
+            Statistics {
+                num_rows: Inexact(200),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Inexact(10), Absent),
+                    create_column_stats(Absent, Absent, Absent, Absent),
+                ],
+            },
+            &join_on,
+        )
+        .map(|c| c.num_rows);
+        assert_eq!(result, Some(50), "mixed stats: col1 skipped");
+
+        // Mixed stats: neither column has stats on both sides → fallback to outer_rows
+        let result = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            Statistics {
+                num_rows: Inexact(100),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Inexact(20), Absent),
+                    create_column_stats(Absent, Absent, Absent, Absent),
+                ],
+            },
+            Statistics {
+                num_rows: Inexact(200),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Absent, Absent),
+                    create_column_stats(Absent, Absent, Inexact(10), Absent),
+                ],
+            },
+            &join_on,
+        )
+        .map(|c| c.num_rows);
+        assert_eq!(result, Some(100), "no column has stats on both sides");
 
         Ok(())
     }
