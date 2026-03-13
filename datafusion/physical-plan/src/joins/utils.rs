@@ -719,25 +719,27 @@ fn estimate_disjoint_inputs(
 /// Under the uniformity assumption (each distinct value contributes
 /// equally to row counts), the surviving fraction of outer rows is:
 ///
+/// Null rows cannot match, so each column's selectivity is further
+/// reduced by the outer null fraction:
+///
 /// ```text
-/// overlap_fraction = min(outer_ndv, inner_ndv) / outer_ndv
+/// null_frac_i = outer_null_count_i / outer_rows
+/// selectivity_i = min(outer_ndv_i, inner_ndv_i) / outer_ndv_i * (1 - null_frac_i)
 /// ```
 ///
-/// For multi-column join keys, each column pair contributes an
-/// independent selectivity factor and the overall selectivity is the
-/// product of these factors:
+/// For multi-column join keys the overall selectivity is the product
+/// of per-column factors:
 ///
 /// ```text
-/// selectivity = product_i(min(outer_ndv_i, inner_ndv_i) / outer_ndv_i)
-/// semi_cardinality = outer_rows * selectivity
+/// semi_cardinality = outer_rows * product_i(selectivity_i)
 /// ```
 ///
 /// Anti join cardinality is derived as the complement:
 /// `outer_rows - semi_cardinality`.
 ///
 /// Boundary cases:
-/// * `inner_ndv >= outer_ndv` → selectivity = 1.0 (all outer rows match)
-/// * `inner_ndv = 0` → selectivity = 0.0
+/// * `inner_ndv >= outer_ndv` → selectivity = `1.0 - null_frac`
+/// * `null_frac = 1.0` → selectivity = 0.0 (no non-null rows can match)
 /// * Missing NDV statistics → returns `None` (fallback to `outer_rows`)
 ///
 /// PostgreSQL uses a similar approach in `eqjoinsel_semi`
@@ -780,10 +782,11 @@ fn estimate_semi_join_cardinality(
         if let (Some(&o), Some(&i)) = (outer_ndv.get_value(), inner_ndv.get_value())
             && o > 0
         {
-            let null_frac = outer_stat.null_count
-            .get_value()
-            .map(|&nc| nc as f64 / outer_rows as f64)
-            .unwrap_or(0.0);
+            let null_frac = outer_stat
+                .null_count
+                .get_value()
+                .map(|&nc| nc as f64 / outer_rows as f64)
+                .unwrap_or(0.0);
             selectivity *= (o.min(i) as f64) / (o as f64) * (1.0 - null_frac);
             has_selectivity_estimate = true;
         }
@@ -2783,6 +2786,39 @@ mod tests {
                 (0, Absent, Absent, Absent, Absent),
                 Some(0),
             ),
+            // NDV-based semi with nulls on outer side:
+            // outer_ndv=20, inner_ndv=10, null_frac=10/100=0.1
+            // selectivity = 10/20 * (1-0.1) = 0.5 * 0.9 = 0.45
+            // semi = ceil(100 * 0.45) = 45
+            (
+                JoinType::LeftSemi,
+                (100, Absent, Absent, Inexact(20), Inexact(10)),
+                (200, Absent, Absent, Inexact(10), Absent),
+                Some(45),
+            ),
+            // Anti-join with nulls on outer side:
+            // semi=45, anti = 100 - 45 = 55
+            (
+                JoinType::LeftAnti,
+                (100, Absent, Absent, Inexact(20), Inexact(10)),
+                (200, Absent, Absent, Inexact(10), Absent),
+                Some(55),
+            ),
+            // All outer rows are null: null_frac=1.0
+            // selectivity = 10/20 * (1-1.0) = 0.0, semi = 0
+            (
+                JoinType::LeftSemi,
+                (100, Absent, Absent, Inexact(20), Inexact(100)),
+                (200, Absent, Absent, Inexact(10), Absent),
+                Some(0),
+            ),
+            // All outer rows are null (anti): anti = 100 - 0 = 100
+            (
+                JoinType::LeftAnti,
+                (100, Absent, Absent, Inexact(20), Inexact(100)),
+                (200, Absent, Absent, Inexact(10), Absent),
+                Some(100),
+            ),
         ];
 
         let join_on = vec![(
@@ -3017,6 +3053,38 @@ mod tests {
         )
         .map(|c| c.num_rows);
         assert_eq!(result, Some(100), "no column has stats on both sides");
+
+        // Multi-column with nulls on one column:
+        // col0: outer_ndv=20, inner_ndv=10, null_frac=0.0 → 10/20 * 1.0 = 0.5
+        // col1: outer_ndv=40, inner_ndv=10, null_frac=20/100=0.2 → 10/40 * 0.8 = 0.2
+        // total selectivity = 0.5 * 0.2 = 0.1
+        // semi = ceil(100 * 0.1) = 10
+        let result = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            Statistics {
+                num_rows: Inexact(100),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Inexact(20), Absent),
+                    create_column_stats(Absent, Absent, Inexact(40), Inexact(20)),
+                ],
+            },
+            Statistics {
+                num_rows: Inexact(200),
+                total_byte_size: Absent,
+                column_statistics: vec![
+                    create_column_stats(Absent, Absent, Inexact(10), Absent),
+                    create_column_stats(Absent, Absent, Inexact(10), Absent),
+                ],
+            },
+            &join_on,
+        )
+        .map(|c| c.num_rows);
+        assert_eq!(
+            result,
+            Some(10),
+            "multi-column semi join with nulls on one column"
+        );
 
         Ok(())
     }
