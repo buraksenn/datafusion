@@ -780,7 +780,11 @@ fn estimate_semi_join_cardinality(
         if let (Some(&o), Some(&i)) = (outer_ndv.get_value(), inner_ndv.get_value())
             && o > 0
         {
-            selectivity *= (o.min(i) as f64) / (o as f64);
+            let null_frac = outer_stat.null_count
+            .get_value()
+            .map(|&nc| nc as f64 / outer_rows as f64)
+            .unwrap_or(0.0);
+            selectivity *= (o.min(i) as f64) / (o as f64) * (1.0 - null_frac);
             has_selectivity_estimate = true;
         }
     }
