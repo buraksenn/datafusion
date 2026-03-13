@@ -40,7 +40,7 @@ use datafusion_expr::{
 };
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_functions_nested::expr_fn::array_has;
+use datafusion_functions_nested::expr_fn::{array_has, array_max, array_min};
 
 mod binary_op;
 mod function;
@@ -634,7 +634,34 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     schema,
                     planner_context,
                 ),
-                _ => not_impl_err!("ALL only supports subquery comparison currently"),
+                _ => {
+                    let left_expr = self.sql_to_expr(*left, schema, planner_context)?;
+                    let right_expr = self.sql_to_expr(*right, schema, planner_context)?;
+                    match compare_op {
+                        BinaryOperator::Eq => Ok(array_min(right_expr.clone())
+                            .eq(left_expr.clone())
+                            .and(array_max(right_expr).eq(left_expr))
+                            .is_not_false()),
+                        BinaryOperator::NotEq => {
+                            Ok(Expr::Not(Box::new(array_has(right_expr, left_expr))))
+                        }
+                        BinaryOperator::Gt => {
+                            Ok(array_max(right_expr).lt(left_expr).is_not_false())
+                        }
+                        BinaryOperator::Lt => {
+                            Ok(array_min(right_expr).gt(left_expr).is_not_false())
+                        }
+                        BinaryOperator::GtEq => {
+                            Ok(array_max(right_expr).lt_eq(left_expr).is_not_false())
+                        }
+                        BinaryOperator::LtEq => {
+                            Ok(array_min(right_expr).gt_eq(left_expr).is_not_false())
+                        }
+                        _ => plan_err!(
+                            "Unsupported AllOp: '{compare_op}', only '=', '<>', '>', '<', '>=', '<=' are supported"
+                        ),
+                    }
+                }
             },
             #[expect(deprecated)]
             SQLExpr::Wildcard(_token) => Ok(Expr::Wildcard {

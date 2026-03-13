@@ -7006,6 +7006,202 @@ select count(*) from arrays where 'X'=any(column3);
 query error DataFusion error: Error during planning: Unsupported AnyOp: '>', only '=' is supported
 select count(*) from arrays where 'X'>any(column3);
 
+## all operator
+
+statement ok
+CREATE TABLE all_op_test (
+    val INT,
+    arr INT[]
+) AS VALUES
+    (5, [1, 2, 3, 4, 5]),
+    (5, [5, 5, 5]),
+    (3, [1, 2, 3]),
+    (10, [1, 2, 3, 4, 5]),
+    (0, [1, 2, 3, 4, 5]),
+    (5, [5])
+;
+
+# = ALL: true when all elements equal val
+query B
+SELECT 5 = ALL([5, 5, 5]);
+----
+true
+
+query B
+SELECT 5 = ALL([5, 5, 3]);
+----
+false
+
+# <> ALL: true when val differs from every element
+query B
+SELECT 5 <> ALL([1, 2, 3]);
+----
+true
+
+query B
+SELECT 5 <> ALL([1, 2, 5]);
+----
+false
+
+# > ALL: true when val greater than all elements
+query B
+SELECT 10 > ALL([1, 2, 3]);
+----
+true
+
+query B
+SELECT 3 > ALL([1, 2, 3]);
+----
+false
+
+# < ALL: true when val less than all elements
+query B
+SELECT 0 < ALL([1, 2, 3]);
+----
+true
+
+query B
+SELECT 2 < ALL([1, 2, 3]);
+----
+false
+
+# >= ALL: true when val >= all elements
+query B
+SELECT 5 >= ALL([1, 2, 5]);
+----
+true
+
+query B
+SELECT 4 >= ALL([1, 2, 5]);
+----
+false
+
+# <= ALL: true when val <= all elements
+query B
+SELECT 1 <= ALL([1, 2, 5]);
+----
+true
+
+query B
+SELECT 2 <= ALL([1, 2, 5]);
+----
+false
+
+# ALL with table data
+query I rowsort
+SELECT val FROM all_op_test WHERE val = ALL(arr);
+----
+5
+5
+
+query I
+SELECT val FROM all_op_test WHERE val > ALL(arr);
+----
+10
+
+query I
+SELECT val FROM all_op_test WHERE val < ALL(arr);
+----
+0
+
+# Single-element array
+query B
+SELECT 5 = ALL([5]);
+----
+true
+
+query B
+SELECT 5 <> ALL([5]);
+----
+false
+
+# Empty arrays: all operators return TRUE (vacuous truth)
+query B
+SELECT 5 = ALL(arrow_cast(make_array(), 'List(Int64)'));
+----
+true
+
+query B
+SELECT 5 <> ALL(arrow_cast(make_array(), 'List(Int64)'));
+----
+true
+
+query B
+SELECT 5 > ALL(arrow_cast(make_array(), 'List(Int64)'));
+----
+true
+
+query B
+SELECT 5 < ALL(arrow_cast(make_array(), 'List(Int64)'));
+----
+true
+
+query B
+SELECT 5 >= ALL(arrow_cast(make_array(), 'List(Int64)'));
+----
+true
+
+query B
+SELECT 5 <= ALL(arrow_cast(make_array(), 'List(Int64)'));
+----
+true
+
+# All-NULL arrays: all operators return TRUE (NULLs skipped → vacuous truth)
+query B
+SELECT 5 = ALL([NULL::INT, NULL::INT]);
+----
+true
+
+query B
+SELECT 5 > ALL([NULL::INT, NULL::INT]);
+----
+true
+
+query B
+SELECT 5 < ALL([NULL::INT, NULL::INT]);
+----
+true
+
+# Mixed NULL + non-NULL (satisfying condition)
+query B
+SELECT 5 > ALL([3, NULL::INT]);
+----
+true
+
+query B
+SELECT 5 >= ALL([5, NULL::INT]);
+----
+true
+
+query B
+SELECT 1 < ALL([3, NULL::INT]);
+----
+true
+
+query B
+SELECT 1 <= ALL([1, NULL::INT]);
+----
+true
+
+# Mixed NULL + non-NULL (not satisfying condition)
+query B
+SELECT 5 > ALL([6, NULL::INT]);
+----
+false
+
+query B
+SELECT 5 < ALL([3, NULL::INT]);
+----
+false
+
+query B
+SELECT 5 = ALL([5, 3, NULL::INT]);
+----
+false
+
+statement ok
+DROP TABLE all_op_test;
+
 ## array_distinct
 
 #TODO: https://github.com/apache/datafusion/issues/7142
