@@ -1,0 +1,91 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Tests for window functions used in ORDER BY clause
+
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+statement ok
+CREATE EXTERNAL TABLE aggregate_test_100 (
+  c1  VARCHAR NOT NULL,
+  c2  TINYINT NOT NULL,
+  c3  SMALLINT NOT NULL,
+  c4  SMALLINT,
+  c5  INT,
+  c6  BIGINT NOT NULL,
+  c7  SMALLINT NOT NULL,
+  c8  INT NOT NULL,
+  c9  BIGINT UNSIGNED NOT NULL,
+  c10 VARCHAR NOT NULL,
+  c11 FLOAT NOT NULL,
+  c12 DOUBLE NOT NULL,
+  c13 VARCHAR NOT NULL
+)
+STORED AS CSV
+LOCATION '../../testing/data/csv/aggregate_test_100.csv'
+OPTIONS ('format.has_header' 'true');
+
+# Window function only in ORDER BY
+query I
+SELECT c2 FROM aggregate_test_100 ORDER BY row_number() OVER (ORDER BY c9) LIMIT 5;
+----
+4
+2
+5
+2
+2
+
+# Window function in both SELECT and ORDER BY (deduplication)
+query II
+SELECT c2, row_number() OVER (ORDER BY c9) as rn FROM aggregate_test_100 ORDER BY row_number() OVER (ORDER BY c9) LIMIT 5;
+----
+4 1
+2 2
+5 3
+2 4
+2 5
+
+# Nested expression: ORDER BY window_func(...) + 1
+query I
+SELECT c2 FROM aggregate_test_100 ORDER BY row_number() OVER (ORDER BY c9) + 1 LIMIT 5;
+----
+4
+2
+5
+2
+2
+
+# Multiple window functions in ORDER BY
+query I
+SELECT c2 FROM aggregate_test_100 ORDER BY row_number() OVER (ORDER BY c9), max(c3) OVER (ORDER BY c9) LIMIT 5;
+----
+4
+2
+5
+2
+2
+
+# DESC ordering with window function
+query I
+SELECT c2 FROM aggregate_test_100 ORDER BY row_number() OVER (ORDER BY c9) DESC LIMIT 5;
+----
+5
+1
+1
+2
+1
