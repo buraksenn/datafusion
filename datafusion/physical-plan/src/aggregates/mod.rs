@@ -1043,17 +1043,28 @@ impl AggregateExec {
     /// count is estimated as:
     ///
     /// ```text
-    /// output_rows = input_rows                                          // baseline
-    /// output_rows = min(output_rows, product(NDV_i + nulls_i) * sets)   // if NDV available
-    /// output_rows = min(output_rows, limit)                             // if TopK active
+    /// ndv        = sum over each grouping set of product(max(NDV_i + nulls_i, 1))
+    /// output_rows = input_rows                       // baseline
+    /// output_rows = min(output_rows, ndv)             // if NDV available
+    /// output_rows = min(output_rows, limit)           // if TopK active
     /// ```
     ///
-    /// The NDV estimation is heavily inspired by Spark and Trino.
-    /// - Multiplies distinct value counts of all group-by columns
-    /// - Adds +1 per column when nulls are present (a null group is a distinct output row)
-    /// - Caps the result by the input row count
-    /// - Requires NDV stats for ALL group-by columns; if any column lacks stats,
-    ///   falls back to `input_rows` as the upper bound
+    /// When `input_rows` is absent but NDV is available, falls back to:
+    ///
+    /// ```text
+    /// output_rows = min(ndv, limit)   // if both available
+    /// output_rows = ndv               // if only NDV available
+    /// output_rows = limit             // if only limit available
+    /// ```
+    ///
+    /// NDV estimation details (see [`Self::compute_group_ndv`]):
+    /// - For each grouping set, only active (non-NULL) columns contribute
+    /// - Per-column contribution is `max(NDV + null_adj, 1)` where `null_adj`
+    ///   is 1 when nulls are present, 0 otherwise (a null group is a distinct
+    ///   output row; `.max(1)` prevents a zero NDV from zeroing the product)
+    /// - Per-set products are summed across all grouping sets
+    /// - Requires NDV stats for ALL active group-by columns; if any lacks stats,
+    ///   falls back to `input_rows` (or `Absent` if that is also unknown)
     fn statistics_inner(&self, child_statistics: &Statistics) -> Result<Statistics> {
         // TODO stats: group expressions:
         // - once expressions will be able to compute their own stats, use it here
@@ -1099,13 +1110,10 @@ impl AggregateExec {
                     if *value > 1 {
                         let mut num_rows = child_statistics.num_rows.to_inexact();
 
-                        if !self.group_by.expr.is_empty() {
-                            let ndv_product = self.compute_group_ndv(child_statistics);
-                            if let Some(ndv) = ndv_product {
-                                let grouping_set_num = self.group_by.groups.len();
-                                let ndv_estimate = ndv.saturating_mul(grouping_set_num);
-                                num_rows = num_rows.map(|n| n.min(ndv_estimate));
-                            }
+                        if !self.group_by.expr.is_empty()
+                            && let Some(ndv) = self.compute_group_ndv(child_statistics)
+                        {
+                            num_rows = num_rows.map(|n| n.min(ndv));
                         }
 
                         // If TopK mode is active, cap output rows by the limit
@@ -1121,10 +1129,20 @@ impl AggregateExec {
                         let grouping_set_num = self.group_by.groups.len();
                         child_statistics.num_rows.map(|x| x * grouping_set_num)
                     }
-                } else if let Some(limit_opts) = &self.limit_options {
-                    Precision::Inexact(limit_opts.limit)
                 } else {
-                    Precision::Absent
+                    let ndv = if !self.group_by.expr.is_empty() {
+                        self.compute_group_ndv(child_statistics)
+                    } else {
+                        None
+                    };
+                    match (ndv, &self.limit_options) {
+                        (Some(n), Some(limit_opts)) => {
+                            Precision::Inexact(n.min(limit_opts.limit))
+                        }
+                        (Some(n), None) => Precision::Inexact(n),
+                        (None, Some(limit_opts)) => Precision::Inexact(limit_opts.limit),
+                        (None, None) => Precision::Absent,
+                    }
                 };
 
                 let total_byte_size = num_rows
@@ -1145,22 +1163,32 @@ impl AggregateExec {
         }
     }
 
-    /// Computes `product(NDV_i + null_adjustment_i)` across all group-by columns.
-    /// Returns `None` if any group-by column is not a direct column reference
-    /// or lacks `distinct_count` stats.
+    /// Computes the estimated number of distinct groups across all grouping sets.
+    /// For each grouping set, computes `product(NDV_i + null_adj_i)` for active columns,
+    /// then sums across all sets. Returns `None` if any active column is not a direct
+    /// column reference or lacks `distinct_count` stats.
+    /// When `null_count` is absent or unknown, null_adjustment defaults to 0.
     fn compute_group_ndv(&self, child_statistics: &Statistics) -> Option<usize> {
-        let mut product: usize = 1;
-        for (expr, _) in self.group_by.expr.iter() {
-            let col = expr.as_any().downcast_ref::<Column>()?;
-            let col_stats = &child_statistics.column_statistics[col.index()];
-            let ndv = *col_stats.distinct_count.get_value()?;
-            let null_adjustment = match col_stats.null_count.get_value() {
-                Some(&n) if n > 0 => 1usize,
-                _ => 0,
-            };
-            product = product.saturating_mul(ndv.saturating_add(null_adjustment));
+        let mut total: usize = 0;
+        for group_mask in &self.group_by.groups {
+            let mut set_product: usize = 1;
+            for (j, (expr, _)) in self.group_by.expr.iter().enumerate() {
+                if group_mask[j] {
+                    continue;
+                }
+                let col = expr.as_any().downcast_ref::<Column>()?;
+                let col_stats = &child_statistics.column_statistics[col.index()];
+                let ndv = *col_stats.distinct_count.get_value()?;
+                let null_adjustment = match col_stats.null_count.get_value() {
+                    Some(&n) if n > 0 => 1usize,
+                    _ => 0,
+                };
+                set_product = set_product
+                    .saturating_mul(ndv.saturating_add(null_adjustment).max(1));
+            }
+            total = total.saturating_add(set_product);
         }
-        Some(product)
+        Some(total)
     }
 
     /// Check if dynamic filter is possible for the current plan node.
@@ -4261,11 +4289,12 @@ mod tests {
         )?;
 
         let stats = agg.partition_statistics(None)?;
-        // NDV product = 100 * 50 = 5000, multiplied by 3 grouping sets = 15000
+        // Per-set NDV: (a,NULL)=100, (NULL,b)=50, (a,b)=100*50=5000
+        // Total = 100 + 50 + 5000 = 5150
         assert_eq!(
             stats.num_rows,
-            Precision::Inexact(15_000),
-            "grouping sets should multiply NDV product by number of groups"
+            Precision::Inexact(5_150),
+            "grouping sets should sum per-set NDV products"
         );
 
         Ok(())
@@ -4328,6 +4357,157 @@ mod tests {
             stats.num_rows,
             Precision::Inexact(1_000_000),
             "non-column group-by expression should bail out to input_rows"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_stats_ndv_zero_column() -> Result<()> {
+        use crate::test::exec::StatisticsExec;
+        use datafusion_common::ColumnStatistics;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(1_000),
+            total_byte_size: Precision::Inexact(1_000),
+            column_statistics: vec![
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(0),
+                    null_count: Precision::Exact(1_000),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(50),
+                    ..ColumnStatistics::new_unknown()
+                },
+            ],
+        };
+
+        let input = Arc::new(StatisticsExec::new(input_stats, (*schema).clone()))
+            as Arc<dyn ExecutionPlan>;
+
+        let agg = AggregateExec::try_new(
+            AggregateMode::Final,
+            PhysicalGroupBy::new_single(vec![
+                (col("a", &schema)? as Arc<dyn PhysicalExpr>, "a".to_string()),
+                (col("b", &schema)? as Arc<dyn PhysicalExpr>, "b".to_string()),
+            ]),
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("COUNT(a)")
+                    .build()?,
+            )],
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+
+        let stats = agg.partition_statistics(None)?;
+        // NDV(a)=0 with nulls => max(0+1, 1)=1, NDV(b)=50 => 1*50=50
+        assert_eq!(
+            stats.num_rows,
+            Precision::Inexact(50),
+            "all-null column should contribute 1 to the product, not 0"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_stats_absent_num_rows_with_ndv() -> Result<()> {
+        use crate::test::exec::StatisticsExec;
+        use datafusion_common::ColumnStatistics;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+
+        let input_stats = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(100),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+
+        let input = Arc::new(StatisticsExec::new(input_stats, (*schema).clone()))
+            as Arc<dyn ExecutionPlan>;
+
+        let agg = AggregateExec::try_new(
+            AggregateMode::Final,
+            PhysicalGroupBy::new_single(vec![(
+                col("a", &schema)? as Arc<dyn PhysicalExpr>,
+                "a".to_string(),
+            )]),
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("COUNT(a)")
+                    .build()?,
+            )],
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+
+        let stats = agg.partition_statistics(None)?;
+        assert_eq!(
+            stats.num_rows,
+            Precision::Inexact(100),
+            "absent num_rows should fall back to NDV estimate"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_stats_absent_num_rows_with_ndv_and_limit() -> Result<()> {
+        use crate::test::exec::StatisticsExec;
+        use datafusion_common::ColumnStatistics;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+
+        let input_stats = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(100),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+
+        let input = Arc::new(StatisticsExec::new(input_stats, (*schema).clone()))
+            as Arc<dyn ExecutionPlan>;
+
+        let mut agg = AggregateExec::try_new(
+            AggregateMode::Final,
+            PhysicalGroupBy::new_single(vec![(
+                col("a", &schema)? as Arc<dyn PhysicalExpr>,
+                "a".to_string(),
+            )]),
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("COUNT(a)")
+                    .build()?,
+            )],
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+
+        agg = agg.with_limit_options(Some(LimitOptions::new(10)));
+
+        let stats = agg.partition_statistics(None)?;
+        assert_eq!(
+            stats.num_rows,
+            Precision::Inexact(10),
+            "absent num_rows with NDV and limit should return min(ndv, limit)"
         );
 
         Ok(())
