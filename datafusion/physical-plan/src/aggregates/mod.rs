@@ -2092,7 +2092,9 @@ mod tests {
     use crate::metrics::MetricValue;
     use crate::test::TestMemoryExec;
     use crate::test::assert_is_pending;
-    use crate::test::exec::{BlockingExec, assert_strong_count_converges_to_zero};
+    use crate::test::exec::{
+        BlockingExec, StatisticsExec, assert_strong_count_converges_to_zero,
+    };
 
     use arrow::array::{
         DictionaryArray, Float32Array, Float64Array, Int32Array, Int64Array, StructArray,
@@ -3802,7 +3804,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_aggregate_statistics_edge_cases() -> Result<()> {
-        use crate::test::exec::StatisticsExec;
         use datafusion_common::ColumnStatistics;
 
         let schema = Arc::new(Schema::new(vec![
@@ -3810,72 +3811,92 @@ mod tests {
             Field::new("b", DataType::Float64, false),
         ]));
 
-        // Test 1: Absent statistics remain absent
-        let input = Arc::new(StatisticsExec::new(
-            Statistics {
-                num_rows: Precision::Exact(100),
-                total_byte_size: Precision::Absent,
-                column_statistics: vec![
-                    ColumnStatistics::new_unknown(),
-                    ColumnStatistics::new_unknown(),
-                ],
-            },
-            (*schema).clone(),
-        )) as Arc<dyn ExecutionPlan>;
-
-        let agg = Arc::new(AggregateExec::try_new(
-            AggregateMode::Final,
+        let absent_byte_stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown(),
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        let agg = build_test_aggregate(
+            &schema,
+            absent_byte_stats,
             PhysicalGroupBy::default(),
-            vec![Arc::new(
-                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
-                    .schema(Arc::clone(&schema))
-                    .alias("COUNT(a)")
-                    .build()?,
-            )],
-            vec![None],
-            input,
-            Arc::clone(&schema),
-        )?);
-
+            None,
+        )?;
         let stats = agg.partition_statistics(None)?;
         assert_eq!(stats.total_byte_size, Precision::Absent);
 
-        // Test 2: Zero rows returns Absent (can't estimate output size from zero input)
-        let input_zero = Arc::new(StatisticsExec::new(
-            Statistics {
-                num_rows: Precision::Exact(0),
-                total_byte_size: Precision::Exact(0),
-                column_statistics: vec![
-                    ColumnStatistics::new_unknown(),
-                    ColumnStatistics::new_unknown(),
-                ],
-            },
-            (*schema).clone(),
-        )) as Arc<dyn ExecutionPlan>;
-
-        let agg_zero = Arc::new(AggregateExec::try_new(
-            AggregateMode::Final,
+        let zero_row_stats = Statistics {
+            num_rows: Precision::Exact(0),
+            total_byte_size: Precision::Exact(0),
+            column_statistics: vec![
+                ColumnStatistics::new_unknown(),
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        let agg_zero = build_test_aggregate(
+            &schema,
+            zero_row_stats,
             PhysicalGroupBy::default(),
-            vec![Arc::new(
-                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
-                    .schema(Arc::clone(&schema))
-                    .alias("COUNT(a)")
-                    .build()?,
-            )],
-            vec![None],
-            input_zero,
-            Arc::clone(&schema),
-        )?);
-
+            None,
+        )?;
         let stats_zero = agg_zero.partition_statistics(None)?;
         assert_eq!(stats_zero.total_byte_size, Precision::Absent);
 
         Ok(())
     }
 
+    fn build_test_aggregate(
+        schema: &SchemaRef,
+        stats: Statistics,
+        group_by: PhysicalGroupBy,
+        limit: Option<LimitOptions>,
+    ) -> Result<AggregateExec> {
+        let input = Arc::new(StatisticsExec::new(stats, (**schema).clone()))
+            as Arc<dyn ExecutionPlan>;
+
+        let mut agg = AggregateExec::try_new(
+            AggregateMode::Final,
+            group_by,
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("a", schema)?])
+                    .schema(Arc::clone(schema))
+                    .alias("COUNT(a)")
+                    .build()?,
+            )],
+            vec![None],
+            input,
+            Arc::clone(schema),
+        )?;
+
+        if let Some(limit) = limit {
+            agg = agg.with_limit_options(Some(limit));
+        }
+
+        Ok(agg)
+    }
+
+    fn simple_group_by(schema: &SchemaRef, cols: &[&str]) -> PhysicalGroupBy {
+        if cols.is_empty() {
+            PhysicalGroupBy::default()
+        } else {
+            PhysicalGroupBy::new_single(
+                cols.iter()
+                    .map(|name| {
+                        (
+                            col(name, schema).unwrap() as Arc<dyn PhysicalExpr>,
+                            name.to_string(),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+    }
+
     #[test]
     fn test_aggregate_cardinality_estimation() -> Result<()> {
-        use crate::test::exec::StatisticsExec;
         use datafusion_common::ColumnStatistics;
 
         let schema = Arc::new(Schema::new(vec![
@@ -4115,6 +4136,49 @@ mod tests {
                 limit_options: Some(LimitOptions::new(10)),
                 expected_num_rows: Precision::Inexact(10),
             },
+            // --- NDV zero column (all-null) ---
+            TestCase {
+                name: "all-null column contributes 1 to the product, not 0",
+                input_rows: Precision::Exact(1_000),
+                col_a_stats: ColumnStatistics {
+                    distinct_count: Precision::Exact(0),
+                    null_count: Precision::Exact(1_000),
+                    ..ColumnStatistics::new_unknown()
+                },
+                col_b_stats: ColumnStatistics {
+                    distinct_count: Precision::Exact(50),
+                    ..ColumnStatistics::new_unknown()
+                },
+                group_by_cols: vec!["a", "b"],
+                limit_options: None,
+                // NDV(a)=0 with nulls => max(0+1, 1)=1, NDV(b)=50 => 1*50=50
+                expected_num_rows: Precision::Inexact(50),
+            },
+            // --- Absent num_rows with NDV ---
+            TestCase {
+                name: "absent num_rows falls back to NDV estimate",
+                input_rows: Precision::Absent,
+                col_a_stats: ColumnStatistics {
+                    distinct_count: Precision::Exact(100),
+                    ..ColumnStatistics::new_unknown()
+                },
+                col_b_stats: ColumnStatistics::new_unknown(),
+                group_by_cols: vec!["a"],
+                limit_options: None,
+                expected_num_rows: Precision::Inexact(100),
+            },
+            TestCase {
+                name: "absent num_rows with NDV and limit returns min(ndv, limit)",
+                input_rows: Precision::Absent,
+                col_a_stats: ColumnStatistics {
+                    distinct_count: Precision::Exact(100),
+                    ..ColumnStatistics::new_unknown()
+                },
+                col_b_stats: ColumnStatistics::new_unknown(),
+                group_by_cols: vec!["a"],
+                limit_options: Some(LimitOptions::new(10)),
+                expected_num_rows: Precision::Inexact(10),
+            },
         ];
 
         for case in cases {
@@ -4127,42 +4191,9 @@ mod tests {
                 ],
             };
 
-            let input = Arc::new(StatisticsExec::new(input_stats, (*schema).clone()))
-                as Arc<dyn ExecutionPlan>;
-
-            let group_by = if case.group_by_cols.is_empty() {
-                PhysicalGroupBy::default()
-            } else {
-                PhysicalGroupBy::new_single(
-                    case.group_by_cols
-                        .iter()
-                        .map(|name| {
-                            (
-                                col(name, &schema).unwrap() as Arc<dyn PhysicalExpr>,
-                                name.to_string(),
-                            )
-                        })
-                        .collect(),
-                )
-            };
-
-            let mut agg = AggregateExec::try_new(
-                AggregateMode::Final,
-                group_by,
-                vec![Arc::new(
-                    AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
-                        .schema(Arc::clone(&schema))
-                        .alias("COUNT(a)")
-                        .build()?,
-                )],
-                vec![None],
-                input,
-                Arc::clone(&schema),
-            )?;
-
-            if let Some(limit) = case.limit_options {
-                agg = agg.with_limit_options(Some(limit));
-            }
+            let group_by = simple_group_by(&schema, &case.group_by_cols);
+            let agg =
+                build_test_aggregate(&schema, input_stats, group_by, case.limit_options)?;
 
             let stats = agg.partition_statistics(None)?;
             assert_eq!(
@@ -4177,7 +4208,6 @@ mod tests {
 
     #[test]
     fn test_aggregate_stats_distinct_count_propagation() -> Result<()> {
-        use crate::test::exec::StatisticsExec;
         use datafusion_common::ColumnStatistics;
 
         let schema = Arc::new(Schema::new(vec![
@@ -4185,37 +4215,23 @@ mod tests {
             Field::new("b", DataType::Int32, true),
         ]));
 
-        let input = Arc::new(StatisticsExec::new(
-            Statistics {
-                num_rows: Precision::Exact(1000),
-                total_byte_size: Precision::Inexact(10000),
-                column_statistics: vec![
-                    ColumnStatistics {
-                        distinct_count: Precision::Exact(100),
-                        null_count: Precision::Exact(5),
-                        ..ColumnStatistics::new_unknown()
-                    },
-                    ColumnStatistics::new_unknown(),
-                ],
-            },
-            (*schema).clone(),
-        )) as Arc<dyn ExecutionPlan>;
-
-        let agg = AggregateExec::try_new(
-            AggregateMode::Final,
-            PhysicalGroupBy::new_single(vec![(
-                col("a", &schema)? as Arc<dyn PhysicalExpr>,
-                "a".to_string(),
-            )]),
-            vec![Arc::new(
-                AggregateExprBuilder::new(count_udaf(), vec![col("b", &schema)?])
-                    .schema(Arc::clone(&schema))
-                    .alias("COUNT(b)")
-                    .build()?,
-            )],
-            vec![None],
-            input,
-            Arc::clone(&schema),
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(1000),
+            total_byte_size: Precision::Inexact(10000),
+            column_statistics: vec![
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(100),
+                    null_count: Precision::Exact(5),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        let agg = build_test_aggregate(
+            &schema,
+            input_stats,
+            simple_group_by(&schema, &["a"]),
+            None,
         )?;
 
         let stats = agg.partition_statistics(None)?;
@@ -4230,7 +4246,6 @@ mod tests {
 
     #[test]
     fn test_aggregate_stats_grouping_sets() -> Result<()> {
-        use crate::test::exec::StatisticsExec;
         use datafusion_common::ColumnStatistics;
 
         let schema = Arc::new(Schema::new(vec![
@@ -4253,9 +4268,6 @@ mod tests {
             ],
         };
 
-        let input = Arc::new(StatisticsExec::new(input_stats, (*schema).clone()))
-            as Arc<dyn ExecutionPlan>;
-
         // CUBE-like grouping set: (a, NULL), (NULL, b), (a, b) — 3 groups
         let grouping_set = PhysicalGroupBy::new(
             vec![
@@ -4274,19 +4286,7 @@ mod tests {
             true,
         );
 
-        let agg = AggregateExec::try_new(
-            AggregateMode::Final,
-            grouping_set,
-            vec![Arc::new(
-                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
-                    .schema(Arc::clone(&schema))
-                    .alias("COUNT(a)")
-                    .build()?,
-            )],
-            vec![None],
-            input,
-            Arc::clone(&schema),
-        )?;
+        let agg = build_test_aggregate(&schema, input_stats, grouping_set, None)?;
 
         let stats = agg.partition_statistics(None)?;
         // Per-set NDV: (a,NULL)=100, (NULL,b)=50, (a,b)=100*50=5000
@@ -4302,7 +4302,6 @@ mod tests {
 
     #[test]
     fn test_aggregate_stats_non_column_expr_bails_out() -> Result<()> {
-        use crate::test::exec::StatisticsExec;
         use datafusion_common::ColumnStatistics;
         use datafusion_expr::Operator;
         use datafusion_physical_expr::expressions::BinaryExpr;
@@ -4327,9 +4326,6 @@ mod tests {
             ],
         };
 
-        let input = Arc::new(StatisticsExec::new(input_stats, (*schema).clone()))
-            as Arc<dyn ExecutionPlan>;
-
         // GROUP BY (a + b) — not a direct column reference
         let expr_a_plus_b: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
             col("a", &schema)?,
@@ -4337,177 +4333,15 @@ mod tests {
             col("b", &schema)?,
         ));
 
-        let agg = AggregateExec::try_new(
-            AggregateMode::Final,
-            PhysicalGroupBy::new_single(vec![(expr_a_plus_b, "a+b".to_string())]),
-            vec![Arc::new(
-                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
-                    .schema(Arc::clone(&schema))
-                    .alias("COUNT(a)")
-                    .build()?,
-            )],
-            vec![None],
-            input,
-            Arc::clone(&schema),
-        )?;
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(expr_a_plus_b, "a+b".to_string())]);
+        let agg = build_test_aggregate(&schema, input_stats, group_by, None)?;
 
         let stats = agg.partition_statistics(None)?;
-        // Non-column expr bails out of NDV estimation, falls back to input_rows
         assert_eq!(
             stats.num_rows,
             Precision::Inexact(1_000_000),
             "non-column group-by expression should bail out to input_rows"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_aggregate_stats_ndv_zero_column() -> Result<()> {
-        use crate::test::exec::StatisticsExec;
-        use datafusion_common::ColumnStatistics;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int32, true),
-            Field::new("b", DataType::Int32, true),
-        ]));
-
-        let input_stats = Statistics {
-            num_rows: Precision::Exact(1_000),
-            total_byte_size: Precision::Inexact(1_000),
-            column_statistics: vec![
-                ColumnStatistics {
-                    distinct_count: Precision::Exact(0),
-                    null_count: Precision::Exact(1_000),
-                    ..ColumnStatistics::new_unknown()
-                },
-                ColumnStatistics {
-                    distinct_count: Precision::Exact(50),
-                    ..ColumnStatistics::new_unknown()
-                },
-            ],
-        };
-
-        let input = Arc::new(StatisticsExec::new(input_stats, (*schema).clone()))
-            as Arc<dyn ExecutionPlan>;
-
-        let agg = AggregateExec::try_new(
-            AggregateMode::Final,
-            PhysicalGroupBy::new_single(vec![
-                (col("a", &schema)? as Arc<dyn PhysicalExpr>, "a".to_string()),
-                (col("b", &schema)? as Arc<dyn PhysicalExpr>, "b".to_string()),
-            ]),
-            vec![Arc::new(
-                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
-                    .schema(Arc::clone(&schema))
-                    .alias("COUNT(a)")
-                    .build()?,
-            )],
-            vec![None],
-            input,
-            Arc::clone(&schema),
-        )?;
-
-        let stats = agg.partition_statistics(None)?;
-        // NDV(a)=0 with nulls => max(0+1, 1)=1, NDV(b)=50 => 1*50=50
-        assert_eq!(
-            stats.num_rows,
-            Precision::Inexact(50),
-            "all-null column should contribute 1 to the product, not 0"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_aggregate_stats_absent_num_rows_with_ndv() -> Result<()> {
-        use crate::test::exec::StatisticsExec;
-        use datafusion_common::ColumnStatistics;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-
-        let input_stats = Statistics {
-            num_rows: Precision::Absent,
-            total_byte_size: Precision::Absent,
-            column_statistics: vec![ColumnStatistics {
-                distinct_count: Precision::Exact(100),
-                ..ColumnStatistics::new_unknown()
-            }],
-        };
-
-        let input = Arc::new(StatisticsExec::new(input_stats, (*schema).clone()))
-            as Arc<dyn ExecutionPlan>;
-
-        let agg = AggregateExec::try_new(
-            AggregateMode::Final,
-            PhysicalGroupBy::new_single(vec![(
-                col("a", &schema)? as Arc<dyn PhysicalExpr>,
-                "a".to_string(),
-            )]),
-            vec![Arc::new(
-                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
-                    .schema(Arc::clone(&schema))
-                    .alias("COUNT(a)")
-                    .build()?,
-            )],
-            vec![None],
-            input,
-            Arc::clone(&schema),
-        )?;
-
-        let stats = agg.partition_statistics(None)?;
-        assert_eq!(
-            stats.num_rows,
-            Precision::Inexact(100),
-            "absent num_rows should fall back to NDV estimate"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_aggregate_stats_absent_num_rows_with_ndv_and_limit() -> Result<()> {
-        use crate::test::exec::StatisticsExec;
-        use datafusion_common::ColumnStatistics;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-
-        let input_stats = Statistics {
-            num_rows: Precision::Absent,
-            total_byte_size: Precision::Absent,
-            column_statistics: vec![ColumnStatistics {
-                distinct_count: Precision::Exact(100),
-                ..ColumnStatistics::new_unknown()
-            }],
-        };
-
-        let input = Arc::new(StatisticsExec::new(input_stats, (*schema).clone()))
-            as Arc<dyn ExecutionPlan>;
-
-        let mut agg = AggregateExec::try_new(
-            AggregateMode::Final,
-            PhysicalGroupBy::new_single(vec![(
-                col("a", &schema)? as Arc<dyn PhysicalExpr>,
-                "a".to_string(),
-            )]),
-            vec![Arc::new(
-                AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
-                    .schema(Arc::clone(&schema))
-                    .alias("COUNT(a)")
-                    .build()?,
-            )],
-            vec![None],
-            input,
-            Arc::clone(&schema),
-        )?;
-
-        agg = agg.with_limit_options(Some(LimitOptions::new(10)));
-
-        let stats = agg.partition_statistics(None)?;
-        assert_eq!(
-            stats.num_rows,
-            Precision::Inexact(10),
-            "absent num_rows with NDV and limit should return min(ndv, limit)"
         );
 
         Ok(())
