@@ -18,13 +18,17 @@
 //! [`ScalarUDFImpl`] definitions for array_sort function.
 
 use crate::utils::make_scalar_function;
-use arrow::array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, new_null_array};
+use arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, GenericListArray, OffsetSizeTrait, UInt32Array,
+    new_null_array,
+};
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::SortColumn;
 use arrow::datatypes::{DataType, FieldRef};
 use arrow::{compute, compute::SortOptions};
-use datafusion_common::cast::{as_large_list_array, as_list_array, as_string_array};
-use datafusion_common::utils::ListCoercion;
+use datafusion_common::cast::{
+    as_fixed_size_list_array, as_large_list_array, as_list_array, as_string_array,
+};
 use datafusion_common::{Result, exec_err};
 use datafusion_expr::{
     ArrayFunctionArgument, ArrayFunctionSignature, ColumnarValue, Documentation,
@@ -93,14 +97,14 @@ impl ArraySort {
                 vec![
                     TypeSignature::ArraySignature(ArrayFunctionSignature::Array {
                         arguments: vec![ArrayFunctionArgument::Array],
-                        array_coercion: Some(ListCoercion::FixedSizedListToList),
+                        array_coercion: None,
                     }),
                     TypeSignature::ArraySignature(ArrayFunctionSignature::Array {
                         arguments: vec![
                             ArrayFunctionArgument::Array,
                             ArrayFunctionArgument::String,
                         ],
-                        array_coercion: Some(ListCoercion::FixedSizedListToList),
+                        array_coercion: None,
                     }),
                     TypeSignature::ArraySignature(ArrayFunctionSignature::Array {
                         arguments: vec![
@@ -108,7 +112,7 @@ impl ArraySort {
                             ArrayFunctionArgument::String,
                             ArrayFunctionArgument::String,
                         ],
-                        array_coercion: Some(ListCoercion::FixedSizedListToList),
+                        array_coercion: None,
                     }),
                 ],
                 Volatility::Immutable,
@@ -186,7 +190,9 @@ fn array_sort_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
     };
 
     match args[0].data_type() {
-        DataType::List(field) | DataType::LargeList(field)
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
             if field.data_type().is_null() =>
         {
             Ok(Arc::clone(&args[0]))
@@ -199,7 +205,10 @@ fn array_sort_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
             let array = as_large_list_array(&args[0])?;
             array_sort_generic(array, Arc::clone(field), sort_options)
         }
-        // Signature should prevent this arm ever occurring
+        DataType::FixedSizeList(field, _) => {
+            let array = as_fixed_size_list_array(&args[0])?;
+            fixed_size_array_sort(array, Arc::clone(field), sort_options)
+        }
         _ => exec_err!("array_sort expects list for first argument"),
     }
 }
@@ -257,6 +266,55 @@ fn array_sort_generic<OffsetSize: OffsetSizeTrait>(
         )
     };
     Ok(Arc::new(list_arr))
+}
+
+fn fixed_size_array_sort(
+    array: &FixedSizeListArray,
+    field: FieldRef,
+    sort_options: Option<SortOptions>,
+) -> Result<ArrayRef> {
+    let values = array.values();
+    let value_length = array.value_length() as usize;
+
+    if value_length <= 1 {
+        return Ok(Arc::new(array.clone()));
+    }
+
+    let is_struct = matches!(values.data_type(), DataType::Struct(_));
+    let mut indices: Vec<u32> = Vec::with_capacity(values.len());
+
+    for row in 0..array.len() {
+        let start = row * value_length;
+        if array.is_null(row) {
+            indices.extend((start..start + value_length).map(|i| i as u32));
+            continue;
+        }
+
+        let sliced = values.slice(start, value_length);
+        let sorted_indices = if is_struct {
+            let sort_columns = vec![SortColumn {
+                values: sliced,
+                options: sort_options,
+            }];
+            compute::lexsort_to_indices(&sort_columns, None)?
+        } else {
+            compute::sort_to_indices(&sliced, sort_options, None)?
+        };
+
+        for &local_idx in sorted_indices.values() {
+            indices.push((start + local_idx as usize) as u32);
+        }
+    }
+
+    let indices_array = UInt32Array::from(indices);
+    let sorted_values = compute::take(values.as_ref(), &indices_array, None)?;
+
+    Ok(Arc::new(FixedSizeListArray::try_new(
+        field,
+        array.value_length(),
+        sorted_values,
+        array.nulls().cloned(),
+    )?))
 }
 
 fn order_desc(modifier: &str) -> Result<bool> {
