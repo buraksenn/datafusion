@@ -19,7 +19,9 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayData, ArrayRef, MapArray, OffsetSizeTrait, StructArray};
+use arrow::array::{
+    Array, ArrayData, ArrayRef, AsArray, MapArray, OffsetSizeTrait, StructArray,
+};
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, SchemaBuilder, ToByteSlice};
 
@@ -371,26 +373,132 @@ fn make_map_array_internal<O: OffsetSizeTrait>(
     keys: &ArrayRef,
     values: &ArrayRef,
 ) -> Result<ColumnarValue> {
-    // Save original data types and array length before list_to_arrays transforms them
-    let keys_data_type = keys.data_type().clone();
-    let values_data_type = values.data_type().clone();
-    let original_len = keys.len(); // This is the number of rows in the input
+    let keys_list = keys.as_list::<O>();
+    let values_list = values.as_list::<O>();
+    let original_len = keys_list.len();
+    let nulls_bitmap = keys_list.nulls().cloned();
 
-    // Save the nulls bitmap from the original keys array (before list_to_arrays)
-    // This tells us which MAP values are NULL (not which keys within maps are null)
-    let nulls_bitmap = keys.nulls().cloned();
+    let key_type = get_element_type(keys.data_type())?;
+    let value_type = get_element_type(values.data_type())?;
 
-    let keys = list_to_arrays::<O>(keys);
-    let values = list_to_arrays::<O>(values);
+    let has_nulls = nulls_bitmap.as_ref().is_some_and(|n| n.null_count() > 0);
 
-    build_map_array(
-        &keys,
-        &values,
-        &keys_data_type,
-        &values_data_type,
-        original_len,
-        nulls_bitmap,
-    )
+    let k_first = keys_list.offsets()[0].as_usize();
+    let k_last = keys_list.offsets()[original_len].as_usize();
+    let v_first = values_list.offsets()[0].as_usize();
+    let v_last = values_list.offsets()[original_len].as_usize();
+
+    let (flat_keys, flat_values, offset_buffer) = if has_nulls {
+        let nulls = nulls_bitmap.as_ref().unwrap();
+        let mut key_indices: Vec<usize> = Vec::with_capacity(k_last - k_first);
+        let mut val_indices: Vec<usize> = Vec::with_capacity(v_last - v_first);
+        let mut running_offset = 0i32;
+        let mut offsets = Vec::with_capacity(original_len + 1);
+        offsets.push(running_offset);
+
+        for i in 0..original_len {
+            if nulls.is_null(i) {
+                offsets.push(running_offset);
+                continue;
+            }
+            let ks = keys_list.offsets()[i].as_usize();
+            let ke = keys_list.offsets()[i + 1].as_usize();
+            let vs = values_list.offsets()[i].as_usize();
+            let ve = values_list.offsets()[i + 1].as_usize();
+            let entry_count = ke - ks;
+            let entry_count_i32 = i32::try_from(entry_count).map_err(|_| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Map offset overflow: entry count {entry_count} at index {i} exceeds i32::MAX",
+                ))
+            })?;
+            running_offset =
+                running_offset.checked_add(entry_count_i32).ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Map offset overflow: cumulative offset exceeds i32::MAX at index {i}",
+                    ))
+                })?;
+            key_indices.extend(ks..ke);
+            val_indices.extend(vs..ve);
+            offsets.push(running_offset);
+        }
+
+        let key_idx_arr = arrow::array::UInt32Array::from(
+            key_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        );
+        let val_idx_arr = arrow::array::UInt32Array::from(
+            val_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        );
+        let fk = arrow::compute::take(keys_list.values().as_ref(), &key_idx_arr, None)?;
+        let fv = arrow::compute::take(values_list.values().as_ref(), &val_idx_arr, None)?;
+        (fk, fv, offsets)
+    } else {
+        let flat_keys = keys_list.values().slice(k_first, k_last - k_first);
+        let flat_values = values_list.values().slice(v_first, v_last - v_first);
+
+        let mut running_offset = 0i32;
+        let mut offsets = Vec::with_capacity(original_len + 1);
+        offsets.push(running_offset);
+        for i in 0..original_len {
+            let entry_count =
+                keys_list.offsets()[i + 1].as_usize() - keys_list.offsets()[i].as_usize();
+            let entry_count_i32 = i32::try_from(entry_count).map_err(|_| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Map offset overflow: entry count {entry_count} at index {i} exceeds i32::MAX",
+                ))
+            })?;
+            running_offset =
+                running_offset.checked_add(entry_count_i32).ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Map offset overflow: cumulative offset exceeds i32::MAX at index {i}",
+                    ))
+                })?;
+            offsets.push(running_offset);
+        }
+        (flat_keys, flat_values, offsets)
+    };
+
+    if flat_keys.null_count() > 0 {
+        return exec_err!("keys cannot be null");
+    }
+
+    let (flat_keys, flat_values) = if flat_keys.is_empty() {
+        (
+            arrow::array::new_empty_array(key_type),
+            arrow::array::new_empty_array(value_type),
+        )
+    } else {
+        (flat_keys, flat_values)
+    };
+
+    let fields = vec![
+        Arc::new(Field::new("key", flat_keys.data_type().clone(), false)),
+        Arc::new(Field::new("value", flat_values.data_type().clone(), true)),
+    ];
+
+    let struct_data = ArrayData::builder(DataType::Struct(fields.into()))
+        .len(flat_keys.len())
+        .add_child_data(flat_keys.to_data())
+        .add_child_data(flat_values.to_data())
+        .build()?;
+
+    let mut map_data_builder = ArrayData::builder(DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            struct_data.data_type().clone(),
+            false,
+        )),
+        false,
+    ))
+    .len(original_len)
+    .add_child_data(struct_data)
+    .add_buffer(Buffer::from_slice_ref(offset_buffer.as_slice()));
+
+    if let Some(nulls) = nulls_bitmap {
+        map_data_builder = map_data_builder.nulls(Some(nulls));
+    }
+
+    let map_data = map_data_builder.build()?;
+    Ok(ColumnarValue::Array(Arc::new(MapArray::from(map_data))))
 }
 
 /// Helper function specifically for FixedSizeList inputs

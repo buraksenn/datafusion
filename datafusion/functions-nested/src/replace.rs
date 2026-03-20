@@ -21,9 +21,9 @@ use arrow::array::{
     Array, ArrayRef, AsArray, Capacities, GenericListArray, MutableArrayData,
     NullBufferBuilder, OffsetSizeTrait, new_null_array,
 };
-use arrow::datatypes::{DataType, Field};
-
 use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{DataType, Field};
+use arrow::row::{RowConverter, SortField};
 use datafusion_common::cast::as_int64_array;
 use datafusion_common::utils::ListCoercion;
 use datafusion_common::{Result, exec_err, utils::take_function_args};
@@ -33,7 +33,6 @@ use datafusion_expr::{
 };
 use datafusion_macros::user_doc;
 
-use crate::utils::compare_element_to_list;
 use crate::utils::make_scalar_function;
 
 use std::any::Any;
@@ -330,14 +329,22 @@ fn general_replace<O: OffsetSizeTrait>(
     to_array: &ArrayRef,
     arr_n: &[i64],
 ) -> Result<ArrayRef> {
-    // Build up the offsets for the final output array
+    let converter = RowConverter::new(vec![SortField::new(list_array.value_type())])?;
+
+    let first_offset = list_array.offsets()[0].as_usize();
+    let last_offset = list_array.offsets()[list_array.len()].as_usize();
+    let visible_values = list_array
+        .values()
+        .slice(first_offset, last_offset - first_offset);
+    let value_rows = converter.convert_columns(&[visible_values])?;
+    let from_rows = converter.convert_columns(&[Arc::clone(from_array)])?;
+
     let mut offsets: Vec<O> = vec![O::usize_as(0)];
     let values = list_array.values();
     let original_data = values.to_data();
     let to_data = to_array.to_data();
     let capacity = Capacities::Array(original_data.len());
 
-    // First array is the original array, second array is the element to replace with.
     let mut mutable = MutableArrayData::with_capacities(
         vec![&original_data, &to_data],
         false,
@@ -355,51 +362,40 @@ fn general_replace<O: OffsetSizeTrait>(
 
         let start = offset_window[0];
         let end = offset_window[1];
+        let row_start = start.to_usize().unwrap() - first_offset;
+        let row_end = end.to_usize().unwrap() - first_offset;
+        let row_len = row_end - row_start;
+        let target = from_rows.row(row_index);
 
-        let list_array_row = list_array.value(row_index);
+        let num_matches = (row_start..row_end)
+            .filter(|&idx| value_rows.row(idx) == target)
+            .count();
 
-        // Compute all positions in list_row_array (that is itself an
-        // array) that are equal to `from_array_row`
-        let eq_array =
-            compare_element_to_list(&list_array_row, &from_array, row_index, true)?;
-
-        let original_idx = O::usize_as(0);
-        let replace_idx = O::usize_as(1);
-        let n = arr_n[row_index];
-        let mut counter = 0;
-
-        // All elements are false, no need to replace, just copy original data
-        if eq_array.false_count() == eq_array.len() {
-            mutable.extend(
-                original_idx.to_usize().unwrap(),
-                start.to_usize().unwrap(),
-                end.to_usize().unwrap(),
-            );
+        if num_matches == 0 {
+            mutable.extend(0, start.to_usize().unwrap(), end.to_usize().unwrap());
             offsets.push(offsets[row_index] + (end - start));
             valid.append_non_null();
             continue;
         }
 
-        for (i, to_replace) in eq_array.iter().enumerate() {
-            let i = O::usize_as(i);
-            if let Some(true) = to_replace {
-                mutable.extend(replace_idx.to_usize().unwrap(), row_index, row_index + 1);
+        let n = arr_n[row_index];
+        let mut counter = 0i64;
+
+        for i in 0..row_len {
+            let matches = value_rows.row(row_start + i) == target;
+            if matches && counter < n {
+                mutable.extend(1, row_index, row_index + 1);
                 counter += 1;
                 if counter == n {
-                    // copy original data for any matches past n
-                    mutable.extend(
-                        original_idx.to_usize().unwrap(),
-                        (start + i).to_usize().unwrap() + 1,
-                        end.to_usize().unwrap(),
-                    );
+                    let remaining_start = start.to_usize().unwrap() + i + 1;
+                    mutable.extend(0, remaining_start, end.to_usize().unwrap());
                     break;
                 }
             } else {
-                // copy original data for false / null matches
                 mutable.extend(
-                    original_idx.to_usize().unwrap(),
-                    (start + i).to_usize().unwrap(),
-                    (start + i).to_usize().unwrap() + 1,
+                    0,
+                    start.to_usize().unwrap() + i,
+                    start.to_usize().unwrap() + i + 1,
                 );
             }
         }

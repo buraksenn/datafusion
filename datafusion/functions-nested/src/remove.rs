@@ -17,7 +17,6 @@
 
 //! [`ScalarUDFImpl`] definitions for array_remove, array_remove_n, array_remove_all functions.
 
-use crate::utils;
 use crate::utils::make_scalar_function;
 use arrow::array::{
     Array, ArrayRef, Capacities, GenericListArray, MutableArrayData, NullBufferBuilder,
@@ -25,6 +24,7 @@ use arrow::array::{
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, FieldRef};
+use arrow::row::{RowConverter, SortField};
 use datafusion_common::cast::as_int64_array;
 use datafusion_common::utils::ListCoercion;
 use datafusion_common::{Result, exec_err, internal_err, utils::take_function_args};
@@ -377,8 +377,18 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
             );
         }
     };
+
+    let converter = RowConverter::new(vec![SortField::new(list_array.value_type())])?;
+
+    let first_offset = list_array.offsets()[0].as_usize();
+    let last_offset = list_array.offsets()[list_array.len()].as_usize();
+    let visible_values = list_array
+        .values()
+        .slice(first_offset, last_offset - first_offset);
+    let value_rows = converter.convert_columns(&[visible_values])?;
+    let element_rows = converter.convert_columns(&[Arc::clone(element_array)])?;
+
     let original_data = list_array.values().to_data();
-    // Build up the offsets for the final output array
     let mut offsets = Vec::<OffsetSize>::with_capacity(arr_n.len() + 1);
     offsets.push(OffsetSize::zero());
 
@@ -398,36 +408,30 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
 
         let start = offset_window[0].to_usize().unwrap();
         let end = offset_window[1].to_usize().unwrap();
-        // n is the number of elements to remove in this row
         let n = arr_n[row_index];
+        let row_start = start - first_offset;
+        let row_end = end - first_offset;
+        let row_len = row_end - row_start;
+        let target = element_rows.row(row_index);
 
-        // compare each element in the list, `false` means the element matches and should be removed
-        let eq_array = utils::compare_element_to_list(
-            &list_array.value(row_index),
-            element_array,
-            row_index,
-            false,
-        )?;
+        let num_to_remove = (row_start..row_end)
+            .filter(|&idx| value_rows.row(idx) == target)
+            .count();
 
-        let num_to_remove = eq_array.false_count();
-
-        // Fast path: no elements to remove, copy entire row
         if num_to_remove == 0 {
             mutable.extend(0, start, end);
-            offsets.push(offsets[row_index] + OffsetSize::usize_as(end - start));
+            offsets.push(offsets[row_index] + OffsetSize::usize_as(row_len));
             valid.append_non_null();
             continue;
         }
 
-        // Remove at most `n` matching elements
         let max_removals = n.min(num_to_remove as i64);
         let mut removed = 0i64;
         let mut copied = 0usize;
-        // marks the beginning of a range of elements pending to be copied.
         let mut pending_batch_to_retain: Option<usize> = None;
-        for (i, keep) in eq_array.iter().enumerate() {
-            if keep == Some(false) && removed < max_removals {
-                // Flush pending batch before skipping this element
+        for i in 0..row_len {
+            let matches = value_rows.row(row_start + i) == target;
+            if matches && removed < max_removals {
                 if let Some(bs) = pending_batch_to_retain {
                     mutable.extend(0, start + bs, start + i);
                     copied += i - bs;
@@ -439,10 +443,9 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
             }
         }
 
-        // Flush remaining batch
         if let Some(bs) = pending_batch_to_retain {
-            mutable.extend(0, start + bs, start + eq_array.len());
-            copied += eq_array.len() - bs;
+            mutable.extend(0, start + bs, start + row_len);
+            copied += row_len - bs;
         }
 
         offsets.push(offsets[row_index] + OffsetSize::usize_as(copied));

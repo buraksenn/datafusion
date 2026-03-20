@@ -23,6 +23,7 @@ use arrow::datatypes::{
     DataType::{LargeList, List, UInt64},
     Field,
 };
+use arrow::row::{RowConverter, SortField};
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
     ColumnarValue, Documentation, ScalarUDFImpl, Signature, Volatility,
@@ -32,6 +33,7 @@ use datafusion_macros::user_doc;
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::utils::make_scalar_function;
 use arrow::array::{
     Array, ArrayRef, GenericListArray, ListArray, OffsetSizeTrait, UInt64Array,
     types::UInt64Type,
@@ -40,9 +42,6 @@ use datafusion_common::cast::{
     as_generic_list_array, as_int64_array, as_large_list_array, as_list_array,
 };
 use datafusion_common::{Result, exec_err, utils::take_function_args};
-use itertools::Itertools;
-
-use crate::utils::{compare_element_to_list, make_scalar_function};
 
 make_udf_expr_and_func!(
     ArrayPosition,
@@ -333,28 +332,34 @@ fn generic_position<OffsetSize: OffsetSizeTrait>(
     element_array: &ArrayRef,
     arr_from: &[i64], // 0-indexed
 ) -> Result<ArrayRef> {
+    let converter = RowConverter::new(vec![SortField::new(list_array.value_type())])?;
+
+    let first_offset = list_array.offsets()[0].as_usize();
+    let last_offset = list_array.offsets()[list_array.len()].as_usize();
+    let visible_values = list_array
+        .values()
+        .slice(first_offset, last_offset - first_offset);
+    let value_rows = converter.convert_columns(&[visible_values])?;
+    let element_rows = converter.convert_columns(&[Arc::clone(element_array)])?;
+
     let mut data = Vec::with_capacity(list_array.len());
 
-    for (row_index, (list_array_row, &from)) in
-        list_array.iter().zip(arr_from.iter()).enumerate()
-    {
-        let from = from as usize;
-
-        if let Some(list_array_row) = list_array_row {
-            let eq_array =
-                compare_element_to_list(&list_array_row, element_array, row_index, true)?;
-
-            // Collect `true`s in 1-indexed positions
-            let index = eq_array
-                .iter()
-                .skip(from)
-                .position(|e| e == Some(true))
-                .map(|index| (from + index + 1) as u64);
-
-            data.push(index);
-        } else {
+    for (row_index, &from) in arr_from.iter().enumerate() {
+        if list_array.is_null(row_index) {
             data.push(None);
+            continue;
         }
+
+        let start = list_array.offsets()[row_index].as_usize() - first_offset;
+        let end = list_array.offsets()[row_index + 1].as_usize() - first_offset;
+        let from = from as usize;
+        let target = element_rows.row(row_index);
+
+        let index = (start + from..end)
+            .position(|idx| value_rows.row(idx) == target)
+            .map(|pos| (from + pos + 1) as u64);
+
+        data.push(index);
     }
 
     Ok(Arc::new(UInt64Array::from(data)))
@@ -460,24 +465,34 @@ fn general_positions<OffsetSize: OffsetSizeTrait>(
     list_array: &GenericListArray<OffsetSize>,
     element_array: &ArrayRef,
 ) -> Result<ArrayRef> {
+    let converter = RowConverter::new(vec![SortField::new(list_array.value_type())])?;
+
+    let first_offset = list_array.offsets()[0].as_usize();
+    let last_offset = list_array.offsets()[list_array.len()].as_usize();
+    let visible_values = list_array
+        .values()
+        .slice(first_offset, last_offset - first_offset);
+    let value_rows = converter.convert_columns(&[visible_values])?;
+    let element_rows = converter.convert_columns(&[Arc::clone(element_array)])?;
+
     let mut data = Vec::with_capacity(list_array.len());
 
-    for (row_index, list_array_row) in list_array.iter().enumerate() {
-        if let Some(list_array_row) = list_array_row {
-            let eq_array =
-                compare_element_to_list(&list_array_row, element_array, row_index, true)?;
-
-            // Collect `true`s in 1-indexed positions
-            let indexes = eq_array
-                .iter()
-                .positions(|e| e == Some(true))
-                .map(|index| Some(index as u64 + 1))
-                .collect::<Vec<_>>();
-
-            data.push(Some(indexes));
-        } else {
+    for row_index in 0..list_array.len() {
+        if list_array.is_null(row_index) {
             data.push(None);
+            continue;
         }
+
+        let start = list_array.offsets()[row_index].as_usize() - first_offset;
+        let end = list_array.offsets()[row_index + 1].as_usize() - first_offset;
+        let target = element_rows.row(row_index);
+
+        let indexes = (start..end)
+            .filter(|&idx| value_rows.row(idx) == target)
+            .map(|idx| Some((idx - start) as u64 + 1))
+            .collect::<Vec<_>>();
+
+        data.push(Some(indexes));
     }
 
     Ok(Arc::new(
