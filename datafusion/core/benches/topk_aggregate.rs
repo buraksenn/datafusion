@@ -294,35 +294,35 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     // Numeric aggregate benchmarks
     // (asc, use_topk, use_view)
-    let numeric_cases: &[(bool, bool, bool, &str)] = &[
-        (false, false, false, "aggregate {rows} time-series rows"),
-        (true, false, false, "aggregate {rows} worst-case rows"),
+    let numeric_cases: &[(&str, bool, bool, bool)] = &[
+        ("aggregate {rows} time-series rows", false, false, false),
+        ("aggregate {rows} worst-case rows", true, false, false),
         (
-            false,
-            true,
-            false,
             "top k={limit} aggregate {rows} time-series rows",
-        ),
-        (
-            true,
+            false,
             true,
             false,
+        ),
+        (
             "top k={limit} aggregate {rows} worst-case rows",
+            true,
+            true,
+            false,
         ),
         (
+            "top k={limit} aggregate {rows} time-series rows [Utf8View]",
             false,
             true,
             true,
-            "top k={limit} aggregate {rows} time-series rows [Utf8View]",
         ),
         (
-            true,
-            true,
-            true,
             "top k={limit} aggregate {rows} worst-case rows [Utf8View]",
+            true,
+            true,
+            true,
         ),
     ];
-    for &(asc, use_topk, use_view, name_tpl) in numeric_cases {
+    for &(name_tpl, asc, use_topk, use_view) in numeric_cases {
         let name = name_tpl
             .replace("{rows}", &total_rows.to_string())
             .replace("{limit}", &limit.to_string());
