@@ -41,7 +41,7 @@ use datafusion_expr::{
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_functions_nested::expr_fn::{
-    array_element, array_has, array_max, array_min, array_sort, cardinality,
+    array_has, array_max, array_min, array_position, cardinality,
 };
 
 mod binary_op;
@@ -612,7 +612,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 _ => {
                     let left_expr = self.sql_to_expr(*left, schema, planner_context)?;
                     let right_expr = self.sql_to_expr(*right, schema, planner_context)?;
-                    plan_quantified_op(left_expr, right_expr, &compare_op, false)
+                    plan_quantified_op(&left_expr, &right_expr, &compare_op, false)
                 }
             },
             SQLExpr::AllOp {
@@ -631,7 +631,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 _ => {
                     let left_expr = self.sql_to_expr(*left, schema, planner_context)?;
                     let right_expr = self.sql_to_expr(*right, schema, planner_context)?;
-                    plan_quantified_op(left_expr, right_expr, &compare_op, true)
+                    plan_quantified_op(&left_expr, &right_expr, &compare_op, true)
                 }
             },
             #[expect(deprecated)]
@@ -1240,14 +1240,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     }
 }
 
-/// Returns an expression that checks whether the given array contains any NULL elements.
-///
-/// Implemented as: `cardinality(arr) != cardinality(array_remove_all(arr, NULL))`
-fn array_has_nulls(arr: Expr) -> Expr {
-    let sorted = array_sort(arr, lit("ASC"), lit("NULLS FIRST"));
-    array_element(sorted, lit(1i64)).is_null()
-}
-
 /// Plans `left_expr <compare_op> ANY/ALL(right_expr)` with proper SQL NULL semantics.
 ///
 /// When `is_all` is false (ANY): returns TRUE if any element satisfies the condition.
@@ -1261,15 +1253,16 @@ fn array_has_nulls(arr: Expr) -> Expr {
 ///   WHEN has_nulls          → NULL
 ///   ELSE                    → is_all (ANY:false, ALL:true)
 fn plan_quantified_op(
-    left_expr: Expr,
-    right_expr: Expr,
+    left_expr: &Expr,
+    right_expr: &Expr,
     compare_op: &BinaryOperator,
     is_all: bool,
 ) -> Result<Expr> {
     let null_arr_check = right_expr.clone().is_null();
     let empty_check = cardinality(right_expr.clone()).eq(lit(0i64));
     let null_lhs_check = left_expr.clone().is_null();
-    let has_nulls = array_has_nulls(right_expr.clone());
+    let has_nulls =
+        array_position(right_expr.clone(), lit(ScalarValue::Null), lit(1i64)).is_null();
 
     let decisive_condition = match (compare_op, is_all) {
         (BinaryOperator::Eq, false) | (BinaryOperator::NotEq, true) => {
@@ -1313,11 +1306,12 @@ fn plan_quantified_op(
         }
     };
 
-    when(null_arr_check, lit(ScalarValue::Null))
+    let null_bool = lit(ScalarValue::Boolean(None));
+    when(null_arr_check, null_bool.clone())
         .when(empty_check, lit(is_all))
-        .when(null_lhs_check, lit(ScalarValue::Null))
+        .when(null_lhs_check, null_bool.clone())
         .when(decisive_condition, lit(!is_all))
-        .when(has_nulls, lit(ScalarValue::Null))
+        .when(has_nulls, null_bool)
         .otherwise(lit(is_all))
 }
 
