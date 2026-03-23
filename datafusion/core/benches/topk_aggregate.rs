@@ -117,9 +117,9 @@ fn run(rt: &Runtime, ctx: SessionContext, limit: usize, use_topk: bool, asc: boo
     black_box(rt.block_on(async { aggregate(ctx, limit, use_topk, asc).await })).unwrap();
 }
 
-fn run_string(rt: &Runtime, ctx: SessionContext, limit: usize, use_topk: bool) -> String {
+fn run_string(rt: &Runtime, ctx: SessionContext, limit: usize, use_topk: bool) {
     black_box(rt.block_on(async { aggregate_string(ctx, limit, use_topk).await }))
-        .unwrap()
+        .unwrap();
 }
 
 fn run_distinct(
@@ -187,7 +187,7 @@ async fn aggregate_string(
     ctx: SessionContext,
     limit: usize,
     use_topk: bool,
-) -> Result<String> {
+) -> Result<Vec<RecordBatch>> {
     let sql = format!(
         "select max(trace_id) from traces group by timestamp_ms order by max(trace_id) desc limit {limit};"
     );
@@ -204,7 +204,7 @@ async fn aggregate_string(
     let batch = batches.first().unwrap();
     assert_eq!(batch.num_rows(), LIMIT);
 
-    Ok(format!("{}", pretty_format_batches(&batches)?))
+    Ok(batches)
 }
 
 async fn aggregate_distinct(
@@ -285,6 +285,60 @@ async fn aggregate_distinct(
     Ok(())
 }
 
+struct BenchCase<'a> {
+    name_tpl: &'a str,
+    asc: bool,
+    use_topk: bool,
+    use_view: bool,
+}
+
+struct StringCase {
+    asc: bool,
+    use_topk: bool,
+    use_view: bool,
+}
+
+fn assert_utf8_utf8view_match(
+    rt: &Runtime,
+    partitions: i32,
+    samples: i32,
+    limit: usize,
+    asc: bool,
+    use_topk: bool,
+) {
+    let ctx_utf8 = rt
+        .block_on(create_context(partitions, samples, asc, use_topk, false))
+        .unwrap();
+    let ctx_view = rt
+        .block_on(create_context(partitions, samples, asc, use_topk, true))
+        .unwrap();
+    let batches_utf8 = rt
+        .block_on(aggregate_string(ctx_utf8, limit, use_topk))
+        .unwrap();
+    let batches_view = rt
+        .block_on(aggregate_string(ctx_view, limit, use_topk))
+        .unwrap();
+    let result_utf8 = pretty_format_batches(&batches_utf8).unwrap().to_string();
+    let result_view = pretty_format_batches(&batches_view).unwrap().to_string();
+    assert_eq!(
+        result_utf8, result_view,
+        "Utf8 vs Utf8View mismatch for asc={asc}, use_topk={use_topk}"
+    );
+}
+
+fn assert_string_results_match(
+    rt: &Runtime,
+    partitions: i32,
+    samples: i32,
+    limit: usize,
+) {
+    for asc in [false, true] {
+        for use_topk in [false, true] {
+            assert_utf8_utf8view_match(rt, partitions, samples, limit, asc, use_topk);
+        }
+    }
+}
+
 fn criterion_benchmark(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let limit = LIMIT;
@@ -293,80 +347,115 @@ fn criterion_benchmark(c: &mut Criterion) {
     let total_rows = partitions * samples;
 
     // Numeric aggregate benchmarks
-    // (asc, use_topk, use_view)
-    let numeric_cases: &[(&str, bool, bool, bool)] = &[
-        ("aggregate {rows} time-series rows", false, false, false),
-        ("aggregate {rows} worst-case rows", true, false, false),
-        (
-            "top k={limit} aggregate {rows} time-series rows",
-            false,
-            true,
-            false,
-        ),
-        (
-            "top k={limit} aggregate {rows} worst-case rows",
-            true,
-            true,
-            false,
-        ),
-        (
-            "top k={limit} aggregate {rows} time-series rows [Utf8View]",
-            false,
-            true,
-            true,
-        ),
-        (
-            "top k={limit} aggregate {rows} worst-case rows [Utf8View]",
-            true,
-            true,
-            true,
-        ),
+    let numeric_cases = &[
+        BenchCase {
+            name_tpl: "aggregate {rows} time-series rows",
+            asc: false,
+            use_topk: false,
+            use_view: false,
+        },
+        BenchCase {
+            name_tpl: "aggregate {rows} worst-case rows",
+            asc: true,
+            use_topk: false,
+            use_view: false,
+        },
+        BenchCase {
+            name_tpl: "top k={limit} aggregate {rows} time-series rows",
+            asc: false,
+            use_topk: true,
+            use_view: false,
+        },
+        BenchCase {
+            name_tpl: "top k={limit} aggregate {rows} worst-case rows",
+            asc: true,
+            use_topk: true,
+            use_view: false,
+        },
+        BenchCase {
+            name_tpl: "top k={limit} aggregate {rows} time-series rows [Utf8View]",
+            asc: false,
+            use_topk: true,
+            use_view: true,
+        },
+        BenchCase {
+            name_tpl: "top k={limit} aggregate {rows} worst-case rows [Utf8View]",
+            asc: true,
+            use_topk: true,
+            use_view: true,
+        },
     ];
-    for &(name_tpl, asc, use_topk, use_view) in numeric_cases {
-        let name = name_tpl
+    for case in numeric_cases {
+        let name = case
+            .name_tpl
             .replace("{rows}", &total_rows.to_string())
             .replace("{limit}", &limit.to_string());
         let ctx = rt
-            .block_on(create_context(partitions, samples, asc, use_topk, use_view))
+            .block_on(create_context(
+                partitions,
+                samples,
+                case.asc,
+                case.use_topk,
+                case.use_view,
+            ))
             .unwrap();
         c.bench_function(&name, |b| {
-            b.iter(|| run(&rt, ctx.clone(), limit, use_topk, asc))
+            b.iter(|| run(&rt, ctx.clone(), limit, case.use_topk, case.asc))
         });
     }
 
-    for asc in [false, true] {
-        for use_topk in [false, true] {
-            let ctx_utf8 = rt
-                .block_on(create_context(partitions, samples, asc, use_topk, false))
-                .unwrap();
-            let ctx_view = rt
-                .block_on(create_context(partitions, samples, asc, use_topk, true))
-                .unwrap();
-            let result_utf8 = run_string(&rt, ctx_utf8, limit, use_topk);
-            let result_view = run_string(&rt, ctx_view, limit, use_topk);
-            assert_eq!(
-                result_utf8, result_view,
-                "Utf8 vs Utf8View mismatch for asc={asc}, use_topk={use_topk}"
-            );
-        }
-    }
+    assert_string_results_match(&rt, partitions, samples, limit);
 
-    // String aggregate benchmarks
-    // (asc, use_topk, use_view)
-    let string_cases: &[(bool, bool, bool)] = &[
-        (false, false, false),
-        (true, false, false),
-        (false, false, true),
-        (true, false, true),
-        (false, true, false),
-        (true, true, false),
-        (false, true, true),
-        (true, true, true),
+    let string_cases = &[
+        StringCase {
+            asc: false,
+            use_topk: false,
+            use_view: false,
+        },
+        StringCase {
+            asc: true,
+            use_topk: false,
+            use_view: false,
+        },
+        StringCase {
+            asc: false,
+            use_topk: false,
+            use_view: true,
+        },
+        StringCase {
+            asc: true,
+            use_topk: false,
+            use_view: true,
+        },
+        StringCase {
+            asc: false,
+            use_topk: true,
+            use_view: false,
+        },
+        StringCase {
+            asc: true,
+            use_topk: true,
+            use_view: false,
+        },
+        StringCase {
+            asc: false,
+            use_topk: true,
+            use_view: true,
+        },
+        StringCase {
+            asc: true,
+            use_topk: true,
+            use_view: true,
+        },
     ];
-    for &(asc, use_topk, use_view) in string_cases {
-        let scenario = if asc { "worst-case" } else { "time-series" };
-        let type_label = if use_view { "Utf8View" } else { "Utf8" };
-        let name = if use_topk {
+    for case in string_cases {
+        let scenario = if case.asc {
+            "worst-case"
+        } else {
+            "time-series"
+        };
+        let type_label = if case.use_view { "Utf8View" } else { "Utf8" };
+        let name = if case.use_topk {
             format!(
                 "top k={limit} string aggregate {total_rows} {scenario} rows [{type_label}]"
             )
@@ -374,10 +463,16 @@ fn criterion_benchmark(c: &mut Criterion) {
             format!("string aggregate {total_rows} {scenario} rows [{type_label}]")
         };
         let ctx = rt
-            .block_on(create_context(partitions, samples, asc, use_topk, use_view))
+            .block_on(create_context(
+                partitions,
+                samples,
+                case.asc,
+                case.use_topk,
+                case.use_view,
+            ))
             .unwrap();
         c.bench_function(&name, |b| {
-            b.iter(|| run_string(&rt, ctx.clone(), limit, use_topk))
+            b.iter(|| run_string(&rt, ctx.clone(), limit, case.use_topk))
         });
     }
 
