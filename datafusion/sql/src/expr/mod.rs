@@ -1258,14 +1258,20 @@ fn plan_quantified_op(
     compare_op: &BinaryOperator,
     is_all: bool,
 ) -> Result<Expr> {
+    // Fast path: `x = ANY(arr)` maps directly to `array_has(arr, x)`,
+    // which the optimizer can further simplify to an IN-list.
+    if matches!(compare_op, BinaryOperator::Eq) && !is_all {
+        return Ok(array_has(right_expr.clone(), left_expr.clone()));
+    }
+
     let null_arr_check = right_expr.clone().is_null();
-    let empty_check = cardinality(right_expr.clone()).eq(lit(0i64));
+    let empty_check = cardinality(right_expr.clone()).eq(lit(0u64));
     let null_lhs_check = left_expr.clone().is_null();
-    let has_nulls =
-        array_position(right_expr.clone(), lit(ScalarValue::Null), lit(1i64)).is_null();
+    let has_nulls = array_position(right_expr.clone(), lit(ScalarValue::Null), lit(1i64))
+        .is_not_null();
 
     let decisive_condition = match (compare_op, is_all) {
-        (BinaryOperator::Eq, false) | (BinaryOperator::NotEq, true) => {
+        (BinaryOperator::NotEq, true) => {
             array_has(right_expr.clone(), left_expr.clone())
         }
         (BinaryOperator::Eq, true) | (BinaryOperator::NotEq, false) => {
