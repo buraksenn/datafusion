@@ -30,7 +30,9 @@ use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
 };
-use datafusion_common::{Column, Result, ScalarValue, assert_or_internal_err, plan_err};
+use datafusion_common::{
+    Column, Result, ScalarValue, TableReference, assert_or_internal_err, plan_err,
+};
 use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
 use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::conjunction;
@@ -363,9 +365,10 @@ fn build_join(
                     expr: None,
                     when_then_expr: vec![
                         (
-                            Box::new(Expr::IsNull(Box::new(Expr::Column(
-                                Column::new_unqualified(UN_MATCHED_ROW_INDICATOR),
-                            )))),
+                            Box::new(Expr::IsNull(Box::new(Expr::Column(Column::new(
+                                Some(TableReference::bare(subquery_alias)),
+                                UN_MATCHED_ROW_INDICATOR,
+                            ))))),
                             Box::new(result),
                         ),
                         (
@@ -373,7 +376,8 @@ fn build_join(
                             Box::new(Expr::Literal(ScalarValue::Null, None)),
                         ),
                     ],
-                    else_expr: Some(Box::new(Expr::Column(Column::new_unqualified(
+                    else_expr: Some(Box::new(Expr::Column(Column::new(
+                        Some(TableReference::bare(subquery_alias)),
                         name.clone(),
                     )))),
                 })
@@ -381,12 +385,14 @@ fn build_join(
                 Expr::Case(expr::Case {
                     expr: None,
                     when_then_expr: vec![(
-                        Box::new(Expr::IsNull(Box::new(Expr::Column(
-                            Column::new_unqualified(UN_MATCHED_ROW_INDICATOR),
-                        )))),
+                        Box::new(Expr::IsNull(Box::new(Expr::Column(Column::new(
+                            Some(TableReference::bare(subquery_alias)),
+                            UN_MATCHED_ROW_INDICATOR,
+                        ))))),
                         Box::new(result),
                     )],
-                    else_expr: Some(Box::new(Expr::Column(Column::new_unqualified(
+                    else_expr: Some(Box::new(Expr::Column(Column::new(
+                        Some(TableReference::bare(subquery_alias)),
                         name.clone(),
                     )))),
                 })

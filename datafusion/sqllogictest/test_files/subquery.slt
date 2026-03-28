@@ -388,7 +388,7 @@ query TT
 explain SELECT t1_id, t1_name, t1_int FROM t1 WHERE EXISTS(SELECT t1_int FROM t1 WHERE t1.t1_id > t1.t1_int)
 ----
 logical_plan
-01)LeftSemi Join: 
+01)LeftSemi Join:
 02)--TableScan: t1 projection=[t1_id, t1_name, t1_int]
 03)--SubqueryAlias: __correlated_sq_1
 04)----Projection:
@@ -607,7 +607,7 @@ query TT
 explain SELECT t1_id, t1_name FROM t1 WHERE EXISTS (SELECT NULL)
 ----
 logical_plan
-01)LeftSemi Join: 
+01)LeftSemi Join:
 02)--TableScan: t1 projection=[t1_id, t1_name]
 03)--SubqueryAlias: __correlated_sq_1
 04)----EmptyRelation: rows=1
@@ -690,7 +690,7 @@ explain SELECT t1_id, (SELECT t2_id FROM t2 limit 0) FROM t1
 ----
 logical_plan
 01)Projection: t1.t1_id, __scalar_sq_1.t2_id AS t2_id
-02)--Left Join: 
+02)--Left Join:
 03)----TableScan: t1 projection=[t1_id]
 04)----EmptyRelation: rows=0
 
@@ -735,7 +735,7 @@ explain select (select count(*) from t1) as b, (select count(1) from t2)
 ----
 logical_plan
 01)Projection: __scalar_sq_1.count(*) AS b, __scalar_sq_2.count(Int64(1)) AS count(Int64(1))
-02)--Left Join: 
+02)--Left Join:
 03)----SubqueryAlias: __scalar_sq_1
 04)------Projection: count(Int64(1)) AS count(*)
 05)--------Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]
@@ -752,7 +752,7 @@ explain select (select count(*) from t1) as b, (select count(1) from t2)
 ----
 logical_plan
 01)Projection: __scalar_sq_1.count(*) AS b, __scalar_sq_2.count(Int64(1)) AS count(Int64(1))
-02)--Left Join: 
+02)--Left Join:
 03)----SubqueryAlias: __scalar_sq_1
 04)------Projection: count(Int64(1)) AS count(*)
 05)--------Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]
@@ -1439,7 +1439,7 @@ query TT
 explain SELECT a FROM t1 WHERE EXISTS (SELECT count(*) FROM t2)
 ----
 logical_plan
-01)LeftSemi Join: 
+01)LeftSemi Join:
 02)--TableScan: t1 projection=[a]
 03)--SubqueryAlias: __correlated_sq_1
 04)----EmptyRelation: rows=1
@@ -1456,7 +1456,7 @@ statement count 0
 create table person(id int, last_name int, state int);
 
 query TT
-explain SELECT id FROM person p WHERE EXISTS 
+explain SELECT id FROM person p WHERE EXISTS
     (SELECT * FROM person WHERE last_name = p.last_name AND state = p.state)
 ----
 logical_plan
@@ -1581,6 +1581,53 @@ logical_plan
 11)----------------SubqueryAlias: __correlated_sq_1
 12)------------------Projection: lineitem.l_extendedprice AS price, lineitem.l_extendedprice, lineitem.l_orderkey
 13)--------------------TableScan: lineitem projection=[l_orderkey, l_extendedprice]
+
+# Multiple correlated scalar subqueries should not cause
+# "Ambiguous reference to unqualified field __always_true"
+
+statement ok
+CREATE TABLE activity (region TEXT, duration DOUBLE) AS VALUES
+('US', 10.0), ('EU', 20.0), ('US', 15.0), ('EU', 25.0), ('APAC', 30.0);
+
+# multiple_correlated_scalar_subqueries_count_and_max (issue reproduction for https://github.com/apache/datafusion/issues/20315)
+query TRIR rowsort
+SELECT
+    region,
+    SUM(duration) as total_duration,
+    (SELECT COUNT(*) FROM activity WHERE region = a.region) as count,
+    (SELECT MAX(duration) FROM activity WHERE region = a.region) as max_duration
+FROM activity a
+GROUP BY region
+----
+APAC 30 1 30
+EU 45 2 25
+US 25 2 15
+
+# multiple_correlated_scalar_subqueries_both_count (issue repro variant)
+query TRI rowsort
+SELECT
+    region,
+    SUM(duration) as total_duration,
+    (SELECT COUNT(*) FROM activity WHERE region = a.region) as count
+FROM activity a
+GROUP BY region
+----
+APAC 30 1
+EU 45 2
+US 25 2
+
+# multiple_correlated_scalar_subqueries_in_where
+query TR rowsort
+SELECT region, SUM(duration) as total_duration
+FROM activity a
+GROUP BY region
+HAVING (SELECT COUNT(*) FROM activity WHERE region = a.region) > 1
+   AND (SELECT MAX(duration) FROM activity WHERE region = a.region) > 20
+----
+EU 45
+
+statement ok
+DROP TABLE activity;
 
 # Setup tables for recursive correlation tests
 statement ok
