@@ -18,6 +18,8 @@
 //! Shared state for query planning and execution.
 
 pub mod context;
+/// Built-in support for DuckDB-compatible `CREATE MACRO` statements.
+pub mod macro_factory;
 pub mod session_state;
 pub use session_state::{SessionState, SessionStateBuilder};
 

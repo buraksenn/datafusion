@@ -63,9 +63,9 @@ use sqlparser::ast::{
 use sqlparser::ast::{
     Assignment, AssignmentTarget, ColumnDef, CreateIndex, CreateTable,
     CreateTableOptions, Delete, DescribeAlias, Expr as SQLExpr, FromTable, Ident, Insert,
-    ObjectName, ObjectType, Query, SchemaName, SetExpr, ShowCreateObject,
-    ShowStatementFilter, Statement, TableConstraint, TableFactor, TableWithJoins,
-    TransactionMode, UnaryOperator, Value,
+    MacroDefinition, ObjectName, ObjectType, Query, SchemaName, SetExpr,
+    ShowCreateObject, ShowStatementFilter, Statement, TableConstraint, TableFactor,
+    TableWithJoins, TransactionMode, UnaryOperator, Value,
 };
 use sqlparser::parser::ParserError::ParserError;
 
@@ -1509,6 +1509,97 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         schema: DFSchemaRef::new(DFSchema::empty()),
                     },
                 )))
+            }
+            Statement::CreateMacro {
+                or_replace,
+                temporary,
+                name,
+                args,
+                definition,
+            } => {
+                let name = match &name.0[..] {
+                    [] => exec_err!("Macro should have a name")?,
+                    [n] => n.as_ident().unwrap().value.clone(),
+                    [..] => not_impl_err!("Qualified macros are not supported")?,
+                };
+
+                let args = args
+                    .map(|macro_args| {
+                        macro_args
+                            .into_iter()
+                            .map(|arg| {
+                                let default_expr = match arg.default_expr {
+                                    Some(expr) => Some(self.sql_to_expr(
+                                        expr,
+                                        &DFSchema::empty(),
+                                        &mut PlannerContext::new(),
+                                    )?),
+                                    None => None,
+                                };
+                                Ok(OperateFunctionArg {
+                                    name: Some(arg.name),
+                                    data_type: arrow::datatypes::DataType::Null,
+                                    default_expr,
+                                })
+                            })
+                            .collect::<Result<Vec<OperateFunctionArg>>>()
+                    })
+                    .transpose()?;
+
+                let function_body = match definition {
+                    MacroDefinition::Expr(expr) => {
+                        let arg_fields: Fields = args
+                            .as_ref()
+                            .map(|a| {
+                                a.iter()
+                                    .map(|arg| {
+                                        let field_name = arg
+                                            .name
+                                            .as_ref()
+                                            .map(|n| n.value.clone())
+                                            .unwrap_or_default();
+                                        Field::new(
+                                            field_name,
+                                            arrow::datatypes::DataType::Null,
+                                            true,
+                                        )
+                                    })
+                                    .collect::<Fields>()
+                            })
+                            .unwrap_or_default();
+                        let macro_schema = DFSchema::from_unqualified_fields(
+                            arg_fields,
+                            HashMap::new(),
+                        )?;
+                        let mut planner_context = PlannerContext::new();
+                        Some(self.sql_to_expr(
+                            expr,
+                            &macro_schema,
+                            &mut planner_context,
+                        )?)
+                    }
+                    MacroDefinition::Table(_) => {
+                        return not_impl_err!("Table macros are not yet supported");
+                    }
+                };
+
+                let params = CreateFunctionBody {
+                    language: Some(Ident::new("macro")),
+                    behavior: None,
+                    function_body,
+                };
+
+                let statement = DdlStatement::CreateFunction(CreateFunction {
+                    or_replace,
+                    temporary,
+                    name,
+                    return_type: None,
+                    args,
+                    params,
+                    schema: DFSchemaRef::new(DFSchema::empty()),
+                });
+
+                Ok(LogicalPlan::Ddl(statement))
             }
             stmt => {
                 not_impl_err!("Unsupported SQL statement: {stmt}")

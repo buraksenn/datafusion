@@ -1434,10 +1434,21 @@ impl SessionContext {
 
             match function_factory {
                 Some(f) => f.create(&state, stmt).await?,
-                _ => {
-                    return Err(DataFusionError::Configuration(
-                        "Function factory has not been configured".to_string(),
-                    ));
+                None => {
+                    let is_macro = stmt
+                        .params
+                        .language
+                        .as_ref()
+                        .is_some_and(|l| l.value.eq_ignore_ascii_case("macro"));
+                    if is_macro {
+                        crate::execution::macro_factory::MacroFunctionFactory
+                            .create(&state, stmt)
+                            .await?
+                    } else {
+                        return Err(DataFusionError::Configuration(
+                            "Function factory has not been configured".to_string(),
+                        ));
+                    }
                 }
             }
         };
