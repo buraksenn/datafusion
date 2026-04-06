@@ -125,6 +125,7 @@ fn create_membership_predicate(
                 expr,
                 in_list_array,
                 false,
+                schema,
             )?)))
         }
         // Use hash table lookup for large build sides
