@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow::compute::kernels::cast_utils::IntervalUnit;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::types::logical_date;
 use datafusion_common::{
@@ -26,7 +27,14 @@ use datafusion_expr::{
     Coercion, ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl,
     Signature, TypeSignature, TypeSignatureClass, Volatility,
 };
+use std::str::FromStr;
 use std::sync::Arc;
+
+fn is_second_part(part: &str) -> bool {
+    IntervalUnit::from_str(&part.to_lowercase())
+        .map(|u| matches!(u, IntervalUnit::Second))
+        .unwrap_or(false)
+}
 
 /// Wrapper around datafusion date_part function to handle
 /// Spark behavior returning day of the week 1-indexed instead of 0-indexed and different part aliases.
@@ -125,10 +133,12 @@ impl ScalarUDFImpl for SparkDatePart {
         ));
 
         match part {
-            // Add 1 for day-of-week parts to convert 0-indexed to 1-indexed
             "dow" | "isodow" => Ok(ExprSimplifyResult::Simplified(
                 date_part_expr + Expr::Literal(ScalarValue::Int32(Some(1)), None),
             )),
+            p if is_second_part(p) => Ok(ExprSimplifyResult::Simplified(Expr::Cast(
+                datafusion_expr::Cast::new(Box::new(date_part_expr), DataType::Int32),
+            ))),
             _ => Ok(ExprSimplifyResult::Simplified(date_part_expr)),
         }
     }

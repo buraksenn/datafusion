@@ -175,7 +175,7 @@ impl ScalarUDFImpl for DatePartFunc {
                     .flatten()
                     .filter(|s| !s.is_empty())
                     .map(|part| {
-                        if is_epoch(part) {
+                        if is_epoch(part) || is_second(part) {
                             Field::new(self.name(), DataType::Float64, nullable)
                         } else if is_nanosecond(part) {
                             // See notes on [seconds_ns] for rationale
@@ -225,7 +225,7 @@ impl ScalarUDFImpl for DatePartFunc {
                 IntervalUnit::Day => date_part(array.as_ref(), DatePart::Day)?,
                 IntervalUnit::Hour => date_part(array.as_ref(), DatePart::Hour)?,
                 IntervalUnit::Minute => date_part(array.as_ref(), DatePart::Minute)?,
-                IntervalUnit::Second => seconds_as_i32(array.as_ref(), Second)?,
+                IntervalUnit::Second => seconds(array.as_ref(), Second)?,
                 IntervalUnit::Millisecond => seconds_as_i32(array.as_ref(), Millisecond)?,
                 IntervalUnit::Microsecond => seconds_as_i32(array.as_ref(), Microsecond)?,
                 IntervalUnit::Nanosecond => seconds_ns(array.as_ref())?,
@@ -329,6 +329,12 @@ impl ScalarUDFImpl for DatePartFunc {
 fn is_epoch(part: &str) -> bool {
     let part = part_normalization(part);
     matches!(part.to_lowercase().as_str(), "epoch")
+}
+
+fn is_second(part: &str) -> bool {
+    IntervalUnit::from_str(part_normalization(part))
+        .map(|p| matches!(p, IntervalUnit::Second))
+        .unwrap_or(false)
 }
 
 fn is_nanosecond(part: &str) -> bool {
