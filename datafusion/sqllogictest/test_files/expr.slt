@@ -443,6 +443,11 @@ statement error DataFusion error: Execution error: invalid Unicode scalar value:
 SELECT chr(CAST(55297 AS bigint))
 
 query T
+SELECT chr(65.0)
+----
+A
+
+query T
 SELECT concat('a','b','c')
 ----
 abc

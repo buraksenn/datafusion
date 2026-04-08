@@ -19,14 +19,15 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, GenericStringBuilder, Int64Array};
 use arrow::datatypes::DataType;
-use arrow::datatypes::DataType::Int64;
 use arrow::datatypes::DataType::Utf8;
 
 use datafusion_common::cast::as_int64_array;
+use datafusion_common::types::{NativeType, logical_int64};
 use datafusion_common::utils::take_function_args;
 use datafusion_common::{Result, ScalarValue, exec_err, internal_err};
 use datafusion_expr::{ColumnarValue, Documentation, Volatility};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, Signature};
+use datafusion_expr_common::signature::{Coercion, TypeSignatureClass};
 use datafusion_macros::user_doc;
 
 /// Returns the character with the given code.
@@ -88,7 +89,14 @@ impl Default for ChrFunc {
 impl ChrFunc {
     pub fn new() -> Self {
         Self {
-            signature: Signature::uniform(1, vec![Int64], Volatility::Immutable),
+            signature: Signature::coercible(
+                vec![Coercion::new_implicit(
+                    TypeSignatureClass::Native(logical_int64()),
+                    vec![TypeSignatureClass::Numeric],
+                    NativeType::Int64,
+                )],
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -145,6 +153,7 @@ mod tests {
     use super::*;
 
     use arrow::array::{Array, StringArray};
+    use arrow::datatypes::DataType::Int64;
     use arrow::datatypes::Field;
     use datafusion_common::assert_contains;
     use datafusion_common::config::ConfigOptions;
