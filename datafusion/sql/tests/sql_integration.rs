@@ -51,7 +51,9 @@ use datafusion_functions_nested::make_array::make_array_udf;
 use datafusion_functions_window::{rank::rank_udwf, row_number::row_number_udwf};
 use insta::{allow_duplicates, assert_snapshot};
 use rstest::rstest;
-use sqlparser::dialect::{Dialect, GenericDialect, HiveDialect, MySqlDialect};
+use sqlparser::dialect::{
+    BigQueryDialect, Dialect, GenericDialect, HiveDialect, MySqlDialect,
+};
 
 mod cases;
 mod common;
@@ -5133,5 +5135,17 @@ Sort: customer.c_custkey ASC NULLS LAST
               TableScan: orders
       TableScan: customer
 "#
+    );
+}
+
+#[test]
+fn test_execute_immediate_returns_error() {
+    let sql = "EXECUTE IMMEDIATE 'SELECT 1'";
+    let dialect = &BigQueryDialect;
+    let result = logical_plan_with_dialect(sql, dialect);
+    assert!(result.is_err());
+    assert_contains!(
+        result.unwrap_err().strip_backtrace(),
+        "Execute statement with IMMEDIATE is not supported"
     );
 }
