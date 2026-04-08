@@ -217,16 +217,17 @@ pub fn create_physical_expr(
             escape_char,
             case_insensitive,
         }) => {
-            // `\` is the implicit escape, see https://github.com/apache/datafusion/issues/13291
-            if escape_char.unwrap_or('\\') != '\\' {
-                return exec_err!(
-                    "LIKE does not support escape_char other than the backslash (\\)"
-                );
-            }
             let physical_expr =
                 create_physical_expr(expr, input_dfschema, execution_props)?;
-            let physical_pattern =
-                create_physical_expr(pattern, input_dfschema, execution_props)?;
+
+            let esc = escape_char.unwrap_or('\\');
+            let physical_pattern = if esc != '\\' {
+                let transformed = transform_like_pattern_escape(pattern, esc)?;
+                create_physical_expr(&transformed, input_dfschema, execution_props)?
+            } else {
+                create_physical_expr(pattern, input_dfschema, execution_props)?
+            };
+
             like(
                 *negated,
                 *case_insensitive,
@@ -418,6 +419,83 @@ pub fn create_physical_expr(
     }
 }
 
+/// Transforms a LIKE pattern that uses a custom escape character into one
+/// that uses the standard backslash escape, so Arrow's like kernel can
+/// process it.
+///
+/// The algorithm walks the pattern character by character:
+/// 1. Literal `\` in the original pattern becomes `\\` (escaped for Arrow).
+/// 2. `{esc}{esc}` becomes the literal escape character itself.
+/// 3. `{esc}%` becomes `\%` and `{esc}_` becomes `\_`.
+/// 4. A lone `{esc}` at the end of the pattern is an error.
+/// 5. Every other character passes through unchanged.
+fn transform_like_escape(pattern: &str, esc: char) -> Result<String> {
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == esc {
+            match chars.next() {
+                Some(next) if next == esc => {
+                    if esc == '\\' {
+                        result.push_str("\\\\");
+                    } else {
+                        result.push('\\');
+                        result.push(esc);
+                    }
+                }
+                Some('%') => result.push_str("\\%"),
+                Some('_') => result.push_str("\\_"),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => {
+                    return exec_err!(
+                        "LIKE pattern must not end with escape character '{esc}'"
+                    );
+                }
+            }
+        } else if ch == '\\' {
+            result.push_str("\\\\");
+        } else {
+            result.push(ch);
+        }
+    }
+    Ok(result)
+}
+
+fn transform_like_pattern_escape(pattern: &Expr, esc: char) -> Result<Expr> {
+    match pattern {
+        Expr::Literal(ScalarValue::Utf8(Some(s)), metadata) => {
+            let transformed = transform_like_escape(s, esc)?;
+            Ok(Expr::Literal(
+                ScalarValue::Utf8(Some(transformed)),
+                metadata.clone(),
+            ))
+        }
+        Expr::Literal(ScalarValue::LargeUtf8(Some(s)), metadata) => {
+            let transformed = transform_like_escape(s, esc)?;
+            Ok(Expr::Literal(
+                ScalarValue::LargeUtf8(Some(transformed)),
+                metadata.clone(),
+            ))
+        }
+        Expr::Literal(ScalarValue::Utf8View(Some(s)), metadata) => {
+            let transformed = transform_like_escape(s, esc)?;
+            Ok(Expr::Literal(
+                ScalarValue::Utf8View(Some(transformed)),
+                metadata.clone(),
+            ))
+        }
+        _ => {
+            exec_err!(
+                "LIKE with a custom ESCAPE character requires a literal pattern, \
+                 but found a non-literal expression"
+            )
+        }
+    }
+}
+
 /// Create vector of Physical Expression from a vector of logical expression
 pub fn create_physical_exprs<'a, I>(
     exprs: I,
@@ -538,5 +616,37 @@ mod tests {
             create_physical_expr(&expr, &df_schema, &ExecutionProps::new())?;
 
         Ok(())
+    }
+
+    #[test]
+    fn test_transform_like_escape_basic() {
+        assert_eq!(transform_like_escape("a$%b", '$').unwrap(), "a\\%b");
+        assert_eq!(transform_like_escape("a$_b", '$').unwrap(), "a\\_b");
+        assert_eq!(transform_like_escape("a$$b", '$').unwrap(), "a\\$b");
+    }
+
+    #[test]
+    fn test_transform_like_escape_preserves_wildcards() {
+        assert_eq!(transform_like_escape("a%b", '$').unwrap(), "a%b");
+        assert_eq!(transform_like_escape("a_b", '$').unwrap(), "a_b");
+    }
+
+    #[test]
+    fn test_transform_like_escape_backslash_in_pattern() {
+        assert_eq!(transform_like_escape("a\\b", '$').unwrap(), "a\\\\b");
+    }
+
+    #[test]
+    fn test_transform_like_escape_trailing_escape_error() {
+        let result = transform_like_escape("abc$", '$');
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transform_like_escape_complex() {
+        assert_eq!(
+            transform_like_escape("$%foo$_bar$$\\", '$').unwrap(),
+            "\\%foo\\_bar\\$\\\\"
+        );
     }
 }
