@@ -115,10 +115,9 @@ impl ScalarUDFImpl for ConcatWsFunc {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let ScalarFunctionArgs { args, .. } = args;
 
-        if args.len() < 2 {
+        if args.is_empty() {
             return exec_err!(
-                "concat_ws was called with {} arguments. It requires at least 2.",
-                args.len()
+                "concat_ws was called with 0 arguments. It requires at least 1."
             );
         }
 
@@ -193,7 +192,7 @@ impl ScalarUDFImpl for ConcatWsFunc {
         let sep = match &args[0] {
             ColumnarValue::Scalar(scalar) => match scalar.try_as_str() {
                 Some(Some(s)) => {
-                    data_size += s.len() * len * (args.len() - 2); // estimate
+                    data_size += s.len() * len * args.len().saturating_sub(2); // estimate
                     ColumnarValueRef::Scalar(s.as_bytes())
                 }
                 Some(None) => {
@@ -214,7 +213,8 @@ impl ScalarUDFImpl for ConcatWsFunc {
             ColumnarValue::Array(array) => match array.data_type() {
                 DataType::Utf8 => {
                     let string_array = as_string_array(array)?;
-                    data_size += string_array.values().len() * (args.len() - 2);
+                    data_size +=
+                        string_array.values().len() * args.len().saturating_sub(2);
                     if array.is_nullable() {
                         ColumnarValueRef::NullableArray(string_array)
                     } else {
@@ -223,7 +223,8 @@ impl ScalarUDFImpl for ConcatWsFunc {
                 }
                 DataType::LargeUtf8 => {
                     let string_array = as_large_string_array(array)?;
-                    data_size += string_array.values().len() * (args.len() - 2);
+                    data_size +=
+                        string_array.values().len() * args.len().saturating_sub(2);
                     if array.is_nullable() {
                         ColumnarValueRef::NullableLargeStringArray(string_array)
                     } else {
@@ -232,8 +233,8 @@ impl ScalarUDFImpl for ConcatWsFunc {
                 }
                 DataType::Utf8View => {
                     let string_array = as_string_view_array(array)?;
-                    data_size +=
-                        string_array.total_buffer_bytes_used() * (args.len() - 2);
+                    data_size += string_array.total_buffer_bytes_used()
+                        * args.len().saturating_sub(2);
                     if array.is_nullable() {
                         ColumnarValueRef::NullableStringViewArray(string_array)
                     } else {
@@ -589,6 +590,14 @@ mod tests {
                 ColumnarValue::Scalar(ScalarValue::from("cc")),
             ],
             Ok(Some("aa|cc")),
+            &str,
+            Utf8,
+            StringArray
+        );
+        test_function!(
+            ConcatWsFunc::new(),
+            vec![ColumnarValue::Scalar(ScalarValue::from("s")),],
+            Ok(Some("")),
             &str,
             Utf8,
             StringArray

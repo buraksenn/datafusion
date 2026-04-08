@@ -487,6 +487,12 @@ SELECT concat_ws('|','a',NULL,NULL)
 ----
 a
 
+# concat_ws with only separator and no values returns empty string (PostgreSQL compatibility)
+query T
+SELECT concat_ws('s')
+----
+(empty)
+
 statement ok
 create table foo (a varchar, b varchar) as values ('a', 'b');
 
