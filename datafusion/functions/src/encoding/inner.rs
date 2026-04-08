@@ -67,7 +67,7 @@ const BASE64_ENGINE_PADDED: GeneralPurpose = GeneralPurpose::new(
     ),
     argument(
         name = "format",
-        description = "Supported formats are: `base64`, `base64pad`, `hex`"
+        description = "Supported formats are: `base64`, `base64pad`, `hex`, `utf-8`"
     ),
     related_udf(name = "decode")
 )]
@@ -214,14 +214,16 @@ fn encode_scalar(value: &ScalarValue, encoding: Encoding) -> Result<ColumnarValu
             Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
                 maybe_bytes
                     .as_ref()
-                    .map(|bytes| encoding.encode_bytes(bytes)),
+                    .map(|bytes| encoding.encode_bytes(bytes))
+                    .transpose()?,
             )))
         }
         ScalarValue::LargeBinary(maybe_bytes) => {
             Ok(ColumnarValue::Scalar(ScalarValue::LargeUtf8(
                 maybe_bytes
                     .as_ref()
-                    .map(|bytes| encoding.encode_bytes(bytes)),
+                    .map(|bytes| encoding.encode_bytes(bytes))
+                    .transpose()?,
             )))
         }
         v => internal_err!("Unexpected value for encode: {v}"),
@@ -318,6 +320,7 @@ enum Encoding {
     Base64,
     Base64Padded,
     Hex,
+    Utf8,
 }
 
 impl fmt::Display for Encoding {
@@ -326,6 +329,7 @@ impl fmt::Display for Encoding {
             Self::Base64 => "base64",
             Self::Base64Padded => "base64pad",
             Self::Hex => "hex",
+            Self::Utf8 => "utf-8",
         };
         write!(f, "{name}")
     }
@@ -350,8 +354,9 @@ impl TryFrom<&ColumnarValue> for Encoding {
             "base64" => Ok(Self::Base64),
             "base64pad" => Ok(Self::Base64Padded),
             "hex" => Ok(Self::Hex),
+            "utf-8" | "utf8" => Ok(Self::Utf8),
             _ => {
-                let options = [Self::Base64, Self::Base64Padded, Self::Hex]
+                let options = [Self::Base64, Self::Base64Padded, Self::Hex, Self::Utf8]
                     .iter()
                     .map(|i| i.to_string())
                     .collect::<Vec<_>>()
@@ -365,11 +370,18 @@ impl TryFrom<&ColumnarValue> for Encoding {
 }
 
 impl Encoding {
-    fn encode_bytes(self, value: &[u8]) -> String {
+    fn encode_bytes(self, value: &[u8]) -> Result<String> {
         match self {
-            Self::Base64 => BASE64_ENGINE.encode(value),
-            Self::Base64Padded => BASE64_ENGINE_PADDED.encode(value),
-            Self::Hex => hex::encode(value),
+            Self::Base64 => Ok(BASE64_ENGINE.encode(value)),
+            Self::Base64Padded => Ok(BASE64_ENGINE_PADDED.encode(value)),
+            Self::Hex => Ok(hex::encode(value)),
+            Self::Utf8 => {
+                std::str::from_utf8(value)
+                    .map(|s| s.to_string())
+                    .map_err(|e| {
+                        exec_datafusion_err!("Failed to encode value using utf-8: {e}")
+                    })
+            }
         }
     }
 
@@ -383,6 +395,7 @@ impl Encoding {
             Self::Hex => hex::decode(value).map_err(|e| {
                 exec_datafusion_err!("Failed to decode value using hex: {e}")
             }),
+            Self::Utf8 => Ok(value.to_vec()),
         }
     }
 
@@ -415,6 +428,24 @@ impl Encoding {
                     array.iter().map(|x| x.map(hex::encode)).collect();
                 Ok(Arc::new(array))
             }
+            Self::Utf8 => {
+                let results: Result<Vec<_>> = array
+                    .iter()
+                    .map(|x| match x {
+                        Some(bytes) => std::str::from_utf8(bytes)
+                            .map(|s| Some(s.to_string()))
+                            .map_err(|e| {
+                                exec_datafusion_err!(
+                                    "Failed to encode value using utf-8: {e}"
+                                )
+                            }),
+                        None => Ok(None),
+                    })
+                    .collect();
+                let array: GenericStringArray<OutputOffset> =
+                    results?.into_iter().collect();
+                Ok(Arc::new(array))
+            }
         }
     }
 
@@ -443,18 +474,27 @@ impl Encoding {
                 .map_err(|e| exec_datafusion_err!("Failed to decode from base64: {e}"))
         }
 
+        fn utf8_decode(input: &[u8], buf: &mut [u8]) -> Result<usize> {
+            let len = input.len();
+            buf[..len].copy_from_slice(input);
+            Ok(len)
+        }
+
         match self {
             Self::Base64 | Self::Base64Padded => {
                 let upper_bound = base64::decoded_len_estimate(approx_data_size);
                 delegated_decode::<_, _, OutputOffset>(base64_decode, value, upper_bound)
             }
             Self::Hex => {
-                // Calculate the upper bound for decoded byte size
                 // For hex encoding, each pair of hex characters (2 bytes) represents 1 byte when decoded
-                // So the upper bound is half the length of the input values.
                 let upper_bound = approx_data_size / 2;
                 delegated_decode::<_, _, OutputOffset>(hex_decode, value, upper_bound)
             }
+            Self::Utf8 => delegated_decode::<_, _, OutputOffset>(
+                utf8_decode,
+                value,
+                approx_data_size,
+            ),
         }
     }
 }
