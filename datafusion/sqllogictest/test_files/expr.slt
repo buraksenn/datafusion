@@ -866,6 +866,22 @@ SELECT to_hex(CAST(255 AS TINYINT UNSIGNED))
 ----
 ff
 
+# to_hex with string input
+query T
+SELECT to_hex('Spark SQL')
+----
+537061726b2053514c
+
+query T
+SELECT to_hex('')
+----
+(empty)
+
+query T
+SELECT to_hex(CAST(NULL AS VARCHAR))
+----
+NULL
+
 query T
 SELECT trim(' tom ')
 ----

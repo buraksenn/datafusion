@@ -129,7 +129,7 @@ pub mod expr_fn {
         arg1 arg2
     ),(
         to_hex,
-        "Converts an integer to a hexadecimal string.",
+        "Converts an integer or string to a hexadecimal string.",
         arg1
     ),(
         upper,

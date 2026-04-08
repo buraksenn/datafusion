@@ -2045,15 +2045,15 @@ _Alias of [substr_index](#substr_index)._
 
 ### `to_hex`
 
-Converts an integer to a hexadecimal string.
+Converts an integer to a hexadecimal string, or converts a string to the hex representation of its UTF-8 bytes.
 
 ```sql
-to_hex(int)
+to_hex(value)
 ```
 
 #### Arguments
 
-- **int**: Integer expression to operate on. Can be a constant, column, or function, and any combination of operators.
+- **value**: Integer or string expression to convert to hexadecimal.
 
 #### Example
 
@@ -2064,6 +2064,13 @@ to_hex(int)
 +-------------------------+
 | bc6159                  |
 +-------------------------+
+
+> select to_hex('Spark SQL');
++----------------------------+
+| to_hex(Utf8("Spark SQL")) |
++----------------------------+
+| 537061726b2053514c         |
++----------------------------+
 ```
 
 ### `translate`

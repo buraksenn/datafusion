@@ -17,17 +17,18 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::array::{Array, ArrayRef, AsArray, StringArray};
 use arrow::buffer::{Buffer, OffsetBuffer};
 use arrow::datatypes::{
     ArrowNativeType, ArrowPrimitiveType, DataType, Int8Type, Int16Type, Int32Type,
     Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use datafusion_common::cast::as_primitive_array;
+use datafusion_common::types::logical_string;
 use datafusion_common::{Result, ScalarValue, exec_err, internal_err};
 use datafusion_expr::{
     Coercion, ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
-    TypeSignatureClass, Volatility,
+    TypeSignature, TypeSignatureClass, Volatility,
 };
 use datafusion_macros::user_doc;
 
@@ -82,6 +83,48 @@ fn to_hex_scalar<T: ToHex>(value: T) -> String {
     let hex_len = value.write_hex_to_buffer(&mut hex_buffer);
     // SAFETY: hex_buffer is ASCII hex digits
     unsafe { std::str::from_utf8_unchecked(&hex_buffer[16 - hex_len..]).to_string() }
+}
+
+fn bytes_to_hex_string(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        hex.push(HEX_CHARS[(b >> 4) as usize] as char);
+        hex.push(HEX_CHARS[(b & 0x0f) as usize] as char);
+    }
+    hex
+}
+
+fn string_array_to_hex(array: &dyn Array) -> Result<ArrayRef> {
+    let len = array.len();
+    let mut offsets: Vec<i32> = Vec::with_capacity(len + 1);
+    let mut values: Vec<u8> = Vec::with_capacity(len * 8);
+    offsets.push(0);
+
+    for i in 0..len {
+        if !array.is_null(i) {
+            let s: &str = match array.data_type() {
+                DataType::Utf8 => array.as_string::<i32>().value(i),
+                DataType::LargeUtf8 => array.as_string::<i64>().value(i),
+                DataType::Utf8View => array.as_string_view().value(i),
+                other => {
+                    return exec_err!(
+                        "Unsupported data type {other:?} for function to_hex"
+                    );
+                }
+            };
+            for &b in s.as_bytes() {
+                values.push(HEX_CHARS[(b >> 4) as usize]);
+                values.push(HEX_CHARS[(b & 0x0f) as usize]);
+            }
+        }
+        offsets.push(values.len() as i32);
+    }
+
+    let nulls = array.nulls().cloned();
+    let offsets =
+        unsafe { OffsetBuffer::new_unchecked(Buffer::from_vec(offsets).into()) };
+    let result = StringArray::new(offsets, Buffer::from_vec(values), nulls);
+    Ok(Arc::new(result) as ArrayRef)
 }
 
 /// Trait for converting integer types to hexadecimal in a buffer
@@ -177,8 +220,8 @@ impl ToHex for u64 {
 
 #[user_doc(
     doc_section(label = "String Functions"),
-    description = "Converts an integer to a hexadecimal string.",
-    syntax_example = "to_hex(int)",
+    description = "Converts an integer to a hexadecimal string, or converts a string to the hex representation of its UTF-8 bytes.",
+    syntax_example = "to_hex(value)",
     sql_example = r#"```sql
 > select to_hex(12345689);
 +-------------------------+
@@ -186,8 +229,18 @@ impl ToHex for u64 {
 +-------------------------+
 | bc6159                  |
 +-------------------------+
+
+> select to_hex('Spark SQL');
++----------------------------+
+| to_hex(Utf8("Spark SQL")) |
++----------------------------+
+| 537061726b2053514c         |
++----------------------------+
 ```"#,
-    standard_argument(name = "int", prefix = "Integer")
+    argument(
+        name = "value",
+        description = "Integer or string expression to convert to hexadecimal."
+    )
 )]
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ToHexFunc {
@@ -203,8 +256,15 @@ impl Default for ToHexFunc {
 impl ToHexFunc {
     pub fn new() -> Self {
         Self {
-            signature: Signature::coercible(
-                vec![Coercion::new_exact(TypeSignatureClass::Integer)],
+            signature: Signature::one_of(
+                vec![
+                    TypeSignature::Coercible(vec![Coercion::new_exact(
+                        TypeSignatureClass::Integer,
+                    )]),
+                    TypeSignature::Coercible(vec![Coercion::new_exact(
+                        TypeSignatureClass::Native(logical_string()),
+                    )]),
+                ],
                 Volatility::Immutable,
             ),
         }
@@ -253,7 +313,14 @@ impl ScalarUDFImpl for ToHexFunc {
                 ColumnarValue::Scalar(ScalarValue::Utf8(Some(to_hex_scalar(*v)))),
             ),
 
-            // NULL scalars
+            ColumnarValue::Scalar(
+                ScalarValue::Utf8(Some(s))
+                | ScalarValue::LargeUtf8(Some(s))
+                | ScalarValue::Utf8View(Some(s)),
+            ) => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                bytes_to_hex_string(s.as_bytes()),
+            )))),
+
             ColumnarValue::Scalar(s) if s.is_null() => {
                 Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)))
             }
@@ -282,6 +349,9 @@ impl ScalarUDFImpl for ToHexFunc {
                 }
                 DataType::UInt8 => {
                     Ok(ColumnarValue::Array(to_hex_array::<UInt8Type>(array)?))
+                }
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                    Ok(ColumnarValue::Array(string_array_to_hex(array)?))
                 }
                 other => exec_err!("Unsupported data type {other:?} for function to_hex"),
             },
@@ -388,4 +458,28 @@ mod tests {
         vec![Some(u64::MAX), Some(u64::MIN)],
         vec![Some("ffffffffffffffff"), Some("0")]
     );
+
+    #[test]
+    fn to_hex_string_array() -> Result<()> {
+        let input =
+            StringArray::from(vec![Some("Spark SQL"), Some(""), None, Some("abc")]);
+        let array_ref: ArrayRef = Arc::new(input);
+        let result = string_array_to_hex(&*array_ref)?;
+        let result_array = as_string_array(&result)?;
+        let expected = StringArray::from(vec![
+            Some("537061726b2053514c"),
+            Some(""),
+            None,
+            Some("616263"),
+        ]);
+        assert_eq!(&expected, result_array);
+        Ok(())
+    }
+
+    #[test]
+    fn to_hex_bytes_to_hex_string() {
+        assert_eq!(bytes_to_hex_string(b"Spark SQL"), "537061726b2053514c");
+        assert_eq!(bytes_to_hex_string(b""), "");
+        assert_eq!(bytes_to_hex_string(b"abc"), "616263");
+    }
 }
