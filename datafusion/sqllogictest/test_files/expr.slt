@@ -970,6 +970,22 @@ SELECT trim('tom ')
 ----
 tom
 
+# TRIM with direction keyword but no trim characters (defaults to space)
+query T
+SELECT trim(BOTH FROM '    SparkSQL   ')
+----
+SparkSQL
+
+query T
+SELECT trim(LEADING FROM '    SparkSQL   ')
+----
+SparkSQL   
+
+query T
+SELECT trim(TRAILING FROM '    SparkSQL   ')
+----
+    SparkSQL
+
 query T
 SELECT upper('')
 ----

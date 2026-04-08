@@ -422,12 +422,13 @@ impl<'a, 'b> DFParserBuilder<'a, 'b> {
             ParserInput::Tokens(tokens) => tokens,
             ParserInput::Sql(sql) => {
                 let mut tokenizer = Tokenizer::new(self.dialect, sql);
-                // Convert TokenizerError -> ParserError
                 tokenizer
                     .tokenize_with_location()
                     .map_err(ParserError::from)?
             }
         };
+
+        let tokens = rewrite_trim_direction_only(tokens);
 
         Ok(DFParser {
             parser: Parser::new(self.dialect)
@@ -439,6 +440,101 @@ impl<'a, 'b> DFParserBuilder<'a, 'b> {
             },
         })
     }
+}
+
+/// Workaround for sqlparser not supporting `TRIM(BOTH FROM expr)` syntax
+/// (i.e. TRIM with a direction keyword but no trim characters).
+///
+/// The SQL standard allows `TRIM(BOTH FROM expr)` to mean "trim spaces from
+/// both sides". sqlparser 0.61 fails to parse this because after consuming
+/// the direction keyword (BOTH/LEADING/TRAILING), it expects an expression
+/// before FROM. This function rewrites the token stream to insert a space
+/// literal `' '` between the direction keyword and FROM, turning
+/// `TRIM(BOTH FROM expr)` into `TRIM(BOTH ' ' FROM expr)` which sqlparser
+/// handles correctly.
+fn rewrite_trim_direction_only(mut tokens: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
+    fn is_whitespace(t: &TokenWithSpan) -> bool {
+        matches!(t.token, Token::Whitespace(_))
+    }
+
+    fn next_non_ws(
+        tokens: &[TokenWithSpan],
+        start: usize,
+    ) -> Option<(usize, &TokenWithSpan)> {
+        tokens[start..]
+            .iter()
+            .enumerate()
+            .find(|(_, t)| !is_whitespace(t))
+            .map(|(offset, t)| (start + offset, t))
+    }
+
+    let mut insertions: Vec<(usize, TokenWithSpan)> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let is_trim = matches!(
+            tokens[i].token,
+            Token::Word(Word {
+                keyword: Keyword::TRIM,
+                ..
+            })
+        );
+        if !is_trim {
+            i += 1;
+            continue;
+        }
+        i += 1;
+
+        let Some((lparen_idx, lparen_tok)) = next_non_ws(&tokens, i) else {
+            continue;
+        };
+        if lparen_tok.token != Token::LParen {
+            continue;
+        }
+        i = lparen_idx + 1;
+
+        let Some((dir_idx, dir_tok)) = next_non_ws(&tokens, i) else {
+            continue;
+        };
+        let is_direction = matches!(
+            dir_tok.token,
+            Token::Word(Word {
+                keyword: Keyword::BOTH | Keyword::LEADING | Keyword::TRAILING,
+                ..
+            })
+        );
+        if !is_direction {
+            continue;
+        }
+        i = dir_idx + 1;
+
+        let Some((_from_idx, from_tok)) = next_non_ws(&tokens, i) else {
+            continue;
+        };
+        let is_from = matches!(
+            from_tok.token,
+            Token::Word(Word {
+                keyword: Keyword::FROM,
+                ..
+            })
+        );
+        if !is_from {
+            continue;
+        }
+
+        insertions.push((
+            dir_idx + 1,
+            TokenWithSpan {
+                token: Token::SingleQuotedString(" ".to_string()),
+                span: from_tok.span,
+            },
+        ));
+    }
+
+    for (offset, (pos, token)) in insertions.into_iter().enumerate() {
+        tokens.insert(pos + offset, token);
+    }
+
+    tokens
 }
 
 impl<'a> DFParser<'a> {
