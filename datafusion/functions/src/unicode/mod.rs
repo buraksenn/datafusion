@@ -26,6 +26,7 @@ pub mod common;
 pub mod find_in_set;
 pub mod initcap;
 pub mod left;
+pub mod locate;
 pub mod lpad;
 pub mod planner;
 pub mod reverse;
@@ -41,6 +42,7 @@ make_udf_function!(character_length::CharacterLengthFunc, character_length);
 make_udf_function!(find_in_set::FindInSetFunc, find_in_set);
 make_udf_function!(initcap::InitcapFunc, initcap);
 make_udf_function!(left::LeftFunc, left);
+make_udf_function!(locate::LocateFunc, locate);
 make_udf_function!(lpad::LPadFunc, lpad);
 make_udf_function!(right::RightFunc, right);
 make_udf_function!(reverse::ReverseFunc, reverse);
@@ -58,6 +60,10 @@ pub mod expr_fn {
         character_length,
         "the number of characters in the `string`",
         string
+    ),(
+        locate,
+        "returns the position of the first occurrence of `substr` in `str` starting from optional `pos`",
+        args,
     ),(
         lpad,
         "fill up a string to the length by prepending the characters",
@@ -136,6 +142,7 @@ pub fn functions() -> Vec<Arc<ScalarUDF>> {
         find_in_set(),
         initcap(),
         left(),
+        locate(),
         lpad(),
         reverse(),
         right(),

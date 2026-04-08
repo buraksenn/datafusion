@@ -650,6 +650,48 @@ SELECT strpos(arrow_cast('helloworld', 'Dictionary(Int32, Utf8)'), NULL)
 ----
 NULL
 
+# locate: reversed argument order from strpos, with optional start position
+
+query I
+SELECT locate('bar', 'foobarbar');
+----
+4
+
+query I
+SELECT locate('bar', 'foobarbar', 5);
+----
+7
+
+query I
+SELECT locate('xyz', 'foobarbar');
+----
+0
+
+query I
+SELECT locate('bar', 'foobarbar', 100);
+----
+0
+
+query I
+SELECT locate('', 'foobarbar');
+----
+1
+
+query I
+SELECT locate('bar', '');
+----
+0
+
+query I
+SELECT locate('bar', NULL);
+----
+NULL
+
+query I
+SELECT locate(NULL, 'foobarbar');
+----
+NULL
+
 statement ok
 CREATE TABLE products (
 product_id INT PRIMARY KEY,
