@@ -994,6 +994,7 @@ message PhysicalLikeExprNode {
   bool case_insensitive = 2;
   PhysicalExprNode expr = 3;
   PhysicalExprNode pattern = 4;
+  string escape_char = 5;
 }
 
 message PhysicalSortExprNode {

@@ -1508,6 +1508,9 @@ fn build_predicate_expression(
             if like_expr.case_insensitive() {
                 return unhandled_hook.handle(expr);
             }
+            if like_expr.escape_char().is_some_and(|c| c != '\\') {
+                return unhandled_hook.handle(expr);
+            }
             let op = match (like_expr.negated(), like_expr.case_insensitive()) {
                 (false, false) => Operator::LikeMatch,
                 (true, false) => Operator::NotLikeMatch,
@@ -1826,6 +1829,7 @@ fn build_not_like_match(
         false,
         Arc::clone(&min_column_expr),
         Arc::clone(scalar_expr),
+        None,
     ));
 
     let max_col_not_like_expr = Arc::new(phys_expr::LikeExpr::new(
@@ -1833,6 +1837,7 @@ fn build_not_like_match(
         false,
         Arc::clone(&max_column_expr),
         Arc::clone(scalar_expr),
+        None,
     ));
 
     Ok(Arc::new(phys_expr::BinaryExpr::new(

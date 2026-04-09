@@ -456,26 +456,34 @@ pub fn parse_physical_expr_with_converter(
                 .with_nullable(e.nullable),
             )
         }
-        ExprType::LikeExpr(like_expr) => Arc::new(LikeExpr::new(
-            like_expr.negated,
-            like_expr.case_insensitive,
-            parse_required_physical_expr(
-                like_expr.expr.as_deref(),
-                ctx,
-                "expr",
-                input_schema,
-                codec,
-                proto_converter,
-            )?,
-            parse_required_physical_expr(
-                like_expr.pattern.as_deref(),
-                ctx,
-                "pattern",
-                input_schema,
-                codec,
-                proto_converter,
-            )?,
-        )),
+        ExprType::LikeExpr(like_expr) => {
+            let escape_char = if like_expr.escape_char.is_empty() {
+                None
+            } else {
+                like_expr.escape_char.chars().next()
+            };
+            Arc::new(LikeExpr::new(
+                like_expr.negated,
+                like_expr.case_insensitive,
+                parse_required_physical_expr(
+                    like_expr.expr.as_deref(),
+                    ctx,
+                    "expr",
+                    input_schema,
+                    codec,
+                    proto_converter,
+                )?,
+                parse_required_physical_expr(
+                    like_expr.pattern.as_deref(),
+                    ctx,
+                    "pattern",
+                    input_schema,
+                    codec,
+                    proto_converter,
+                )?,
+                escape_char,
+            ))
+        }
         ExprType::HashExpr(hash_expr) => {
             let on_columns = parse_physical_exprs(
                 &hash_expr.on_columns,

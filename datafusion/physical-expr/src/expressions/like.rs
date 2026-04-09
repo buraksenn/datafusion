@@ -16,9 +16,10 @@
 // under the License.
 
 use crate::PhysicalExpr;
+use arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{Result, assert_or_internal_err};
+use datafusion_common::{Result, ScalarValue, assert_or_internal_err, exec_err};
 use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr_common::datum::apply_cmp;
 use std::hash::Hash;
@@ -31,6 +32,7 @@ pub struct LikeExpr {
     case_insensitive: bool,
     expr: Arc<dyn PhysicalExpr>,
     pattern: Arc<dyn PhysicalExpr>,
+    escape_char: Option<char>,
 }
 
 // Manually derive PartialEq and Hash to work around https://github.com/rust-lang/rust/issues/78808
@@ -40,6 +42,7 @@ impl PartialEq for LikeExpr {
             && self.case_insensitive == other.case_insensitive
             && self.expr.eq(&other.expr)
             && self.pattern.eq(&other.pattern)
+            && self.escape_char == other.escape_char
     }
 }
 
@@ -49,6 +52,7 @@ impl Hash for LikeExpr {
         self.case_insensitive.hash(state);
         self.expr.hash(state);
         self.pattern.hash(state);
+        self.escape_char.hash(state);
     }
 }
 
@@ -58,36 +62,37 @@ impl LikeExpr {
         case_insensitive: bool,
         expr: Arc<dyn PhysicalExpr>,
         pattern: Arc<dyn PhysicalExpr>,
+        escape_char: Option<char>,
     ) -> Self {
         Self {
             negated,
             case_insensitive,
             expr,
             pattern,
+            escape_char,
         }
     }
 
-    /// Is negated
     pub fn negated(&self) -> bool {
         self.negated
     }
 
-    /// Is case insensitive
     pub fn case_insensitive(&self) -> bool {
         self.case_insensitive
     }
 
-    /// Input expression
     pub fn expr(&self) -> &Arc<dyn PhysicalExpr> {
         &self.expr
     }
 
-    /// Pattern expression
     pub fn pattern(&self) -> &Arc<dyn PhysicalExpr> {
         &self.pattern
     }
 
-    /// Operator name
+    pub fn escape_char(&self) -> Option<char> {
+        self.escape_char
+    }
+
     fn op_name(&self) -> &str {
         match (self.negated, self.case_insensitive) {
             (false, false) => "LIKE",
@@ -100,7 +105,11 @@ impl LikeExpr {
 
 impl std::fmt::Display for LikeExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{} {} {}", self.expr, self.op_name(), self.pattern)
+        write!(f, "{} {} {}", self.expr, self.op_name(), self.pattern)?;
+        if let Some(escape_char) = self.escape_char {
+            write!(f, " ESCAPE '{escape_char}'")?;
+        }
+        Ok(())
     }
 }
 
@@ -120,6 +129,12 @@ impl PhysicalExpr for LikeExpr {
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         let lhs = self.expr.evaluate(batch)?;
         let rhs = self.pattern.evaluate(batch)?;
+        let escape = self.escape_char.unwrap_or('\\');
+        let rhs = if escape != '\\' {
+            rewrite_pattern_escape(&rhs, escape)?
+        } else {
+            rhs
+        };
         match (self.negated, self.case_insensitive) {
             (false, false) => apply_cmp(Operator::LikeMatch, &lhs, &rhs),
             (false, true) => apply_cmp(Operator::ILikeMatch, &lhs, &rhs),
@@ -141,13 +156,18 @@ impl PhysicalExpr for LikeExpr {
             self.case_insensitive,
             Arc::clone(&children[0]),
             Arc::clone(&children[1]),
+            self.escape_char,
         )))
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.expr.fmt_sql(f)?;
         write!(f, " {} ", self.op_name())?;
-        self.pattern.fmt_sql(f)
+        self.pattern.fmt_sql(f)?;
+        if let Some(escape_char) = self.escape_char {
+            write!(f, " ESCAPE '{escape_char}'")?;
+        }
+        Ok(())
     }
 }
 
@@ -166,6 +186,7 @@ pub fn like(
     expr: Arc<dyn PhysicalExpr>,
     pattern: Arc<dyn PhysicalExpr>,
     input_schema: &Schema,
+    escape_char: Option<char>,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let expr_type = &expr.data_type(input_schema)?;
     let pattern_type = &pattern.data_type(input_schema)?;
@@ -178,7 +199,101 @@ pub fn like(
         case_insensitive,
         expr,
         pattern,
+        escape_char,
     )))
+}
+
+/// Rewrites a LIKE pattern from using `escape_char` to using `\` as the escape
+/// character, so it can be evaluated by Arrow's like kernels which hardcode `\`.
+fn rewrite_like_pattern(pattern: &str, escape_char: char) -> Result<String> {
+    let mut result = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if ch == escape_char {
+            match chars.next() {
+                Some('%') => result.push_str("\\%"),
+                Some('_') => result.push_str("\\_"),
+                Some(c) if c == escape_char => {
+                    if c == '%' || c == '_' {
+                        result.push('\\');
+                        result.push(c);
+                    } else if c == '\\' {
+                        result.push_str("\\\\");
+                    } else {
+                        result.push(c);
+                    }
+                }
+                Some(c) => {
+                    if c == '\\' {
+                        result.push_str("\\\\");
+                    } else {
+                        result.push(c);
+                    }
+                }
+                None => {
+                    return exec_err!(
+                        "LIKE pattern must not end with escape character '{escape_char}'"
+                    );
+                }
+            }
+        } else if ch == '\\' {
+            result.push_str("\\\\");
+        } else {
+            result.push(ch);
+        }
+    }
+    Ok(result)
+}
+
+fn rewrite_pattern_escape(
+    pattern: &ColumnarValue,
+    escape_char: char,
+) -> Result<ColumnarValue> {
+    match pattern {
+        ColumnarValue::Scalar(scalar) => {
+            let s = match scalar {
+                ScalarValue::Utf8(s)
+                | ScalarValue::LargeUtf8(s)
+                | ScalarValue::Utf8View(s) => s,
+                _ => return Ok(pattern.clone()),
+            };
+            match s {
+                Some(s) => {
+                    let rewritten = rewrite_like_pattern(s, escape_char)?;
+                    let new_scalar = match scalar {
+                        ScalarValue::Utf8(_) => ScalarValue::Utf8(Some(rewritten)),
+                        ScalarValue::LargeUtf8(_) => {
+                            ScalarValue::LargeUtf8(Some(rewritten))
+                        }
+                        ScalarValue::Utf8View(_) => {
+                            ScalarValue::Utf8View(Some(rewritten))
+                        }
+                        _ => unreachable!(),
+                    };
+                    Ok(ColumnarValue::Scalar(new_scalar))
+                }
+                None => Ok(pattern.clone()),
+            }
+        }
+        ColumnarValue::Array(array) => {
+            let string_array = array.as_string_opt::<i32>();
+            if let Some(string_array) = string_array {
+                let mut builder = StringBuilder::with_capacity(string_array.len(), 0);
+                for i in 0..string_array.len() {
+                    if string_array.is_null(i) {
+                        builder.append_null();
+                    } else {
+                        let rewritten =
+                            rewrite_like_pattern(string_array.value(i), escape_char)?;
+                        builder.append_value(&rewritten);
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(builder.finish()) as ArrayRef))
+            } else {
+                Ok(pattern.clone())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +320,7 @@ mod test {
                 col("a", &schema)?,
                 col("b", &schema)?,
                 &schema,
+                None,
             )?;
             let batch = RecordBatch::try_new(
                 Arc::new(schema.clone()),
@@ -274,6 +390,7 @@ mod test {
             col("a", &schema)?,
             col("b", &schema)?,
             &schema,
+            None,
         )?;
 
         // Display format
@@ -283,6 +400,34 @@ mod test {
         // fmt_sql format
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         assert_eq!(sql_string, "a LIKE b");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rewrite_like_pattern() -> Result<()> {
+        // Basic escape of % and _
+        assert_eq!(rewrite_like_pattern("$%", '$')?, "\\%");
+        assert_eq!(rewrite_like_pattern("$_", '$')?, "\\_");
+
+        // Escape char escaping itself
+        assert_eq!(rewrite_like_pattern("$$", '$')?, "$");
+
+        // Backslash becomes escaped in output
+        assert_eq!(rewrite_like_pattern("a\\b", '$')?, "a\\\\b");
+
+        // Mixed pattern: /%SystemDrive/%//Users% with escape /
+        // means: literal %, SystemDrive, literal %, literal /, Users, wildcard %
+        assert_eq!(
+            rewrite_like_pattern("/%SystemDrive/%//Users%", '/')?,
+            "\\%SystemDrive\\%/Users%"
+        );
+
+        // Wildcards pass through
+        assert_eq!(rewrite_like_pattern("%hello_", '$')?, "%hello_");
+
+        // Trailing escape char is an error
+        assert!(rewrite_like_pattern("abc$", '$').is_err());
 
         Ok(())
     }

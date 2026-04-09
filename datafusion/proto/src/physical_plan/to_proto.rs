@@ -486,6 +486,10 @@ pub fn serialize_physical_expr_with_converter(
                     pattern: Some(Box::new(
                         proto_converter.physical_expr_to_proto(expr.pattern(), codec)?,
                     )),
+                    escape_char: expr
+                        .escape_char()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
                 },
             ))),
         })

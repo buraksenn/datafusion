@@ -17674,6 +17674,9 @@ impl serde::Serialize for PhysicalLikeExprNode {
         if self.pattern.is_some() {
             len += 1;
         }
+        if !self.escape_char.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalLikeExprNode", len)?;
         if self.negated {
             struct_ser.serialize_field("negated", &self.negated)?;
@@ -17686,6 +17689,9 @@ impl serde::Serialize for PhysicalLikeExprNode {
         }
         if let Some(v) = self.pattern.as_ref() {
             struct_ser.serialize_field("pattern", v)?;
+        }
+        if !self.escape_char.is_empty() {
+            struct_ser.serialize_field("escapeChar", &self.escape_char)?;
         }
         struct_ser.end()
     }
@@ -17702,6 +17708,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalLikeExprNode {
             "caseInsensitive",
             "expr",
             "pattern",
+            "escape_char",
+            "escapeChar",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -17710,6 +17718,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalLikeExprNode {
             CaseInsensitive,
             Expr,
             Pattern,
+            EscapeChar,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -17735,6 +17744,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalLikeExprNode {
                             "caseInsensitive" | "case_insensitive" => Ok(GeneratedField::CaseInsensitive),
                             "expr" => Ok(GeneratedField::Expr),
                             "pattern" => Ok(GeneratedField::Pattern),
+                            "escapeChar" | "escape_char" => Ok(GeneratedField::EscapeChar),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17758,6 +17768,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalLikeExprNode {
                 let mut case_insensitive__ = None;
                 let mut expr__ = None;
                 let mut pattern__ = None;
+                let mut escape_char__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Negated => {
@@ -17784,6 +17795,12 @@ impl<'de> serde::Deserialize<'de> for PhysicalLikeExprNode {
                             }
                             pattern__ = map_.next_value()?;
                         }
+                        GeneratedField::EscapeChar => {
+                            if escape_char__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("escapeChar"));
+                            }
+                            escape_char__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(PhysicalLikeExprNode {
@@ -17791,6 +17808,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalLikeExprNode {
                     case_insensitive: case_insensitive__.unwrap_or_default(),
                     expr: expr__,
                     pattern: pattern__,
+                    escape_char: escape_char__.unwrap_or_default(),
                 })
             }
         }

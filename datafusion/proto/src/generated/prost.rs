@@ -1498,6 +1498,8 @@ pub struct PhysicalLikeExprNode {
     pub expr: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
     #[prost(message, optional, boxed, tag = "4")]
     pub pattern: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
+    #[prost(string, tag = "5")]
+    pub escape_char: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalSortExprNode {

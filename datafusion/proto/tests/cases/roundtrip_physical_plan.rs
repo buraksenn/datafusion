@@ -1536,6 +1536,7 @@ fn roundtrip_like() -> Result<()> {
         col("a", &schema)?,
         col("b", &schema)?,
         &schema,
+        None,
     )?;
     let plan = Arc::new(ProjectionExec::try_new(
         vec![ProjectionExpr {
