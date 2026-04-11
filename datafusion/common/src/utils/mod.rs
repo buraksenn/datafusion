@@ -33,8 +33,7 @@ use arrow::array::{
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::{SortColumn, SortOptions, partition};
 use arrow::datatypes::{DataType, Field, SchemaRef};
-#[cfg(feature = "sql")]
-use sqlparser::{ast::Ident, dialect::GenericDialect, parser::Parser};
+
 use std::borrow::{Borrow, Cow};
 use std::cmp::{Ordering, min};
 use std::collections::HashSet;
@@ -276,31 +275,6 @@ fn needs_quotes(s: &str) -> bool {
     !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-#[cfg(feature = "sql")]
-pub(crate) fn parse_identifiers(s: &str) -> Result<Vec<Ident>> {
-    let dialect = GenericDialect;
-    let mut parser = Parser::new(&dialect).try_with_sql(s)?;
-    let idents = parser.parse_multipart_identifier()?;
-    Ok(idents)
-}
-
-/// Parse a string into a vector of identifiers.
-///
-/// Note: If ignore_case is false, the string will be normalized to lowercase.
-#[cfg(feature = "sql")]
-pub(crate) fn parse_identifiers_normalized(s: &str, ignore_case: bool) -> Vec<String> {
-    parse_identifiers(s)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|id| match id.quote_style {
-            Some(_) => id.value,
-            None if ignore_case => id.value,
-            _ => id.value.to_ascii_lowercase(),
-        })
-        .collect::<Vec<_>>()
-}
-
-#[cfg(not(feature = "sql"))]
 pub(crate) fn parse_identifiers(s: &str) -> Result<Vec<String>> {
     let mut result = Vec::new();
     let mut current = String::new();
@@ -330,7 +304,9 @@ pub(crate) fn parse_identifiers(s: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-#[cfg(not(feature = "sql"))]
+/// Parse a string into a vector of identifiers.
+///
+/// Note: If ignore_case is false, the string will be normalized to lowercase.
 pub(crate) fn parse_identifiers_normalized(s: &str, ignore_case: bool) -> Vec<String> {
     parse_identifiers(s)
         .unwrap_or_default()
@@ -1176,7 +1152,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "sql")]
     #[test]
     fn test_quote_identifier() -> Result<()> {
         let cases = vec![
@@ -1198,23 +1173,11 @@ mod tests {
 
             assert_eq!(quote_identifier(identifier), quoted_identifier);
 
-            // When parsing the quoted identifier, it should be a
-            // a single identifier without normalization, and not in multiple parts
-            let quote_style = if quoted_identifier.starts_with('"') {
-                Some('"')
-            } else {
-                None
-            };
-
-            let expected_parsed = vec![Ident {
-                value: identifier.to_string(),
-                quote_style,
-                span: sqlparser::tokenizer::Span::empty(),
-            }];
-
+            let parsed = parse_identifiers(quoted_identifier).unwrap();
             assert_eq!(
-                parse_identifiers(quoted_identifier).unwrap(),
-                expected_parsed
+                parsed.len(),
+                1,
+                "Expected single identifier for {quoted_identifier}"
             );
         }
 

@@ -139,7 +139,6 @@ impl Column {
     }
 
     /// Deserialize a fully qualified name string into a column preserving column text case
-    #[cfg(feature = "sql")]
     pub fn from_qualified_name_ignore_case(flat_name: impl Into<String>) -> Self {
         let flat_name = flat_name.into();
         Self::from_idents(parse_identifiers_normalized(&flat_name, true)).unwrap_or_else(
@@ -149,11 +148,6 @@ impl Column {
                 spans: Spans::new(),
             },
         )
-    }
-
-    #[cfg(not(feature = "sql"))]
-    pub fn from_qualified_name_ignore_case(flat_name: impl Into<String>) -> Self {
-        Self::from_qualified_name(flat_name)
     }
 
     /// return the column's name.
