@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{UInt8Builder, UInt64Builder};
+use datafusion::arrow::array::{RecordBatchOptions, UInt8Builder, UInt64Builder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -53,6 +53,20 @@ pub async fn custom_datasource() -> Result<()> {
     search_accounts(db.clone(), None, 3).await?;
     search_accounts(db.clone(), Some(col("bank_account").gt(lit(8000u64))), 1).await?;
     search_accounts(db.clone(), Some(col("bank_account").gt(lit(200u64))), 2).await?;
+
+    // demonstrate that SQL queries with literals and aggregates work
+    let ctx = SessionContext::new();
+    ctx.register_table("test", Arc::new(db.clone()))?;
+
+    let result = ctx.sql("select 1 as a from test").await?.collect().await?;
+    assert_eq!(result[0].num_rows(), 3);
+
+    let result = ctx
+        .sql("select COUNT(id) from test")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(result[0].num_rows(), 1);
 
     Ok(())
 }
@@ -192,6 +206,7 @@ impl TableProvider for CustomDataSource {
 #[derive(Debug, Clone)]
 struct CustomExec {
     db: CustomDataSource,
+    projections: Vec<usize>,
     projected_schema: SchemaRef,
     cache: Arc<PlanProperties>,
 }
@@ -205,8 +220,12 @@ impl CustomExec {
     ) -> Self {
         let projected_schema = project_schema(&schema, projections).unwrap();
         let cache = Self::compute_properties(projected_schema.clone());
+        let projections = projections
+            .cloned()
+            .unwrap_or_else(|| (0..schema.fields().len()).collect());
         Self {
             db,
+            projections,
             projected_schema,
             cache: Arc::new(cache),
         }
@@ -260,21 +279,37 @@ impl ExecutionPlan for CustomExec {
             db.data.values().cloned().collect()
         };
 
-        let mut id_array = UInt8Builder::with_capacity(users.len());
-        let mut account_array = UInt64Builder::with_capacity(users.len());
+        let mut columns: Vec<Arc<dyn arrow::array::Array>> =
+            Vec::with_capacity(self.projections.len());
 
-        for user in users {
-            id_array.append_value(user.id);
-            account_array.append_value(user.bank_account);
+        for proj in &self.projections {
+            match proj {
+                0 => {
+                    let mut id_array = UInt8Builder::with_capacity(users.len());
+                    for user in &users {
+                        id_array.append_value(user.id);
+                    }
+                    columns.push(Arc::new(id_array.finish()));
+                }
+                1 => {
+                    let mut account_array =
+                        UInt64Builder::with_capacity(users.len());
+                    for user in &users {
+                        account_array.append_value(user.bank_account);
+                    }
+                    columns.push(Arc::new(account_array.finish()));
+                }
+                _ => unreachable!(),
+            }
         }
 
+        let options =
+            RecordBatchOptions::new().with_row_count(Some(users.len()));
         Ok(Box::pin(MemoryStream::try_new(
-            vec![RecordBatch::try_new(
+            vec![RecordBatch::try_new_with_options(
                 self.projected_schema.clone(),
-                vec![
-                    Arc::new(id_array.finish()),
-                    Arc::new(account_array.finish()),
-                ],
+                columns,
+                &options,
             )?],
             self.schema(),
             None,
