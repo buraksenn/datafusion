@@ -348,6 +348,35 @@ impl PhysicalGroupBy {
         self.expr.is_empty()
     }
 
+    /// Returns true if any grouping set is the empty set (all columns are NULL).
+    ///
+    /// This is true for ROLLUP, CUBE, and GROUPING SETS that include `()`.
+    /// The empty grouping set requires producing a grand total row even when
+    /// there are zero input rows.
+    pub fn has_empty_grouping_set(&self) -> bool {
+        self.has_grouping_set && self.groups.iter().any(|group| group.iter().all(|&b| b))
+    }
+
+    /// Returns the grouping IDs for all empty grouping sets (those where every
+    /// column is NULL).
+    ///
+    /// Each returned `u64` is a packed grouping ID (semantic bitmask + ordinal).
+    /// For `GROUPING SETS((), ())` this returns two distinct IDs.
+    pub fn empty_grouping_set_ids(&self) -> Vec<u64> {
+        let max_ordinal = max_duplicate_ordinal(&self.groups);
+        let mut ordinal_per_pattern: HashMap<&[bool], usize> = HashMap::new();
+        let mut ids = Vec::new();
+        for group in &self.groups {
+            let ordinal = ordinal_per_pattern.entry(group).or_insert(0);
+            let current_ordinal = *ordinal;
+            *ordinal += 1;
+            if group.iter().all(|&b| b) {
+                ids.push(compute_grouping_id(group, current_ordinal, max_ordinal));
+            }
+        }
+        ids
+    }
+
     /// Returns true if this is a "simple" GROUP BY (not using GROUPING SETS/CUBE/ROLLUP).
     /// This determines whether the `__grouping_id` column is included in the output schema.
     pub fn is_single(&self) -> bool {
@@ -2048,9 +2077,9 @@ fn evaluate_optional(
         .collect()
 }
 
-/// Builds the internal `__grouping_id` array for a single grouping set.
+/// Computes the packed grouping ID for a single grouping set.
 ///
-/// The returned array packs two values into a single integer:
+/// The returned `u64` packs two values:
 ///
 /// - Low `n` bits (positions 0 .. n-1): the semantic bitmask.  A `1` bit
 ///   at position `i` means that the `i`-th grouping column (counting from the
@@ -2059,6 +2088,25 @@ fn evaluate_optional(
 /// - High bits (positions n and above): the duplicate `ordinal`, which
 ///   distinguishes multiple occurrences of the same grouping-set pattern.  The
 ///   ordinal is `0` for the first occurrence, `1` for the second, and so on.
+pub(crate) fn compute_grouping_id(
+    group: &[bool],
+    ordinal: usize,
+    max_ordinal: usize,
+) -> u64 {
+    let n = group.len();
+    debug_assert!(n <= 64, "Grouping sets with more than 64 columns are not supported");
+    let ordinal_bits = usize::BITS as usize - max_ordinal.leading_zeros() as usize;
+    debug_assert!(
+        n + ordinal_bits <= 64,
+        "Grouping ID exceeds 64 bits"
+    );
+    let semantic_id = group.iter().fold(0u64, |acc, &is_null| {
+        (acc << 1) | if is_null { 1 } else { 0 }
+    });
+    semantic_id | ((ordinal as u64) << n)
+}
+
+/// Builds the internal `__grouping_id` array for a single grouping set.
 ///
 /// The integer type is chosen to be the smallest `UInt8 / UInt16 / UInt32 /
 /// UInt64` that can represent both parts.  It matches the type returned by
@@ -2083,10 +2131,7 @@ fn group_id_array(
              {max_ordinal} require {total_bits} bits, which exceeds 64"
         );
     }
-    let semantic_id = group.iter().fold(0u64, |acc, &is_null| {
-        (acc << 1) | if is_null { 1 } else { 0 }
-    });
-    let full_id = semantic_id | ((ordinal as u64) << n);
+    let full_id = compute_grouping_id(group, ordinal, max_ordinal);
     let num_rows = batch.num_rows();
     if total_bits <= 8 {
         Ok(Arc::new(UInt8Array::from(vec![full_id as u8; num_rows])))

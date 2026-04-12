@@ -847,8 +847,19 @@ where
             let iter = sums.into_iter().zip(counts).zip(nulls.iter());
 
             for ((sum, count), is_valid) in iter {
-                if is_valid {
+                if is_valid && count != 0 {
                     builder.append_value((self.avg_fn)(sum, count)?)
+                } else {
+                    builder.append_null();
+                }
+            }
+            builder.finish()
+        } else if counts.contains(&0) {
+            let mut builder = PrimitiveBuilder::<T>::with_capacity(counts.len())
+                .with_data_type(self.return_data_type.clone());
+            for (sum, count) in sums.into_iter().zip(counts) {
+                if count != 0 {
+                    builder.append_value((self.avg_fn)(sum, count)?);
                 } else {
                     builder.append_null();
                 }

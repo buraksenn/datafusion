@@ -36,7 +36,7 @@ use crate::{PhysicalExpr, aggregates, metrics};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 use arrow::array::*;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::{
     DataFusionError, Result, assert_eq_or_internal_err, assert_or_internal_err,
     internal_err, resources_datafusion_err,
@@ -44,7 +44,7 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion_expr::{EmitTo, GroupsAccumulator};
+use datafusion_expr::{Aggregate, EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{GroupsAccumulatorAdapter, PhysicalSortExpr};
@@ -383,6 +383,10 @@ pub(crate) struct GroupedHashAggregateStream {
     /// GROUP BY expressions
     group_by: Arc<PhysicalGroupBy>,
 
+    /// Aggregate expressions, used for computing default values
+    /// when producing empty grouping set rows with no input
+    aggregate_exprs: Arc<[Arc<AggregateFunctionExpr>]>,
+
     /// max rows in output RecordBatches
     batch_size: usize,
 
@@ -667,6 +671,7 @@ impl GroupedHashAggregateStream {
             aggregate_arguments,
             filter_expressions,
             group_by: agg_group_by,
+            aggregate_exprs,
             reservation,
             oom_mode,
             group_values,
@@ -1212,6 +1217,66 @@ impl GroupedHashAggregateStream {
         group_values_soft_limit <= self.group_values.len()
     }
 
+    /// Produces a batch with one row per empty grouping set when there are
+    /// no input rows.
+    ///
+    /// Per SQL standard, ROLLUP/CUBE/GROUPING SETS that include the empty
+    /// grouping set `()` must always produce a grand total row, even when
+    /// the input is empty. Aggregate functions return their identity values
+    /// (e.g., COUNT → 0, SUM → NULL).
+    ///
+    /// For `GROUPING SETS((), ())` this produces two rows with distinct
+    /// grouping IDs.
+    fn emit_empty_grouping_set_batch(&self) -> Result<RecordBatch> {
+        let schema = self.schema();
+        let ids = self.group_by.empty_grouping_set_ids();
+        let num_rows = ids.len();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+
+        for field in self.group_by.expr().iter() {
+            let (_, name) = field;
+            let schema_field = schema.field_with_name(name)?;
+            columns.push(new_null_array(schema_field.data_type(), num_rows));
+        }
+
+        // has_empty_grouping_set() implies has_grouping_set(), so the
+        // __grouping_id column is always present when this method is called.
+        let grouping_id_field =
+            schema.field_with_name(Aggregate::INTERNAL_GROUPING_ID)?;
+        let grouping_id_array: ArrayRef = match grouping_id_field.data_type() {
+            DataType::UInt8 => Arc::new(UInt8Array::from(
+                ids.iter().map(|&id| id as u8).collect::<Vec<_>>(),
+            )),
+            DataType::UInt16 => Arc::new(UInt16Array::from(
+                ids.iter().map(|&id| id as u16).collect::<Vec<_>>(),
+            )),
+            DataType::UInt32 => Arc::new(UInt32Array::from(
+                ids.iter().map(|&id| id as u32).collect::<Vec<_>>(),
+            )),
+            _ => Arc::new(UInt64Array::from(ids)),
+        };
+        columns.push(grouping_id_array);
+
+        for expr in self.aggregate_exprs.iter() {
+            match self.mode.output_mode() {
+                AggregateOutputMode::Final => {
+                    let field = expr.field();
+                    let default = expr.default_value(field.data_type())?;
+                    columns.push(default.to_array_of_size(num_rows)?);
+                }
+                AggregateOutputMode::Partial => {
+                    let mut acc = expr.create_accumulator()?;
+                    let states = acc.state()?;
+                    for sv in &states {
+                        columns.push(sv.to_array_of_size(num_rows)?);
+                    }
+                }
+            }
+        }
+
+        RecordBatch::try_new(schema, columns).map_err(Into::into)
+    }
+
     /// Finalizes reading of the input stream and prepares for producing output values.
     ///
     /// This method is called both when the original input stream and,
@@ -1227,8 +1292,13 @@ impl GroupedHashAggregateStream {
             // Flush any remaining group values.
             let batch = self.emit(EmitTo::All, false)?;
 
-            // If there are none, we're done; otherwise switch to emitting them
-            batch.map_or(ExecutionState::Done, ExecutionState::ProducingOutput)
+            match batch {
+                Some(batch) => ExecutionState::ProducingOutput(batch),
+                None if self.group_by.has_empty_grouping_set() => {
+                    ExecutionState::ProducingOutput(self.emit_empty_grouping_set_batch()?)
+                }
+                None => ExecutionState::Done,
+            }
         } else {
             // Spill any remaining data to disk. There is some performance overhead in
             // writing out this last chunk of data and reading it back. The benefit of

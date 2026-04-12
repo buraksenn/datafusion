@@ -224,3 +224,143 @@ query I
 SELECT SUM(v1) FROM generate_series(10) AS t1(v1) GROUP BY GROUPING SETS(())
 ----
 55
+
+# ROLLUP with empty input should still produce grand total row
+query TI
+SELECT c1, COUNT(*) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1);
+----
+NULL 0
+
+# CUBE with empty input should still produce grand total row
+query TI
+SELECT c1, COUNT(*) FROM test WHERE c3 < 0 GROUP BY CUBE(c1);
+----
+NULL 0
+
+# GROUPING SETS with empty set and empty input
+query TI
+SELECT c1, COUNT(*) FROM test WHERE c3 < 0 GROUP BY GROUPING SETS((), (c1));
+----
+NULL 0
+
+# ROLLUP with multiple columns and empty input
+query TTI
+SELECT c1, c2, COUNT(*) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1, c2);
+----
+NULL NULL 0
+
+# SUM should return NULL for empty input with ROLLUP
+query TII
+SELECT c1, SUM(c3), COUNT(c3) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1);
+----
+NULL NULL 0
+
+# Multiple aggregates with empty ROLLUP
+query TRII
+SELECT c1, AVG(c3), MIN(c3), MAX(c3) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1);
+----
+NULL NULL NULL NULL
+
+# Duplicate empty grouping sets with empty input should produce multiple rows
+query I
+SELECT COUNT(*) FROM test WHERE c3 < 0 GROUP BY GROUPING SETS((), ());
+----
+0
+0
+
+# Triple duplicate empty grouping sets, empty input
+query I rowsort
+SELECT count(*) FROM test WHERE c3 < 0 GROUP BY GROUPING SETS((), (), ());
+----
+0
+0
+0
+
+# Mixed grouping sets with duplicate empty sets, empty input
+query TTI rowsort
+SELECT c1, c2, count(*) FROM test WHERE c3 < 0 GROUP BY GROUPING SETS((c1), (), (c2), ());
+----
+NULL NULL 0
+NULL NULL 0
+
+# CUBE on 2 cols with empty input (includes () once)
+query TTII rowsort
+SELECT c1, c2, count(*), sum(c3) FROM test WHERE c3 < 0 GROUP BY CUBE(c1, c2);
+----
+NULL NULL 0 NULL
+
+# ROLLUP on 3 cols with empty input
+query TTII rowsort
+SELECT c1, c2, c3, count(*) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1, c2, c3);
+----
+NULL NULL NULL 0
+
+# Only empty grouping set, no group columns, empty input
+query IIRII
+SELECT count(*), sum(c3), avg(c3), min(c3), max(c3) FROM test WHERE c3 < 0 GROUP BY GROUPING SETS(());
+----
+0 NULL NULL NULL NULL
+
+# ROLLUP on truly empty table
+statement ok
+CREATE TABLE empty_table (a VARCHAR, b INT);
+
+query TII
+SELECT a, count(*), sum(b) FROM empty_table GROUP BY ROLLUP(a);
+----
+NULL 0 NULL
+
+# CUBE on truly empty table
+query TII
+SELECT a, count(*), sum(b) FROM empty_table GROUP BY CUBE(a);
+----
+NULL 0 NULL
+
+# ROLLUP with all-NULL data
+statement ok
+INSERT INTO empty_table VALUES (NULL, NULL), (NULL, NULL);
+
+query TIII rowsort
+SELECT a, count(*), sum(b), count(b) FROM empty_table GROUP BY ROLLUP(a);
+----
+NULL 2 NULL 0
+NULL 2 NULL 0
+
+statement ok
+DROP TABLE empty_table;
+
+# Mixed empty/non-empty grouping sets with data
+query TTI rowsort
+SELECT c1, c2, count(*) FROM test GROUP BY GROUPING SETS((c1), (), (c2), ());
+----
+NULL A 1
+NULL B 1
+NULL NULL 2
+NULL NULL 2
+a NULL 1
+b NULL 1
+
+# count(distinct) with ROLLUP empty input
+query TI
+SELECT c1, count(distinct c3) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1);
+----
+NULL 0
+
+# ROLLUP with single-row input (boundary: minimal non-empty)
+query TII rowsort
+SELECT c1, count(*), sum(c3) FROM test WHERE c1 = 'a' AND c2 = 'A' GROUP BY ROLLUP(c1);
+----
+NULL 1 1
+a 1 1
+
+# GROUPING(c1) with ROLLUP empty input
+query TII
+SELECT c1, grouping(c1), count(*) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1);
+----
+NULL 1 0
+
+# count with FILTER and empty input ROLLUP
+query TII
+SELECT c1, count(*) FILTER (WHERE c3 > 5), sum(c3) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1);
+----
+NULL 0 NULL
