@@ -504,9 +504,21 @@ select floor(a), floor(b), floor(c) from signed_integers;
 2 -1000 123
 4 NULL NULL
 
-# floor with scale parameter(Scale not supported)
-query error DataFusion error: This feature is not implemented: FLOOR with scale is not supported
-select floor(a, 1)
+# floor with scale parameter
+query R rowsort
+select floor(3.145, 2);
+----
+3.14
+
+query R rowsort
+select floor(3.14, 0);
+----
+3
+
+query R rowsort
+select floor(-3.145, 2);
+----
+-3.15
 
 # floor with datetime parameter ( not supported)
 query error DataFusion error: This feature is not implemented: FLOOR with datetime is not supported

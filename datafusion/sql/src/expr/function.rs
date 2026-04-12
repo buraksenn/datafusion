@@ -19,7 +19,7 @@ use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
 use arrow::datatypes::DataType;
 use datafusion_common::{
-    DFSchema, Dependency, Diagnostic, Result, Span, internal_datafusion_err,
+    DFSchema, Dependency, Diagnostic, Result, ScalarValue, Span, internal_datafusion_err,
     internal_err, not_impl_err, plan_datafusion_err, plan_err,
 };
 use datafusion_expr::{
@@ -32,7 +32,7 @@ use datafusion_expr::{
 use sqlparser::ast::{
     DuplicateTreatment, Expr as SQLExpr, Function as SQLFunction, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
-    ObjectName, OrderByExpr, Spanned, WindowType,
+    ObjectName, OrderByExpr, Spanned, Value, WindowType,
 };
 
 /// Suggest a valid function based on an invalid input function name
@@ -743,6 +743,34 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 internal_datafusion_err!("Unable to find expected '{fn_name}' function")
             })?;
         let args = vec![self.sql_expr_to_logical_expr(expr, schema, planner_context)?];
+        Ok(Expr::ScalarFunction(ScalarFunction::new_udf(fun, args)))
+    }
+
+    pub(super) fn sql_fn_name_to_expr_with_scale(
+        &self,
+        expr: SQLExpr,
+        fn_name: &str,
+        scale: &Value,
+        schema: &DFSchema,
+        planner_context: &mut PlannerContext,
+    ) -> Result<Expr> {
+        let fun = self
+            .context_provider
+            .get_function_meta(fn_name)
+            .ok_or_else(|| {
+                internal_datafusion_err!("Unable to find expected '{fn_name}' function")
+            })?;
+        let value_expr = self.sql_expr_to_logical_expr(expr, schema, planner_context)?;
+        let scale_value = match &scale {
+            Value::Number(n, _) => n.parse::<i64>().map_err(|_| {
+                internal_datafusion_err!("Unable to parse scale value '{n}' as Int64")
+            })?,
+            _ => {
+                return internal_err!("Expected numeric scale value, got {scale:?}");
+            }
+        };
+        let scale_expr = Expr::Literal(ScalarValue::Int64(Some(scale_value)), None);
+        let args = vec![value_expr, scale_expr];
         Ok(Expr::ScalarFunction(ScalarFunction::new_udf(fun, args)))
     }
 

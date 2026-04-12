@@ -39,8 +39,8 @@ use super::decimal::{apply_decimal_op, floor_decimal_value};
 
 #[user_doc(
     doc_section(label = "Math Functions"),
-    description = "Returns the nearest integer less than or equal to a number.",
-    syntax_example = "floor(numeric_expression)",
+    description = "Returns the nearest integer less than or equal to a number. When a scale parameter is provided, rounds down to that number of decimal places.",
+    syntax_example = "floor(numeric_expression [, scale])",
     standard_argument(name = "numeric_expression", prefix = "Numeric"),
     sql_example = r#"```sql
 > SELECT floor(3.14);
@@ -49,6 +49,13 @@ use super::decimal::{apply_decimal_op, floor_decimal_value};
 +-------------+
 | 3.0         |
 +-------------+
+
+> SELECT floor(3.145, 2);
++-----------------+
+| floor(3.145,2)  |
++-----------------+
+| 3.14            |
++-----------------+
 ```"#
 )]
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -70,6 +77,8 @@ impl FloorFunc {
                 vec![
                     TypeSignature::Coercible(vec![decimal_sig]),
                     TypeSignature::Uniform(1, vec![DataType::Float64, DataType::Float32]),
+                    TypeSignature::Exact(vec![DataType::Float64, DataType::Int64]),
+                    TypeSignature::Exact(vec![DataType::Float32, DataType::Int64]),
                 ],
                 Volatility::Immutable,
             ),
@@ -130,6 +139,10 @@ impl ScalarUDFImpl for FloorFunc {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.len() == 2 {
+            return self.invoke_with_scale(&args);
+        }
+
         let arg = &args.args[0];
 
         // Scalar fast path for float types - avoid array conversion overhead entirely
@@ -376,6 +389,63 @@ where
     let upper = value.add_checked(one_scaled).ok()?;
 
     Some((value, upper))
+}
+
+impl FloorFunc {
+    fn invoke_with_scale(&self, args: &ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let value_arg = &args.args[0];
+        let scale_arg = &args.args[1];
+
+        let scale = match scale_arg {
+            ColumnarValue::Scalar(ScalarValue::Int64(Some(s))) => *s,
+            ColumnarValue::Scalar(ScalarValue::Int64(None)) => {
+                return Ok(ColumnarValue::Scalar(ScalarValue::Float64(None)));
+            }
+            _ => {
+                return exec_err!(
+                    "floor(value, scale) requires scale to be a scalar Int64"
+                );
+            }
+        };
+
+        let factor = 10_f64.powi(scale as i32);
+
+        match value_arg {
+            ColumnarValue::Scalar(ScalarValue::Float64(v)) => Ok(ColumnarValue::Scalar(
+                ScalarValue::Float64(v.map(|x| (x * factor).floor() / factor)),
+            )),
+            ColumnarValue::Scalar(ScalarValue::Float32(v)) => {
+                let factor_f32 = factor as f32;
+                Ok(ColumnarValue::Scalar(ScalarValue::Float32(
+                    v.map(|x| (x * factor_f32).floor() / factor_f32),
+                )))
+            }
+            ColumnarValue::Scalar(ScalarValue::Null) => {
+                Ok(ColumnarValue::Scalar(ScalarValue::Float64(None)))
+            }
+            ColumnarValue::Array(array) => match array.data_type() {
+                DataType::Float64 => {
+                    let arr = array.as_primitive::<Float64Type>();
+                    let result: ArrayRef = Arc::new(
+                        arr.unary::<_, Float64Type>(|x| (x * factor).floor() / factor),
+                    );
+                    Ok(ColumnarValue::Array(result))
+                }
+                DataType::Float32 => {
+                    let factor_f32 = factor as f32;
+                    let arr = array.as_primitive::<Float32Type>();
+                    let result: ArrayRef = Arc::new(arr.unary::<_, Float32Type>(|x| {
+                        (x * factor_f32).floor() / factor_f32
+                    }));
+                    Ok(ColumnarValue::Array(result))
+                }
+                other => exec_err!(
+                    "Unsupported data type {other:?} for function floor with scale"
+                ),
+            },
+            _ => exec_err!("Unsupported argument type for floor with scale"),
+        }
+    }
 }
 
 #[cfg(test)]
