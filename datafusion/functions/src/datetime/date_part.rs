@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::array::timezone::Tz;
 use arrow::array::{Array, ArrayRef, Float64Array, Int32Array, Int64Array};
 use arrow::compute::kernels::cast_utils::IntervalUnit;
-use arrow::compute::{DatePart, binary, date_part};
+use arrow::compute::{DatePart, binary, cast, date_part};
 use arrow::datatypes::DataType::{
     Date32, Date64, Duration, Interval, Time32, Time64, Timestamp,
 };
@@ -37,11 +37,12 @@ use datafusion_common::types::{NativeType, logical_date};
 use datafusion_common::{
     Result, ScalarValue,
     cast::{
-        as_date32_array, as_date64_array, as_int32_array, as_interval_dt_array,
-        as_interval_mdn_array, as_interval_ym_array, as_time32_millisecond_array,
-        as_time32_second_array, as_time64_microsecond_array, as_time64_nanosecond_array,
-        as_timestamp_microsecond_array, as_timestamp_millisecond_array,
-        as_timestamp_nanosecond_array, as_timestamp_second_array,
+        as_date32_array, as_date64_array, as_duration_nanosecond_array, as_int32_array,
+        as_interval_dt_array, as_interval_mdn_array, as_interval_ym_array,
+        as_time32_millisecond_array, as_time32_second_array, as_time64_microsecond_array,
+        as_time64_nanosecond_array, as_timestamp_microsecond_array,
+        as_timestamp_millisecond_array, as_timestamp_nanosecond_array,
+        as_timestamp_second_array,
     },
     exec_err, internal_err, not_impl_err,
     types::logical_string,
@@ -217,6 +218,8 @@ impl ScalarUDFImpl for DatePartFunc {
 
         // using IntervalUnit here means we hand off all the work of supporting plurals (like "seconds")
         // and synonyms ( like "ms,msec,msecond,millisecond") to Arrow
+        let is_duration = matches!(array.data_type(), Duration(_));
+
         let arr = if let Ok(interval_unit) = IntervalUnit::from_str(part_trim) {
             match interval_unit {
                 IntervalUnit::Year => date_part(array.as_ref(), DatePart::Year)?,
@@ -225,6 +228,14 @@ impl ScalarUDFImpl for DatePartFunc {
                 IntervalUnit::Day => date_part(array.as_ref(), DatePart::Day)?,
                 IntervalUnit::Hour => date_part(array.as_ref(), DatePart::Hour)?,
                 IntervalUnit::Minute => date_part(array.as_ref(), DatePart::Minute)?,
+                IntervalUnit::Second
+                | IntervalUnit::Millisecond
+                | IntervalUnit::Microsecond
+                | IntervalUnit::Nanosecond
+                    if is_duration =>
+                {
+                    duration_part(array.as_ref(), interval_unit)?
+                }
                 IntervalUnit::Second => seconds_as_i32(array.as_ref(), Second)?,
                 IntervalUnit::Millisecond => seconds_as_i32(array.as_ref(), Millisecond)?,
                 IntervalUnit::Microsecond => seconds_as_i32(array.as_ref(), Microsecond)?,
@@ -562,5 +573,36 @@ fn seconds_ns(array: &dyn Array) -> Result<ArrayRef> {
             })
             .collect();
         Ok(Arc::new(r))
+    }
+}
+
+/// Extract second/millisecond/microsecond/nanosecond component from Duration arrays.
+///
+/// Arrow's `date_part` for Duration types returns total values (e.g., total seconds),
+/// but PostgreSQL semantics require component values (seconds within the current minute).
+/// This function casts to Duration(Nanosecond), then extracts the sub-minute component
+/// to avoid i32 overflow.
+fn duration_part(array: &dyn Array, unit: IntervalUnit) -> Result<ArrayRef> {
+    const NANOS_PER_MINUTE: i64 = 60 * 1_000_000_000;
+
+    let nanos_array = cast(array, &Duration(Nanosecond))?;
+    let arr = as_duration_nanosecond_array(nanos_array.as_ref())?;
+
+    match unit {
+        IntervalUnit::Nanosecond => {
+            let r: Int64Array = arr.unary(|d| d % NANOS_PER_MINUTE);
+            Ok(Arc::new(r))
+        }
+        IntervalUnit::Second | IntervalUnit::Millisecond | IntervalUnit::Microsecond => {
+            let divisor: i64 = match unit {
+                IntervalUnit::Second => 1_000_000_000,
+                IntervalUnit::Millisecond => 1_000_000,
+                IntervalUnit::Microsecond => 1_000,
+                _ => unreachable!(),
+            };
+            let r: Int32Array = arr.unary(|d| ((d % NANOS_PER_MINUTE) / divisor) as i32);
+            Ok(Arc::new(r))
+        }
+        _ => exec_err!("duration_part does not support {unit:?}"),
     }
 }
