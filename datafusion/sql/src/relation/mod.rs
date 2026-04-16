@@ -80,6 +80,31 @@ impl<'a, 'b, S: ContextProvider> RelationPlannerContext
 }
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
+    pub(crate) fn extract_relation_name(
+        &self,
+        relation: &TableFactor,
+    ) -> Result<Option<(String, Option<Span>)>> {
+        match relation {
+            TableFactor::Table { alias: Some(a), .. }
+            | TableFactor::Derived { alias: Some(a), .. }
+            | TableFactor::Function { alias: Some(a), .. }
+            | TableFactor::UNNEST { alias: Some(a), .. }
+            | TableFactor::NestedJoin { alias: Some(a), .. } => {
+                let span = Span::try_from_sqlparser_span(a.name.span);
+                let name = self.ident_normalizer.normalize(a.name.clone());
+                Ok(Some((name, span)))
+            }
+            TableFactor::Table {
+                name, alias: None, ..
+            } => {
+                let span = Span::try_from_sqlparser_span(relation.span());
+                let table_ref = self.object_name_to_table_reference(name.clone())?;
+                Ok(Some((table_ref.to_string(), span)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Create a `LogicalPlan` that scans the named relation.
     ///
     /// First tries any registered extension planners. If no extension handles

@@ -52,9 +52,7 @@ use sqlparser::ast::{
     SelectItemQualifiedWildcardKind, WildcardAdditionalOptions, WindowType,
     visit_expressions_mut,
 };
-use sqlparser::ast::{
-    NamedWindowDefinition, Select, SelectItem, Spanned, TableFactor, TableWithJoins,
-};
+use sqlparser::ast::{NamedWindowDefinition, Select, SelectItem, TableWithJoins};
 
 /// Result of the `aggregate` function, containing the aggregate plan and
 /// rewritten expressions that reference the aggregate output columns.
@@ -694,43 +692,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 self.plan_table_with_joins(input, planner_context)
             }
             _ => {
-                let extract_table_name =
-                    |t: &TableWithJoins| -> Option<(String, Option<Span>)> {
-                        match &t.relation {
-                            TableFactor::Table { alias: Some(a), .. }
-                            | TableFactor::Derived { alias: Some(a), .. }
-                            | TableFactor::Function { alias: Some(a), .. }
-                            | TableFactor::UNNEST { alias: Some(a), .. }
-                            | TableFactor::NestedJoin { alias: Some(a), .. } => {
-                                let span = Span::try_from_sqlparser_span(a.name.span);
-                                let name =
-                                    self.ident_normalizer.normalize(a.name.clone());
-                                Some((name, span))
-                            }
-                            TableFactor::Table {
-                                name, alias: None, ..
-                            } => {
-                                let span =
-                                    Span::try_from_sqlparser_span(t.relation.span());
-                                let table_name = name
-                                    .0
-                                    .iter()
-                                    .filter_map(|p| p.as_ident())
-                                    .map(|id| self.ident_normalizer.normalize(id.clone()))
-                                    .next_back()?;
-                                Some((table_name, span))
-                            }
-                            _ => None,
-                        }
-                    };
-
                 let mut alias_spans: HashMap<String, Option<Span>> = HashMap::new();
 
                 let mut from = from.into_iter();
                 let first = from.next().unwrap();
 
-                if let Some((name, span)) = extract_table_name(&first) {
+                if let Some((name, span)) = self.extract_relation_name(&first.relation)? {
                     alias_spans.entry(name).or_insert(span);
+                }
+                for join in &first.joins {
+                    if let Some((name, span)) =
+                        self.extract_relation_name(&join.relation)?
+                    {
+                        alias_spans.entry(name).or_insert(span);
+                    }
                 }
 
                 let mut left = LogicalPlanBuilder::from(
@@ -742,13 +717,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     planner_context.set_outer_from_schema(left_schema)
                 };
                 for input in from {
-                    let current_name = extract_table_name(&input);
+                    let mut current_names = Vec::new();
+                    if let Some(pair) = self.extract_relation_name(&input.relation)? {
+                        current_names.push(pair);
+                    }
+                    for join in &input.joins {
+                        if let Some(pair) = self.extract_relation_name(&join.relation)? {
+                            current_names.push(pair);
+                        }
+                    }
 
-                    if let Some((ref name, current_span)) = current_name {
-                        if let Some(prior_span) = alias_spans.get(name) {
+                    for (name, current_span) in &current_names {
+                        if let Some(prior_span) = alias_spans.get(name.as_str()) {
                             let mut diagnostic = Diagnostic::new_error(
                                 "duplicate table alias in FROM clause",
-                                current_span,
+                                *current_span,
                             );
                             if let Some(span) = *prior_span {
                                 diagnostic = diagnostic
@@ -757,7 +740,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             return plan_err!("duplicate table alias in FROM clause")
                                 .map_err(|e| e.with_diagnostic(diagnostic));
                         }
-                        alias_spans.insert(name.clone(), current_span);
+                    }
+
+                    for (name, span) in current_names {
+                        alias_spans.insert(name, span);
                     }
 
                     let right = self.plan_table_with_joins(input, planner_context)?;

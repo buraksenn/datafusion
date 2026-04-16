@@ -16,12 +16,14 @@
 // under the License.
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_common::{Column, Result, not_impl_err, plan_datafusion_err};
+use datafusion_common::{
+    Column, Diagnostic, Result, Span, not_impl_err, plan_datafusion_err, plan_err,
+};
 use datafusion_expr::{JoinType, LogicalPlan, LogicalPlanBuilder};
 use sqlparser::ast::{
     Join, JoinConstraint, JoinOperator, ObjectName, TableFactor, TableWithJoins,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     pub(crate) fn plan_table_with_joins(
@@ -29,13 +31,39 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         t: TableWithJoins,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
-        let mut left = if is_lateral(&t.relation) {
-            self.create_relation_subquery(t.relation, planner_context)?
+        let TableWithJoins { relation, joins } = t;
+
+        let mut alias_spans: HashMap<String, Option<Span>> = HashMap::new();
+
+        if let Some((name, span)) = self.extract_relation_name(&relation)? {
+            alias_spans.insert(name, span);
+        }
+
+        let mut left = if is_lateral(&relation) {
+            self.create_relation_subquery(relation, planner_context)?
         } else {
-            self.create_relation(t.relation, planner_context)?
+            self.create_relation(relation, planner_context)?
         };
         let old_outer_from_schema = planner_context.outer_from_schema();
-        for join in t.joins {
+        for join in joins {
+            if let Some((ref name, current_span)) =
+                self.extract_relation_name(&join.relation)?
+            {
+                if let Some(prior_span) = alias_spans.get(name) {
+                    let mut diagnostic = Diagnostic::new_error(
+                        "duplicate table alias in FROM clause",
+                        current_span,
+                    );
+                    if let Some(span) = *prior_span {
+                        diagnostic =
+                            diagnostic.with_note("first defined here", Some(span));
+                    }
+                    return plan_err!("duplicate table alias in FROM clause")
+                        .map_err(|e| e.with_diagnostic(diagnostic));
+                }
+                alias_spans.insert(name.clone(), current_span);
+            }
+
             planner_context.extend_outer_from_schema(left.schema())?;
             left = self.parse_relation_join(left, join, planner_context)?;
         }
