@@ -272,6 +272,10 @@ pub struct PlannerContext {
     outer_from_schema: Option<DFSchemaRef>,
     /// The query schema defined by the table
     create_table_schema: Option<DFSchemaRef>,
+    /// When planning non-first queries in a set expression
+    /// (UNION/INTERSECT/EXCEPT), holds the schema of the left-most query.
+    /// Used to alias duplicate expressions to match the left side's field names.
+    set_expr_left_schema: Option<DFSchemaRef>,
 }
 
 impl Default for PlannerContext {
@@ -289,6 +293,7 @@ impl PlannerContext {
             outer_queries_schemas_stack: vec![],
             outer_from_schema: None,
             create_table_schema: None,
+            set_expr_left_schema: None,
         }
     }
 
@@ -417,6 +422,14 @@ impl PlannerContext {
     /// Get the span of a previously defined CTE name
     pub(super) fn get_cte_span(&self, name: &str) -> Option<Span> {
         self.ctes.get(name).and_then(|(_, span)| *span)
+    }
+
+    /// Sets the left-most set expression schema, returning the previous value
+    pub(super) fn set_set_expr_left_schema(
+        &mut self,
+        schema: Option<DFSchemaRef>,
+    ) -> Option<DFSchemaRef> {
+        std::mem::replace(&mut self.set_expr_left_schema, schema)
     }
 }
 
@@ -639,9 +652,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     ) -> Result<FieldRef> {
         // First check if any of the registered type_planner can handle this type
         if let Some(type_planner) = self.context_provider.get_type_planner()
-            && let Some(data_type) = type_planner.plan_type(sql_type)?
+            && let Some(data_type) = type_planner.plan_type_field(sql_type)?
         {
-            return Ok(data_type.into_nullable_field_ref());
+            return Ok(data_type);
         }
 
         // If no type_planner can handle this type, use the default conversion

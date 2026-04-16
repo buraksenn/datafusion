@@ -25,9 +25,11 @@ use std::sync::Arc;
 use crate::file_groups::FileGroupPartitioner;
 use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::FileOpener;
+use crate::morsel::{FileOpenerMorselizer, Morselizer};
 #[expect(deprecated)]
 use crate::schema_adapter::SchemaAdapterFactory;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, not_impl_err};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
@@ -62,13 +64,33 @@ pub fn as_file_source<T: FileSource + 'static>(source: T) -> Arc<dyn FileSource>
 ///
 /// [`DataSource`]: crate::source::DataSource
 pub trait FileSource: Send + Sync {
-    /// Creates a `dyn FileOpener` based on given parameters
+    /// Creates a `dyn FileOpener` based on given parameters.
+    ///
+    /// Note: File sources with a native morsel implementation should return an
+    /// error from this method and implementing [`Self::create_morselizer`] instead.
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
         base_config: &FileScanConfig,
         partition: usize,
     ) -> Result<Arc<dyn FileOpener>>;
+
+    /// Creates a `dyn Morselizer` based on given parameters.
+    ///
+    /// The default implementation preserves existing behavior by adapting the
+    /// legacy [`FileOpener`] API into a [`Morselizer`].
+    ///
+    /// It is preferred to implement the [`Morselizer`] API directly by
+    /// implementing this method.
+    fn create_morselizer(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> Result<Box<dyn Morselizer>> {
+        let opener = self.create_file_opener(object_store, base_config, partition)?;
+        Ok(Box::new(FileOpenerMorselizer::new(opener)))
+    }
     /// Any
     fn as_any(&self) -> &dyn Any;
 
@@ -319,4 +341,25 @@ pub trait FileSource: Send + Sync {
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         None
     }
+
+    /// Apply a function to all physical expressions used by this file source.
+    ///
+    /// This includes:
+    /// - Filter predicates (which may contain dynamic filters)
+    /// - Projection expressions
+    ///
+    /// The function `f` is called once for each expression. The function should
+    /// return `TreeNodeRecursion::Continue` to continue visiting other expressions,
+    /// or `TreeNodeRecursion::Stop` to stop visiting expressions early.
+    ///
+    /// Implementations must explicitly visit all expressions. There is no default
+    /// implementation to ensure that all FileSource implementations handle this correctly.
+    ///
+    /// See [`ExecutionPlan::apply_expressions`] for more details and examples.
+    ///
+    /// [`ExecutionPlan::apply_expressions`]: datafusion_physical_plan::ExecutionPlan::apply_expressions
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion>;
 }
