@@ -362,19 +362,30 @@ impl PhysicalGroupBy {
     ///
     /// Each returned `u64` is a packed grouping ID (semantic bitmask + ordinal).
     /// For `GROUPING SETS((), ())` this returns two distinct IDs.
-    pub fn empty_grouping_set_ids(&self) -> Vec<u64> {
+    pub fn empty_grouping_set_ids(&self) -> Result<Vec<u64>> {
+        self.iter_groups_with_ids()?
+            .into_iter()
+            .filter_map(|(group, id)| group.iter().all(|&b| b).then_some(id))
+            .map(Ok)
+            .collect()
+    }
+
+    /// Walks the grouping sets in declaration order, pairing each mask with
+    /// its packed grouping ID. Shared by [`Self::empty_grouping_set_ids`] and
+    /// [`evaluate_group_by`] so both see the same ordinal assignment.
+    fn iter_groups_with_ids(&self) -> Result<Vec<(&[bool], u64)>> {
         let max_ordinal = max_duplicate_ordinal(&self.groups);
         let mut ordinal_per_pattern: HashMap<&[bool], usize> = HashMap::new();
-        let mut ids = Vec::new();
-        for group in &self.groups {
-            let ordinal = ordinal_per_pattern.entry(group).or_insert(0);
-            let current_ordinal = *ordinal;
-            *ordinal += 1;
-            if group.iter().all(|&b| b) {
-                ids.push(compute_grouping_id(group, current_ordinal, max_ordinal));
-            }
-        }
-        ids
+        self.groups
+            .iter()
+            .map(|group| {
+                let slice = group.as_slice();
+                let ordinal = ordinal_per_pattern.entry(slice).or_insert(0);
+                let current = *ordinal;
+                *ordinal += 1;
+                Ok((slice, compute_grouping_id(slice, current, max_ordinal)?))
+            })
+            .collect()
     }
 
     /// Returns true if this is a "simple" GROUP BY (not using GROUPING SETS/CUBE/ROLLUP).
@@ -2092,31 +2103,7 @@ pub(crate) fn compute_grouping_id(
     group: &[bool],
     ordinal: usize,
     max_ordinal: usize,
-) -> u64 {
-    let n = group.len();
-    debug_assert!(n <= 64, "Grouping sets with more than 64 columns are not supported");
-    let ordinal_bits = usize::BITS as usize - max_ordinal.leading_zeros() as usize;
-    debug_assert!(
-        n + ordinal_bits <= 64,
-        "Grouping ID exceeds 64 bits"
-    );
-    let semantic_id = group.iter().fold(0u64, |acc, &is_null| {
-        (acc << 1) | if is_null { 1 } else { 0 }
-    });
-    semantic_id | ((ordinal as u64) << n)
-}
-
-/// Builds the internal `__grouping_id` array for a single grouping set.
-///
-/// The integer type is chosen to be the smallest `UInt8 / UInt16 / UInt32 /
-/// UInt64` that can represent both parts.  It matches the type returned by
-/// [`Aggregate::grouping_id_type`].
-fn group_id_array(
-    group: &[bool],
-    ordinal: usize,
-    max_ordinal: usize,
-    batch: &RecordBatch,
-) -> Result<ArrayRef> {
+) -> Result<u64> {
     let n = group.len();
     if n > 64 {
         return not_impl_err!(
@@ -2131,16 +2118,33 @@ fn group_id_array(
              {max_ordinal} require {total_bits} bits, which exceeds 64"
         );
     }
-    let full_id = compute_grouping_id(group, ordinal, max_ordinal);
-    let num_rows = batch.num_rows();
+    let semantic_id = group
+        .iter()
+        .fold(0u64, |acc, &is_null| (acc << 1) | u64::from(is_null));
+    Ok(semantic_id | ((ordinal as u64) << n))
+}
+
+/// Builds the internal `__grouping_id` array for a single grouping set.
+///
+/// The integer type is chosen to be the smallest `UInt8 / UInt16 / UInt32 /
+/// UInt64` that can represent both parts.  It matches the type returned by
+/// [`Aggregate::grouping_id_type`].
+fn group_id_array(
+    full_id: u64,
+    n_group_cols: usize,
+    max_ordinal: usize,
+    num_rows: usize,
+) -> ArrayRef {
+    let ordinal_bits = usize::BITS as usize - max_ordinal.leading_zeros() as usize;
+    let total_bits = n_group_cols + ordinal_bits;
     if total_bits <= 8 {
-        Ok(Arc::new(UInt8Array::from(vec![full_id as u8; num_rows])))
+        Arc::new(UInt8Array::from(vec![full_id as u8; num_rows]))
     } else if total_bits <= 16 {
-        Ok(Arc::new(UInt16Array::from(vec![full_id as u16; num_rows])))
+        Arc::new(UInt16Array::from(vec![full_id as u16; num_rows]))
     } else if total_bits <= 32 {
-        Ok(Arc::new(UInt32Array::from(vec![full_id as u32; num_rows])))
+        Arc::new(UInt32Array::from(vec![full_id as u32; num_rows]))
     } else {
-        Ok(Arc::new(UInt64Array::from(vec![full_id; num_rows])))
+        Arc::new(UInt64Array::from(vec![full_id; num_rows]))
     }
 }
 
@@ -2174,7 +2178,7 @@ pub fn evaluate_group_by(
     batch: &RecordBatch,
 ) -> Result<Vec<Vec<ArrayRef>>> {
     let max_ordinal = max_duplicate_ordinal(&group_by.groups);
-    let mut ordinal_per_pattern: HashMap<&[bool], usize> = HashMap::new();
+    let groups_with_ids = group_by.iter_groups_with_ids()?;
     let exprs = evaluate_expressions_to_arrays(
         group_by.expr.iter().map(|(expr, _)| expr),
         batch,
@@ -2184,14 +2188,9 @@ pub fn evaluate_group_by(
         batch,
     )?;
 
-    group_by
-        .groups
-        .iter()
-        .map(|group| {
-            let ordinal = ordinal_per_pattern.entry(group).or_insert(0);
-            let current_ordinal = *ordinal;
-            *ordinal += 1;
-
+    groups_with_ids
+        .into_iter()
+        .map(|(group, full_id)| {
             let mut group_values = Vec::with_capacity(group_by.num_group_exprs());
             group_values.extend(group.iter().enumerate().map(|(idx, is_null)| {
                 if *is_null {
@@ -2202,11 +2201,11 @@ pub fn evaluate_group_by(
             }));
             if !group_by.is_single() {
                 group_values.push(group_id_array(
-                    group,
-                    current_ordinal,
+                    full_id,
+                    group.len(),
                     max_ordinal,
-                    batch,
-                )?);
+                    batch.num_rows(),
+                ));
             }
             Ok(group_values)
         })

@@ -364,3 +364,47 @@ query TII
 SELECT c1, count(*) FILTER (WHERE c3 > 5), sum(c3) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1);
 ----
 NULL 0 NULL
+
+# Multi-partition coverage: the AVG divide-by-zero regression only surfaces in
+# multi-phase (Partial+Final) plans, so force >1 partition to exercise that path
+# even on single-row tables. Cover ROLLUP on empty input for AVG, SUM, COUNT,
+# and a mixed case where only some partial partitions feed rows to Final.
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+query TRII
+SELECT c1, AVG(c3), SUM(c3), COUNT(*) FROM test WHERE c3 < 0 GROUP BY ROLLUP(c1);
+----
+NULL NULL NULL 0
+
+query TR
+SELECT c1, AVG(c3) FROM test WHERE c3 < 0 GROUP BY CUBE(c1);
+----
+NULL NULL
+
+query IR rowsort
+SELECT v1 % 4, AVG(v1)
+FROM generate_series(1, 16) AS t(v1)
+WHERE v1 < 0
+GROUP BY ROLLUP(v1 % 4);
+----
+NULL NULL
+
+# Mixed: some partial partitions have rows, others are empty. The grand-total
+# row's partial state from the empty partitions must merge correctly with
+# real partial rows at Final without skewing the average.
+query IR rowsort
+SELECT v1 % 4, AVG(v1)
+FROM generate_series(1, 16) AS t(v1)
+WHERE v1 <= 4
+GROUP BY ROLLUP(v1 % 4);
+----
+0 4
+1 1
+2 2
+3 3
+NULL 2.5
+
+# Reset to default partition count
+statement ok
+set datafusion.execution.target_partitions = 2;

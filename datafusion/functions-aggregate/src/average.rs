@@ -838,27 +838,24 @@ where
         assert_eq!(counts.len(), sums.len());
 
         // don't evaluate averages with null inputs to avoid errors on null values
+        //
+        // Per-row check is also needed when any count is 0. count==0 with a
+        // valid null_state can occur after a Final stage merges the synthetic
+        // partial row emitted by `emit_empty_grouping_set_batch` (its count
+        // scalar is 0, not NULL, so null_state marks the group valid). Avoid
+        // dividing by zero and surface SQL NULL in either case.
+        let has_nulls = nulls.as_ref().is_some_and(|n| n.null_count() > 0);
+        let has_zero_count = counts.contains(&0);
 
-        let array: PrimitiveArray<T> = if let Some(nulls) = &nulls
-            && nulls.null_count() > 0
-        {
-            let mut builder = PrimitiveBuilder::<T>::with_capacity(nulls.len())
-                .with_data_type(self.return_data_type.clone());
-            let iter = sums.into_iter().zip(counts).zip(nulls.iter());
-
-            for ((sum, count), is_valid) in iter {
-                if is_valid && count != 0 {
-                    builder.append_value((self.avg_fn)(sum, count)?)
-                } else {
-                    builder.append_null();
-                }
-            }
-            builder.finish()
-        } else if counts.contains(&0) {
+        let array: PrimitiveArray<T> = if has_nulls || has_zero_count {
             let mut builder = PrimitiveBuilder::<T>::with_capacity(counts.len())
                 .with_data_type(self.return_data_type.clone());
-            for (sum, count) in sums.into_iter().zip(counts) {
-                if count != 0 {
+            let valid_iter: Box<dyn Iterator<Item = bool>> = match &nulls {
+                Some(n) => Box::new(n.iter()),
+                None => Box::new(std::iter::repeat(true)),
+            };
+            for ((sum, count), is_valid) in sums.into_iter().zip(counts).zip(valid_iter) {
+                if is_valid && count != 0 {
                     builder.append_value((self.avg_fn)(sum, count)?);
                 } else {
                     builder.append_null();
