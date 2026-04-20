@@ -2896,19 +2896,38 @@ mod tests {
                 (100, Inexact(1), Inexact(100), Inexact(30), Absent),
                 Some(0),
             ),
-            // RightSemi with explicit NDV
+            // RightSemi with explicit NDV (NDV within row count, used as-is):
+            // For RightSemi, sides are swapped: outer = right (20 rows, ndv=10),
+            // inner = left (50 rows, ndv=5). selectivity = min(10,5)/10 = 0.5,
+            // cardinality = ceil(20 * 0.5) = 10.
+            (
+                JoinType::RightSemi,
+                (50, Inexact(1), Inexact(100), Inexact(5), Absent),
+                (20, Inexact(1), Inexact(100), Inexact(10), Absent),
+                Some(10),
+            ),
+            // RightAnti with explicit NDV: anti = outer_rows - semi = 20 - 10 = 10.
+            (
+                JoinType::RightAnti,
+                (50, Inexact(1), Inexact(100), Inexact(5), Absent),
+                (20, Inexact(1), Inexact(100), Inexact(10), Absent),
+                Some(10),
+            ),
+            // RightSemi where right-side NDV (20) exceeds right-side row count (10):
+            // NDV is clamped to 10, so outer_ndv=10, inner_ndv=10,
+            // selectivity = min(10,10)/10 = 1.0, cardinality = ceil(10 * 1.0) = 10.
             (
                 JoinType::RightSemi,
                 (50, Inexact(1), Inexact(100), Inexact(10), Absent),
                 (10, Inexact(1), Inexact(100), Inexact(20), Absent),
-                Some(5),
+                Some(10),
             ),
-            // RightAnti with explicit NDV
+            // RightAnti with NDV clamped by row count: anti = 10 - 10 = 0.
             (
                 JoinType::RightAnti,
                 (50, Inexact(1), Inexact(100), Inexact(10), Absent),
                 (10, Inexact(1), Inexact(100), Inexact(20), Absent),
-                Some(5),
+                Some(0),
             ),
             // Empty inner table: no match possible, semi → 0
             (
