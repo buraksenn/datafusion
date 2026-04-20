@@ -556,12 +556,34 @@ impl ExprSchemable for Expr {
                     .collect::<Result<Vec<_>>>()?;
                 let new_fields = verify_function_arguments(func.as_ref(), &fields)?;
 
+                // Peel `Cast(Literal, Utf8)` style no-op string casts (e.g.
+                // `'SECOND'::string`) so UDFs can resolve literal arguments
+                // even before the optimizer runs its constant-folding pass.
+                fn unwrap_string_cast_literal(e: &Expr) -> Option<&ScalarValue> {
+                    match e {
+                        Expr::Literal(sv, _) => Some(sv),
+                        Expr::Cast(Cast { expr, field })
+                        | Expr::TryCast(TryCast { expr, field }) => {
+                            let target_is_string = matches!(
+                                field.data_type(),
+                                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+                            );
+                            if !target_is_string {
+                                return None;
+                            }
+                            match unwrap_string_cast_literal(expr)? {
+                                sv @ (ScalarValue::Utf8(_)
+                                | ScalarValue::Utf8View(_)
+                                | ScalarValue::LargeUtf8(_)) => Some(sv),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                }
                 let arguments = args
                     .iter()
-                    .map(|e| match e {
-                        Expr::Literal(sv, _) => Some(sv),
-                        _ => None,
-                    })
+                    .map(unwrap_string_cast_literal)
                     .collect::<Vec<_>>();
                 let args = ReturnFieldArgs {
                     arg_fields: &new_fields,

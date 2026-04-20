@@ -58,7 +58,7 @@ use datafusion_macros::user_doc;
 
 #[user_doc(
     doc_section(label = "Time and Date Functions"),
-    description = "Returns the specified part of the date as an integer.",
+    description = "Returns the specified part of the date as an integer, except for `second` / `millisecond` (returned as `Float64` including the fractional component, matching PostgreSQL), `nanosecond` (returned as `Int64`), and `epoch` (returned as `Float64`).",
     syntax_example = "date_part(part, expression)",
     alternative_syntax = "extract(field FROM source)",
     argument(
@@ -175,9 +175,12 @@ impl ScalarUDFImpl for DatePartFunc {
                     .flatten()
                     .filter(|s| !s.is_empty())
                     .map(|part| {
-                        if is_epoch(part) || is_second(part) || is_millisecond(part) {
+                        if is_epoch(part)
+                            || is_interval_unit(part, IntervalUnit::Second)
+                            || is_interval_unit(part, IntervalUnit::Millisecond)
+                        {
                             Field::new(self.name(), DataType::Float64, nullable)
-                        } else if is_nanosecond(part) {
+                        } else if is_interval_unit(part, IntervalUnit::Nanosecond) {
                             // See notes on [seconds_ns] for rationale
                             Field::new(self.name(), DataType::Int64, nullable)
                         } else {
@@ -331,21 +334,9 @@ fn is_epoch(part: &str) -> bool {
     matches!(part.to_lowercase().as_str(), "epoch")
 }
 
-fn is_second(part: &str) -> bool {
+fn is_interval_unit(part: &str, unit: IntervalUnit) -> bool {
     IntervalUnit::from_str(part_normalization(part))
-        .map(|p| matches!(p, IntervalUnit::Second))
-        .unwrap_or(false)
-}
-
-fn is_millisecond(part: &str) -> bool {
-    IntervalUnit::from_str(part_normalization(part))
-        .map(|p| matches!(p, IntervalUnit::Millisecond))
-        .unwrap_or(false)
-}
-
-fn is_nanosecond(part: &str) -> bool {
-    IntervalUnit::from_str(part_normalization(part))
-        .map(|p| matches!(p, IntervalUnit::Nanosecond))
+        .map(|p| std::mem::discriminant(&p) == std::mem::discriminant(&unit))
         .unwrap_or(false)
 }
 

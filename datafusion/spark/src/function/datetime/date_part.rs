@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::compute::kernels::cast_utils::IntervalUnit;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::types::logical_date;
 use datafusion_common::{
@@ -27,14 +26,7 @@ use datafusion_expr::{
     Coercion, ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl,
     Signature, TypeSignature, TypeSignatureClass, Volatility,
 };
-use std::str::FromStr;
 use std::sync::Arc;
-
-fn is_second_part(part: &str) -> bool {
-    IntervalUnit::from_str(&part.to_lowercase())
-        .map(|u| matches!(u, IntervalUnit::Second | IntervalUnit::Millisecond))
-        .unwrap_or(false)
-}
 
 /// Wrapper around datafusion date_part function to handle
 /// Spark behavior returning day of the week 1-indexed instead of 0-indexed and different part aliases.
@@ -90,9 +82,57 @@ impl ScalarUDFImpl for SparkDatePart {
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        // Match the return type that the simplified expression will produce.
+        // Spark follows PostgreSQL: `second` / `millisecond` return Float64
+        // (with fractional component), `nanosecond` returns Int64, everything
+        // else returns Int32.
         let nullable = args.arg_fields.iter().any(|f| f.is_nullable());
+        let part = args
+            .scalar_arguments
+            .first()
+            .and_then(|sv| sv.as_ref())
+            .and_then(|sv| sv.try_as_str().flatten())
+            .map(|s| s.to_lowercase());
 
-        Ok(Arc::new(Field::new(self.name(), DataType::Int32, nullable)))
+        let data_type = match part.as_deref() {
+            Some(p) => {
+                // Apply the same Spark alias mapping used in simplify.
+                let p = match p {
+                    "yearofweek" | "year_iso" => "isoyear",
+                    "dayofweek" => "dow",
+                    "dayofweek_iso" | "dow_iso" => "isodow",
+                    other => other,
+                };
+                if p == "epoch"
+                    || matches!(
+                        p,
+                        "s" | "sec"
+                            | "secs"
+                            | "second"
+                            | "seconds"
+                            | "ms"
+                            | "msec"
+                            | "msecs"
+                            | "millisecond"
+                            | "milliseconds"
+                    )
+                {
+                    DataType::Float64
+                } else if matches!(
+                    p,
+                    "ns" | "nsec" | "nsecs" | "nanosecond" | "nanoseconds"
+                ) {
+                    DataType::Int64
+                } else {
+                    DataType::Int32
+                }
+            }
+            // Part not a resolvable literal at analysis time; Int32 matches
+            // the most common date_part result.
+            None => DataType::Int32,
+        };
+
+        Ok(Arc::new(Field::new(self.name(), data_type, nullable)))
     }
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -133,12 +173,10 @@ impl ScalarUDFImpl for SparkDatePart {
         ));
 
         match part {
+            // Add 1 for day-of-week parts to convert 0-indexed to 1-indexed
             "dow" | "isodow" => Ok(ExprSimplifyResult::Simplified(
                 date_part_expr + Expr::Literal(ScalarValue::Int32(Some(1)), None),
             )),
-            p if is_second_part(p) => Ok(ExprSimplifyResult::Simplified(Expr::Cast(
-                datafusion_expr::Cast::new(Box::new(date_part_expr), DataType::Int32),
-            ))),
             _ => Ok(ExprSimplifyResult::Simplified(date_part_expr)),
         }
     }
