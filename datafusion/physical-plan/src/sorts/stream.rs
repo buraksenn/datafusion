@@ -177,15 +177,17 @@ impl RowCursorStream {
         rows.clear();
 
         self.converter.append(&mut rows, &cols)?;
-        self.reservation.try_resize(self.converter.size())?;
+        // Infallible: memory is already allocated and this stream can't spill.
+        // Pool accounting still updates, so spill-capable operators react.
+        self.reservation.resize(self.converter.size());
 
         let rows = Arc::new(rows);
 
         self.rows.save(stream_idx, &rows);
 
-        // track the memory in the newly created Rows.
+        // Track the newly created Rows. Infallible for the same reason as above.
         let rows_reservation = self.reservation.new_empty();
-        rows_reservation.try_grow(rows.size())?;
+        rows_reservation.grow(rows.size());
         Ok(RowValues::new(rows, rows_reservation))
     }
 }
@@ -250,8 +252,9 @@ impl<T: CursorArray> FieldCursorStream<T> {
         let array = value.into_array(batch.num_rows())?;
         let size_in_mem = array.get_buffer_memory_size();
         let array = array.as_any().downcast_ref::<T>().expect("field values");
+        // Infallible: array memory is already allocated, stream can't spill.
         let array_reservation = self.reservation.new_empty();
-        array_reservation.try_grow(size_in_mem)?;
+        array_reservation.grow(size_in_mem);
         Ok(ArrayValues::new(
             self.sort.options,
             array,
@@ -389,6 +392,7 @@ mod tests {
     use arrow::array::{AsArray, Int32Array};
     use arrow::datatypes::{DataType, Field, Int32Type};
     use datafusion_common::DataFusionError;
+    use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryConsumer};
     use datafusion_physical_expr::expressions::col;
 
     /// Verifies that `take_record_batch` in `IncrementalSortIterator` actually
@@ -433,6 +437,56 @@ mod tests {
         )?;
 
         assert_eq!(total_rows, original_len);
+        Ok(())
+    }
+
+    /// Regression test for <https://github.com/apache/datafusion/issues/19013>:
+    /// `convert_batch` must not fail when the pool is full, since the rows
+    /// are already allocated and this stream can't spill.
+    #[test]
+    fn row_cursor_stream_convert_batch_succeeds_under_memory_pressure() -> Result<()> {
+        let pool: Arc<dyn datafusion_execution::memory_pool::MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(1_000));
+        let competing = MemoryConsumer::new("competitor").register(&pool);
+        competing.grow(950);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![3, 1, 2]))],
+        )?;
+
+        let sort_expr = PhysicalSortExpr::new_default(col("a", &schema)?);
+        let expressions = LexOrdering::new(vec![sort_expr]).expect("non-empty ordering");
+
+        let input_stream: SendableRecordBatchStream =
+            Box::pin(crate::stream::RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::once(async move { Ok(batch) }),
+            ));
+
+        let reservation = MemoryConsumer::new("row_cursor_stream").register(&pool);
+
+        let mut stream = RowCursorStream::try_new(
+            &schema,
+            &expressions,
+            vec![input_stream],
+            reservation,
+        )?;
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let poll_result = stream.poll_next(&mut cx, 0);
+
+        match poll_result {
+            Poll::Ready(Some(Ok(_))) => {}
+            Poll::Ready(Some(Err(e))) => {
+                panic!("convert_batch should not fail under memory pressure: {e}")
+            }
+            other => panic!("unexpected poll result: {other:?}"),
+        }
+
+        drop(competing);
         Ok(())
     }
 }
