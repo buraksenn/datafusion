@@ -162,12 +162,6 @@ where
     Ok(result)
 }
 
-/// Compile `regex` with optional Postgres-style inline `flags`.
-///
-/// If `allow_global` is true, the `g` flag is silently stripped (used by
-/// functions where global matching is either implicit or meaningless, e.g.
-/// `regexp_split_to_array`). If false, the `g` flag is rejected with an
-/// error (used by `regexp_count`, `regexp_instr`).
 pub fn compile_regex(
     regex: &str,
     flags: Option<&str>,
@@ -175,23 +169,20 @@ pub fn compile_regex(
 ) -> Result<Regex, ArrowError> {
     let pattern = match flags {
         None | Some("") => regex.to_string(),
-        Some(flags) => {
-            if allow_global {
-                let filtered: String = flags.chars().filter(|&c| c != 'g').collect();
-                if filtered.is_empty() {
-                    regex.to_string()
-                } else {
-                    format!("(?{filtered}){regex}")
-                }
+        Some(flags) if allow_global => {
+            let filtered: String = flags.chars().filter(|&c| c != 'g').collect();
+            if filtered.is_empty() {
+                regex.to_string()
             } else {
-                if flags.contains('g') {
-                    return Err(ArrowError::ComputeError(
-                        "The global flag is not supported for this function".to_string(),
-                    ));
-                }
-                format!("(?{flags}){regex}")
+                format!("(?{filtered}){regex}")
             }
         }
+        Some(flags) if flags.contains('g') => {
+            return Err(ArrowError::ComputeError(
+                "The global flag is not supported for this function".to_string(),
+            ));
+        }
+        Some(flags) => format!("(?{flags}){regex}"),
     };
 
     Regex::new(&pattern).map_err(|_| {

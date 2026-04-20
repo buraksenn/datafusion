@@ -265,6 +265,10 @@ fn split_and_append<B: StringListBuilder>(
     list_builder.append(true);
 }
 
+// Special-case for an empty pattern so the result matches PostgreSQL's
+// `regexp_split_to_array('abc', '') = {a,b,c}`. Rust's `Regex::new("").split("abc")`
+// matches every zero-width boundary and yields `["", "a", "b", "c", ""]` — which
+// would surface as extra leading/trailing empty strings.
 fn split_chars_and_append<B: StringListBuilder>(
     list_builder: &mut ListBuilder<B>,
     value: &str,
