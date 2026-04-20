@@ -398,7 +398,7 @@ where
         Some("") => return Ok(Some(0)),
         Some(value) => value,
     };
-    let pattern: &Regex = compile_and_cache_regex(pattern, flags, regex_cache)?;
+    let pattern: &Regex = compile_and_cache_regex(pattern, flags, false, regex_cache)?;
     // println!("get_index: value = {}, pattern = {}, start = {}, n = {}, subexpr = {}, flags = {:?}", value, pattern, start, n, subexpr, flags);
     if start < 1 {
         return Err(ArrowError::ComputeError(

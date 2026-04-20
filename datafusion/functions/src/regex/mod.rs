@@ -27,6 +27,7 @@ pub mod regexpinstr;
 pub mod regexplike;
 pub mod regexpmatch;
 pub mod regexpreplace;
+pub mod regexpsplittoarray;
 
 // create UDFs
 make_udf_function!(regexpcount::RegexpCountFunc, regexp_count);
@@ -34,6 +35,10 @@ make_udf_function!(regexpinstr::RegexpInstrFunc, regexp_instr);
 make_udf_function!(regexpmatch::RegexpMatchFunc, regexp_match);
 make_udf_function!(regexplike::RegexpLikeFunc, regexp_like);
 make_udf_function!(regexpreplace::RegexpReplaceFunc, regexp_replace);
+make_udf_function!(
+    regexpsplittoarray::RegexpSplitToArrayFunc,
+    regexp_split_to_array
+);
 
 pub mod expr_fn {
     use datafusion_expr::Expr;
@@ -115,6 +120,15 @@ pub mod expr_fn {
         };
         super::regexp_replace().call(args)
     }
+
+    /// Splits a string by a regular expression pattern and returns a text array.
+    pub fn regexp_split_to_array(values: Expr, regex: Expr, flags: Option<Expr>) -> Expr {
+        let mut args = vec![values, regex];
+        if let Some(flags) = flags {
+            args.push(flags);
+        };
+        super::regexp_split_to_array().call(args)
+    }
 }
 
 /// Returns all DataFusion functions defined in this package
@@ -125,12 +139,14 @@ pub fn functions() -> Vec<Arc<datafusion_expr::ScalarUDF>> {
         regexp_instr(),
         regexp_like(),
         regexp_replace(),
+        regexp_split_to_array(),
     ]
 }
 
 pub fn compile_and_cache_regex<'strings, 'cache>(
     regex: &'strings str,
     flags: Option<&'strings str>,
+    allow_global: bool,
     regex_cache: &'cache mut HashMap<(&'strings str, Option<&'strings str>), Regex>,
 ) -> Result<&'cache Regex, ArrowError>
 where
@@ -139,24 +155,42 @@ where
     let result = match regex_cache.entry((regex, flags)) {
         Entry::Occupied(occupied_entry) => occupied_entry.into_mut(),
         Entry::Vacant(vacant_entry) => {
-            let compiled = compile_regex(regex, flags)?;
+            let compiled = compile_regex(regex, flags, allow_global)?;
             vacant_entry.insert(compiled)
         }
     };
     Ok(result)
 }
 
-pub fn compile_regex(regex: &str, flags: Option<&str>) -> Result<Regex, ArrowError> {
+/// Compile `regex` with optional Postgres-style inline `flags`.
+///
+/// If `allow_global` is true, the `g` flag is silently stripped (used by
+/// functions where global matching is either implicit or meaningless, e.g.
+/// `regexp_split_to_array`). If false, the `g` flag is rejected with an
+/// error (used by `regexp_count`, `regexp_instr`).
+pub fn compile_regex(
+    regex: &str,
+    flags: Option<&str>,
+    allow_global: bool,
+) -> Result<Regex, ArrowError> {
     let pattern = match flags {
         None | Some("") => regex.to_string(),
         Some(flags) => {
-            if flags.contains("g") {
-                return Err(ArrowError::ComputeError(
-                    "regexp_count()/regexp_instr() does not support the global flag"
-                        .to_string(),
-                ));
+            if allow_global {
+                let filtered: String = flags.chars().filter(|&c| c != 'g').collect();
+                if filtered.is_empty() {
+                    regex.to_string()
+                } else {
+                    format!("(?{filtered}){regex}")
+                }
+            } else {
+                if flags.contains('g') {
+                    return Err(ArrowError::ComputeError(
+                        "The global flag is not supported for this function".to_string(),
+                    ));
+                }
+                format!("(?{flags}){regex}")
             }
-            format!("(?{flags}){regex}")
         }
     };
 

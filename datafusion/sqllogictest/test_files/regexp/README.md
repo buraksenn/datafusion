@@ -25,19 +25,23 @@ This directory contains test files for regular expression (regexp) functions in 
 
 ```
 regexp/
-    - init_data.slt.part      // Shared test data for regexp functions
-    - regexp_like.slt         // Tests for regexp_like function
-    - regexp_count.slt        // Tests for regexp_count function
-    - regexp_match.slt        // Tests for regexp_match function
-    - regexp_replace.slt      // Tests for regexp_replace function
+    - init_data.slt.part              // Shared test data for regexp functions
+    - regexp_like.slt                 // Tests for regexp_like function
+    - regexp_count.slt                // Tests for regexp_count function
+    - regexp_instr.slt                // Tests for regexp_instr function
+    - regexp_match.slt                // Tests for regexp_match function
+    - regexp_replace.slt              // Tests for regexp_replace function
+    - regexp_split_to_array.slt       // Tests for regexp_split_to_array function
 ```
 
 ## Tested Functions
 
 1. `regexp_like`: Check if a string matches a regular expression
 2. `regexp_count`: Count occurrences of a pattern in a string
-3. `regexp_match`: Extract matching substrings
-4. `regexp_replace`: Replace matched substrings
+3. `regexp_instr`: Find position of a pattern in a string
+4. `regexp_match`: Extract matching substrings
+5. `regexp_replace`: Replace matched substrings
+6. `regexp_split_to_array`: Split a string by a pattern into an array
 
 ## Test Data
 

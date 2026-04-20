@@ -306,7 +306,7 @@ where
                 Some(regex) => regex,
             };
 
-            let pattern = compile_regex(regex, flags_scalar)?;
+            let pattern = compile_regex(regex, flags_scalar, false)?;
 
             Ok(Arc::new(
                 values
@@ -337,8 +337,12 @@ where
                     .iter()
                     .zip(flags_array.iter())
                     .map(|(value, flags)| {
-                        let pattern =
-                            compile_and_cache_regex(regex, flags, &mut regex_cache)?;
+                        let pattern = compile_and_cache_regex(
+                            regex,
+                            flags,
+                            false,
+                            &mut regex_cache,
+                        )?;
                         count_matches(value, pattern, start_scalar)
                     })
                     .collect::<Result<Int64Array, ArrowError>>()?,
@@ -352,7 +356,7 @@ where
                 Some(regex) => regex,
             };
 
-            let pattern = compile_regex(regex, flags_scalar)?;
+            let pattern = compile_regex(regex, flags_scalar, false)?;
 
             let start_array = start_array.unwrap();
 
@@ -389,7 +393,7 @@ where
                 )
                 .map(|(value, start, flags)| {
                     let pattern =
-                        compile_and_cache_regex(regex, flags, &mut regex_cache)?;
+                        compile_and_cache_regex(regex, flags, false, &mut regex_cache)?;
 
                     count_matches(value, pattern, start)
                 })
@@ -418,6 +422,7 @@ where
                         let pattern = compile_and_cache_regex(
                             regex,
                             flags_scalar,
+                            false,
                             &mut regex_cache,
                         )?;
                         count_matches(value, pattern, start_scalar)
@@ -451,8 +456,12 @@ where
                             Some(regex) => regex,
                         };
 
-                        let pattern =
-                            compile_and_cache_regex(regex, flags, &mut regex_cache)?;
+                        let pattern = compile_and_cache_regex(
+                            regex,
+                            flags,
+                            false,
+                            &mut regex_cache,
+                        )?;
 
                         count_matches(value, pattern, start_scalar)
                     })
@@ -488,6 +497,7 @@ where
                         let pattern = compile_and_cache_regex(
                             regex,
                             flags_scalar,
+                            false,
                             &mut regex_cache,
                         )?;
                         count_matches(value, pattern, start)
@@ -536,7 +546,7 @@ where
                     };
 
                     let pattern =
-                        compile_and_cache_regex(regex, flags, &mut regex_cache)?;
+                        compile_and_cache_regex(regex, flags, false, &mut regex_cache)?;
                     count_matches(value, pattern, start)
                 })
                 .collect::<Result<Int64Array, ArrowError>>()?,

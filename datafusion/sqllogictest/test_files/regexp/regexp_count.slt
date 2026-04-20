@@ -60,7 +60,7 @@ External error: query failed: DataFusion error: Arrow error: Compute error: rege
 SELECT regexp_count('123123123123', '123', -3);
 
 statement error
-External error: statement failed: DataFusion error: Arrow error: Compute error: regexp_count() does not support global flag
+External error: statement failed: DataFusion error: Arrow error: Compute error: The global flag is not supported for this function
 SELECT regexp_count('123123123123', '123', 1, 'g');
 
 query I
