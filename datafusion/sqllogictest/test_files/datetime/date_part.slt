@@ -181,7 +181,7 @@ SELECT date_part('second', ts_nano_no_tz), date_part('second', ts_nano_utc), dat
 0.123456789 0.123456789 0.123456789 0.123 0.123 0.123
 
 # date_part (millisecond)
-query IIIIII
+query RRRRRR
 SELECT date_part('millisecond', ts_nano_no_tz), date_part('millisecond', ts_nano_utc), date_part('millisecond', ts_nano_eastern), date_part('millisecond', ts_milli_no_tz), date_part('millisecond', ts_milli_utc), date_part('millisecond', ts_milli_eastern)  FROM source_ts;
 ----
 0 0 0 0 0 0
@@ -193,8 +193,8 @@ SELECT date_part('millisecond', ts_nano_no_tz), date_part('millisecond', ts_nano
 0 0 0 0 0 0
 30000 30000 30000 30000 30000 30000
 123 123 123 123 123 123
-123 123 123 123 123 123
-123 123 123 123 123 123
+123.456 123.456 123.456 123 123 123
+123.456789 123.456789 123.456789 123 123 123
 
 # date_part (microsecond)
 query IIIIII
@@ -460,10 +460,10 @@ SELECT EXTRACT(second FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
 ----
 12.12345678
 
-query I
+query R
 SELECT EXTRACT(millisecond FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
 ----
-12123
+12123.45678
 
 query I
 SELECT EXTRACT(microsecond FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
@@ -481,10 +481,10 @@ SELECT EXTRACT("second" FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
 ----
 12.12345678
 
-query I
+query R
 SELECT EXTRACT("millisecond" FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
 ----
-12123
+12123.45678
 
 query I
 SELECT EXTRACT("microsecond" FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
@@ -501,10 +501,10 @@ SELECT EXTRACT('second' FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
 ----
 12.12345678
 
-query I
+query R
 SELECT EXTRACT('millisecond' FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
 ----
-12123
+12123.45678
 
 query I
 SELECT EXTRACT('microsecond' FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
@@ -522,10 +522,10 @@ SELECT date_part('second', timestamp '2020-09-08T12:00:12.12345678+00:00')
 ----
 12.12345678
 
-query I
+query R
 SELECT date_part('millisecond', timestamp '2020-09-08T12:00:12.12345678+00:00')
 ----
-12123
+12123.45678
 
 query I
 SELECT date_part('microsecond', timestamp '2020-09-08T12:00:12.12345678+00:00')
@@ -542,10 +542,10 @@ SELECT date_part('second', '2020-09-08T12:00:12.12345678+00:00')
 ----
 12.12345678
 
-query I
+query R
 SELECT date_part('millisecond', '2020-09-08T12:00:12.12345678+00:00')
 ----
-12123
+12123.45678
 
 query I
 SELECT date_part('microsecond', '2020-09-08T12:00:12.12345678+00:00')
@@ -632,12 +632,12 @@ SELECT extract(second from arrow_cast('23:32:50'::time, 'Time32(Second)'))
 ----
 50
 
-query I
+query R
 SELECT date_part('millisecond', arrow_cast('23:32:50'::time, 'Time32(Second)'))
 ----
 50000
 
-query I
+query R
 SELECT extract(millisecond from arrow_cast('23:32:50'::time, 'Time32(Second)'))
 ----
 50000
@@ -698,12 +698,12 @@ SELECT extract(second from arrow_cast('23:32:50.123'::time, 'Time32(Millisecond)
 ----
 50.123
 
-query I
+query R
 SELECT date_part('millisecond', arrow_cast('23:32:50.123'::time, 'Time32(Millisecond)'))
 ----
 50123
 
-query I
+query R
 SELECT extract(millisecond from arrow_cast('23:32:50.123'::time, 'Time32(Millisecond)'))
 ----
 50123
@@ -764,15 +764,15 @@ SELECT extract(second from arrow_cast('23:32:50.123456'::time, 'Time64(Microseco
 ----
 50.123456
 
-query I
+query R
 SELECT date_part('millisecond', arrow_cast('23:32:50.123456'::time, 'Time64(Microsecond)'))
 ----
-50123
+50123.456
 
-query I
+query R
 SELECT extract(millisecond from arrow_cast('23:32:50.123456'::time, 'Time64(Microsecond)'))
 ----
-50123
+50123.456
 
 query I
 SELECT date_part('microsecond', arrow_cast('23:32:50.123456'::time, 'Time64(Microsecond)'))
@@ -850,15 +850,15 @@ SELECT extract(second from arrow_cast('23:32:50.123456789'::time, 'Time64(Nanose
 ----
 50.123456789
 
-query I
+query R
 SELECT date_part('millisecond', arrow_cast('23:32:50.123456789'::time, 'Time64(Nanosecond)'))
 ----
-50123
+50123.456789
 
-query I
+query R
 SELECT extract(millisecond from arrow_cast('23:32:50.123456789'::time, 'Time64(Nanosecond)'))
 ----
-50123
+50123.456789
 
 # just some floating point stuff happening in the result here
 query I
@@ -1047,7 +1047,7 @@ SELECT extract(epoch from arrow_cast('2 seconds', 'Interval(MonthDayNano)'))
 ----
 2
 
-query I
+query R
 SELECT extract(milliseconds from arrow_cast('2 seconds', 'Interval(MonthDayNano)'))
 ----
 2000
@@ -1157,7 +1157,7 @@ SELECT extract(epoch from arrow_cast(2, 'Duration(Second)'))
 ----
 2
 
-query I
+query R
 SELECT extract(millisecond from arrow_cast(2, 'Duration(Second)'))
 ----
 2000
@@ -1172,7 +1172,7 @@ SELECT extract(second from arrow_cast(2002, 'Duration(Millisecond)'))
 ----
 2.002
 
-query I
+query R
 SELECT extract(millisecond from arrow_cast(2002, 'Duration(Millisecond)'))
 ----
 2002
@@ -1559,7 +1559,7 @@ query TT
 explain select c from t1 where extract (millisecond from c) = 2024
 ----
 logical_plan
-01)Filter: date_part(Utf8("MILLISECOND"), t1.c) = Int32(2024)
+01)Filter: date_part(Utf8("MILLISECOND"), t1.c) = Float64(2024)
 02)--TableScan: t1 projection=[c]
 physical_plan
 01)FilterExec: date_part(MILLISECOND, c@0) = 2024

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 fn is_second_part(part: &str) -> bool {
     IntervalUnit::from_str(&part.to_lowercase())
-        .map(|u| matches!(u, IntervalUnit::Second))
+        .map(|u| matches!(u, IntervalUnit::Second | IntervalUnit::Millisecond))
         .unwrap_or(false)
 }
 

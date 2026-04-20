@@ -175,7 +175,7 @@ impl ScalarUDFImpl for DatePartFunc {
                     .flatten()
                     .filter(|s| !s.is_empty())
                     .map(|part| {
-                        if is_epoch(part) || is_second(part) {
+                        if is_epoch(part) || is_second(part) || is_millisecond(part) {
                             Field::new(self.name(), DataType::Float64, nullable)
                         } else if is_nanosecond(part) {
                             // See notes on [seconds_ns] for rationale
@@ -226,7 +226,7 @@ impl ScalarUDFImpl for DatePartFunc {
                 IntervalUnit::Hour => date_part(array.as_ref(), DatePart::Hour)?,
                 IntervalUnit::Minute => date_part(array.as_ref(), DatePart::Minute)?,
                 IntervalUnit::Second => seconds(array.as_ref(), Second)?,
-                IntervalUnit::Millisecond => seconds_as_i32(array.as_ref(), Millisecond)?,
+                IntervalUnit::Millisecond => seconds(array.as_ref(), Millisecond)?,
                 IntervalUnit::Microsecond => seconds_as_i32(array.as_ref(), Microsecond)?,
                 IntervalUnit::Nanosecond => seconds_ns(array.as_ref())?,
                 // century and decade are not supported by `DatePart`, although they are supported in postgres
@@ -334,6 +334,12 @@ fn is_epoch(part: &str) -> bool {
 fn is_second(part: &str) -> bool {
     IntervalUnit::from_str(part_normalization(part))
         .map(|p| matches!(p, IntervalUnit::Second))
+        .unwrap_or(false)
+}
+
+fn is_millisecond(part: &str) -> bool {
+    IntervalUnit::from_str(part_normalization(part))
+        .map(|p| matches!(p, IntervalUnit::Millisecond))
         .unwrap_or(false)
 }
 
