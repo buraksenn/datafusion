@@ -68,6 +68,15 @@ SELECT regexp_split_to_array('abc', '');
 ----
 [a, b, c]
 
+# A *non-empty* pattern that matches the empty string (e.g. `x*` when the input
+# has no `x`) is NOT collapsed like the literal empty pattern above: Rust's regex
+# split emits leading/trailing empty strings at each zero-width match. This differs
+# from PostgreSQL, which would return {a, b, c}.
+query ?
+SELECT regexp_split_to_array('abc', 'x*');
+----
+[, a, b, c, ]
+
 # pattern at start and end produces empty strings
 query ?
 SELECT regexp_split_to_array(',a,,b,', ',');
