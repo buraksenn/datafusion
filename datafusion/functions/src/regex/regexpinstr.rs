@@ -34,7 +34,7 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::regex::compile_and_cache_regex;
+use crate::regex::{GlobalFlag, compile_and_cache_regex};
 
 #[user_doc(
     doc_section(label = "Regular Expression Functions"),
@@ -398,7 +398,8 @@ where
         Some("") => return Ok(Some(0)),
         Some(value) => value,
     };
-    let pattern: &Regex = compile_and_cache_regex(pattern, flags, false, regex_cache)?;
+    let pattern: &Regex =
+        compile_and_cache_regex(pattern, flags, GlobalFlag::Reject, regex_cache)?;
     // println!("get_index: value = {}, pattern = {}, start = {}, n = {}, subexpr = {}, flags = {:?}", value, pattern, start, n, subexpr, flags);
     if start < 1 {
         return Err(ArrowError::ComputeError(

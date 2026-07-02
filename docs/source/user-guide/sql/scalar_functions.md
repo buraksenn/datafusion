@@ -2388,7 +2388,7 @@ Additional examples can be found [here](https://github.com/apache/datafusion/blo
 
 ### `regexp_split_to_array`
 
-Splits a string by a [regular expression](https://docs.rs/regex/latest/regex/#syntax) pattern and returns a text array of the splits.
+Splits a string by a [regular expression](https://docs.rs/regex/latest/regex/#syntax) pattern and returns a text array of the splits. An empty pattern splits the string into individual characters.
 
 ```sql
 regexp_split_to_array(str, regexp[, flags])

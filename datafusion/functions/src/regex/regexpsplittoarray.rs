@@ -33,11 +33,11 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::regex::{compile_and_cache_regex, compile_regex};
+use crate::regex::{GlobalFlag, compile_and_cache_regex};
 
 #[user_doc(
     doc_section(label = "Regular Expression Functions"),
-    description = "Splits a string by a [regular expression](https://docs.rs/regex/latest/regex/#syntax) pattern and returns a text array of the splits.",
+    description = "Splits a string by a [regular expression](https://docs.rs/regex/latest/regex/#syntax) pattern and returns a text array of the splits. An empty pattern splits the string into individual characters.",
     syntax_example = "regexp_split_to_array(str, regexp[, flags])",
     sql_example = r#"```sql
 > select regexp_split_to_array('hello world', '\s+');
@@ -57,8 +57,7 @@ use crate::regex::{compile_and_cache_regex, compile_regex};
     standard_argument(name = "str", prefix = "String"),
     argument(
         name = "regexp",
-        description = "Regular expression to split by.
-            Can be a constant, column, or function."
+        description = "Regular expression to split by. Can be a constant, column, or function."
     ),
     argument(
         name = "flags",
@@ -294,127 +293,47 @@ where
     let is_regex_scalar = regex_array.len() == 1;
     let is_flags_scalar = flags_array.is_none_or(|f| f.len() == 1);
 
-    let regex_is_null_scalar = is_regex_scalar && regex_array.is_null(0);
-
-    let regex_scalar = if is_regex_scalar && !regex_array.is_null(0) {
-        Some(regex_array.value(0))
-    } else {
-        None
-    };
-
-    let flags_scalar = match flags_array {
-        Some(fa) if is_flags_scalar && !fa.is_null(0) => Some(fa.value(0)),
-        _ => None,
-    };
-
     let mut list_builder = ListBuilder::new(B::new_builder());
 
-    if regex_is_null_scalar {
+    // A NULL scalar pattern makes every output row NULL.
+    if is_regex_scalar && regex_array.is_null(0) {
         for _ in 0..values.len() {
             list_builder.append(false);
         }
         return Ok(Arc::new(list_builder.finish()));
     }
 
-    match (is_regex_scalar, is_flags_scalar) {
-        (true, true) => {
-            let regex_str = regex_scalar.unwrap();
-            if regex_str.is_empty() {
-                for i in 0..values.len() {
-                    if values.is_null(i) {
-                        list_builder.append(false);
-                    } else {
-                        split_chars_and_append(&mut list_builder, values.value(i));
-                    }
-                }
-            } else {
-                let pattern = compile_regex(regex_str, flags_scalar, true)?;
-                for i in 0..values.len() {
-                    if values.is_null(i) {
-                        list_builder.append(false);
-                    } else {
-                        split_and_append(&mut list_builder, values.value(i), &pattern);
-                    }
-                }
-            }
+    // Resolve the pattern (and flags) per row: a scalar argument broadcasts from
+    // index 0, otherwise each row uses its own index. The cache compiles each
+    // distinct (pattern, flags) pair once — including the single scalar pattern.
+    let mut regex_cache = HashMap::new();
+    for i in 0..values.len() {
+        let regex_idx = if is_regex_scalar { 0 } else { i };
+        if values.is_null(i) || regex_array.is_null(regex_idx) {
+            list_builder.append(false);
+            continue;
         }
-        (true, false) => {
-            let regex_str = regex_scalar.unwrap();
-            let flags_array = flags_array.unwrap();
-            if regex_str.is_empty() {
-                for i in 0..values.len() {
-                    if values.is_null(i) {
-                        list_builder.append(false);
-                    } else {
-                        split_chars_and_append(&mut list_builder, values.value(i));
-                    }
-                }
-            } else {
-                let mut regex_cache = HashMap::new();
-                for i in 0..values.len() {
-                    if values.is_null(i) {
-                        list_builder.append(false);
-                    } else {
-                        let flags = if flags_array.is_null(i) {
-                            None
-                        } else {
-                            Some(flags_array.value(i))
-                        };
-                        let pattern = compile_and_cache_regex(
-                            regex_str,
-                            flags,
-                            true,
-                            &mut regex_cache,
-                        )?;
-                        split_and_append(&mut list_builder, values.value(i), pattern);
-                    }
-                }
-            }
+
+        let value = values.value(i);
+        let regex_str = regex_array.value(regex_idx);
+        if regex_str.is_empty() {
+            // Match PostgreSQL: an empty pattern splits into characters.
+            split_chars_and_append(&mut list_builder, value);
+            continue;
         }
-        (false, true) => {
-            let mut regex_cache = HashMap::new();
-            for i in 0..values.len() {
-                if values.is_null(i) || regex_array.is_null(i) {
-                    list_builder.append(false);
-                } else if regex_array.value(i).is_empty() {
-                    split_chars_and_append(&mut list_builder, values.value(i));
-                } else {
-                    let regex_str = regex_array.value(i);
-                    let pattern = compile_and_cache_regex(
-                        regex_str,
-                        flags_scalar,
-                        true,
-                        &mut regex_cache,
-                    )?;
-                    split_and_append(&mut list_builder, values.value(i), pattern);
-                }
-            }
-        }
-        (false, false) => {
-            let flags_array = flags_array.unwrap();
-            let mut regex_cache = HashMap::new();
-            for i in 0..values.len() {
-                if values.is_null(i) || regex_array.is_null(i) {
-                    list_builder.append(false);
-                } else if regex_array.value(i).is_empty() {
-                    split_chars_and_append(&mut list_builder, values.value(i));
-                } else {
-                    let regex_str = regex_array.value(i);
-                    let flags = if flags_array.is_null(i) {
-                        None
-                    } else {
-                        Some(flags_array.value(i))
-                    };
-                    let pattern = compile_and_cache_regex(
-                        regex_str,
-                        flags,
-                        true,
-                        &mut regex_cache,
-                    )?;
-                    split_and_append(&mut list_builder, values.value(i), pattern);
-                }
-            }
-        }
+
+        let flags = flags_array.and_then(|fa| {
+            let idx = if is_flags_scalar { 0 } else { i };
+            (!fa.is_null(idx)).then(|| fa.value(idx))
+        });
+
+        let pattern = compile_and_cache_regex(
+            regex_str,
+            flags,
+            GlobalFlag::Ignore,
+            &mut regex_cache,
+        )?;
+        split_and_append(&mut list_builder, value, pattern);
     }
 
     Ok(Arc::new(list_builder.finish()))
@@ -455,25 +374,31 @@ mod tests {
         })
     }
 
+    /// Collect row `row` of a `ListArray` of strings into a `Vec<String>`,
+    /// handling Utf8 / LargeUtf8 / Utf8View element types.
+    fn list_row_to_vec(list_arr: &ListArray, row: usize) -> Vec<String> {
+        let values = list_arr.value(row);
+        match values.data_type() {
+            Utf8View => {
+                let a = values.as_string_view();
+                (0..a.len()).map(|i| a.value(i).to_string()).collect()
+            }
+            LargeUtf8 => {
+                let a = values.as_string::<i64>();
+                (0..a.len()).map(|i| a.value(i).to_string()).collect()
+            }
+            _ => {
+                let a = values.as_string::<i32>();
+                (0..a.len()).map(|i| a.value(i).to_string()).collect()
+            }
+        }
+    }
+
     fn result_to_string_vec(result: &ColumnarValue) -> Vec<String> {
         match result {
             ColumnarValue::Scalar(ScalarValue::List(arr)) => {
                 let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
-                let values = list_arr.value(0);
-                match values.data_type() {
-                    Utf8View => {
-                        let str_arr = values.as_string_view();
-                        (0..str_arr.len())
-                            .map(|i| str_arr.value(i).to_string())
-                            .collect()
-                    }
-                    _ => {
-                        let str_arr = values.as_string::<i32>();
-                        (0..str_arr.len())
-                            .map(|i| str_arr.value(i).to_string())
-                            .collect()
-                    }
-                }
+                list_row_to_vec(list_arr, 0)
             }
             _ => panic!("Expected scalar list result"),
         }
@@ -634,26 +559,9 @@ mod tests {
 
         let list_arr = result.as_any().downcast_ref::<ListArray>().unwrap();
 
-        let row0 = list_arr.value(0);
-        let arr0 = row0.as_string::<i32>();
-        assert_eq!(
-            (0..arr0.len()).map(|i| arr0.value(i)).collect::<Vec<_>>(),
-            vec!["hello", "world"]
-        );
-
-        let row1 = list_arr.value(1);
-        let arr1 = row1.as_string::<i32>();
-        assert_eq!(
-            (0..arr1.len()).map(|i| arr1.value(i)).collect::<Vec<_>>(),
-            vec!["foo", "bar", "baz"]
-        );
-
-        let row2 = list_arr.value(2);
-        let arr2 = row2.as_string::<i32>();
-        assert_eq!(
-            (0..arr2.len()).map(|i| arr2.value(i)).collect::<Vec<_>>(),
-            vec!["a", "c"]
-        );
+        assert_eq!(list_row_to_vec(list_arr, 0), vec!["hello", "world"]);
+        assert_eq!(list_row_to_vec(list_arr, 1), vec!["foo", "bar", "baz"]);
+        assert_eq!(list_row_to_vec(list_arr, 2), vec!["a", "c"]);
     }
 
     #[test]
@@ -671,19 +579,8 @@ mod tests {
 
         let list_arr = result.as_any().downcast_ref::<ListArray>().unwrap();
 
-        let row0 = list_arr.value(0);
-        let arr0 = row0.as_string::<i32>();
-        assert_eq!(
-            (0..arr0.len()).map(|i| arr0.value(i)).collect::<Vec<_>>(),
-            vec!["He", "", "o Wor", "d"]
-        );
-
-        let row1 = list_arr.value(1);
-        let arr1 = row1.as_string::<i32>();
-        assert_eq!(
-            (0..arr1.len()).map(|i| arr1.value(i)).collect::<Vec<_>>(),
-            vec!["F", "", ""]
-        );
+        assert_eq!(list_row_to_vec(list_arr, 0), vec!["He", "", "o Wor", "d"]);
+        assert_eq!(list_row_to_vec(list_arr, 1), vec!["F", "", ""]);
     }
 
     #[test]
@@ -698,11 +595,7 @@ mod tests {
 
         let row0 = list_arr.value(0);
         assert_eq!(*row0.data_type(), Utf8View);
-        let arr0 = row0.as_string_view();
-        assert_eq!(
-            (0..arr0.len()).map(|i| arr0.value(i)).collect::<Vec<_>>(),
-            vec!["hello", "world"]
-        );
+        assert_eq!(list_row_to_vec(list_arr, 0), vec!["hello", "world"]);
     }
 
     #[test]
@@ -729,18 +622,8 @@ mod tests {
 
         let row0 = list_arr.value(0);
         assert_eq!(*row0.data_type(), LargeUtf8);
-        let arr0 = row0.as_string::<i64>();
-        assert_eq!(
-            (0..arr0.len()).map(|i| arr0.value(i)).collect::<Vec<_>>(),
-            vec!["hello", "world"]
-        );
-
-        let row2 = list_arr.value(2);
-        let arr2 = row2.as_string::<i64>();
-        assert_eq!(
-            (0..arr2.len()).map(|i| arr2.value(i)).collect::<Vec<_>>(),
-            vec!["a", "c"]
-        );
+        assert_eq!(list_row_to_vec(list_arr, 0), vec!["hello", "world"]);
+        assert_eq!(list_row_to_vec(list_arr, 2), vec!["a", "c"]);
     }
 
     #[test]
@@ -759,12 +642,7 @@ mod tests {
         assert!(list_arr.is_null(2));
         assert!(!list_arr.is_null(3));
 
-        let row3 = list_arr.value(3);
-        let arr3 = row3.as_string::<i32>();
-        assert_eq!(
-            (0..arr3.len()).map(|i| arr3.value(i)).collect::<Vec<_>>(),
-            vec!["a", "c"]
-        );
+        assert_eq!(list_row_to_vec(list_arr, 3), vec!["a", "c"]);
     }
 
     #[test]
@@ -791,25 +669,35 @@ mod tests {
             regexp_split_to_array_func(&[Arc::new(values), Arc::new(patterns)]).unwrap();
         let list_arr = result.as_any().downcast_ref::<ListArray>().unwrap();
 
-        let row0 = list_arr.value(0);
-        let arr0 = row0.as_string::<i32>();
-        assert_eq!(
-            (0..arr0.len()).map(|i| arr0.value(i)).collect::<Vec<_>>(),
-            vec!["a", "b;c"]
-        );
+        assert_eq!(list_row_to_vec(list_arr, 0), vec!["a", "b;c"]);
+        assert_eq!(list_row_to_vec(list_arr, 1), vec!["a,b", "c"]);
+        assert_eq!(list_row_to_vec(list_arr, 2), vec!["a,", ";c"]);
+    }
 
-        let row1 = list_arr.value(1);
-        let arr1 = row1.as_string::<i32>();
-        assert_eq!(
-            (0..arr1.len()).map(|i| arr1.value(i)).collect::<Vec<_>>(),
-            vec!["a,b", "c"]
-        );
+    #[test]
+    fn test_empty_pattern_in_column_splits_chars() {
+        // Per-row patterns, one of which is empty => char split for that row only.
+        let values: GenericStringArray<i32> = vec!["ab", "xy"].into();
+        let patterns: GenericStringArray<i32> = vec!["", "y"].into();
+        let result =
+            regexp_split_to_array_func(&[Arc::new(values), Arc::new(patterns)]).unwrap();
+        let list_arr = result.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list_row_to_vec(list_arr, 0), vec!["a", "b"]);
+        assert_eq!(list_row_to_vec(list_arr, 1), vec!["x", ""]);
+    }
 
-        let row2 = list_arr.value(2);
-        let arr2 = row2.as_string::<i32>();
-        assert_eq!(
-            (0..arr2.len()).map(|i| arr2.value(i)).collect::<Vec<_>>(),
-            vec!["a,", ";c"]
-        );
+    #[test]
+    fn test_zero_width_pattern_matches_are_not_collapsed() {
+        // A non-empty pattern that matches the empty string (e.g. `x*` when the
+        // input has no `x`) is NOT special-cased like the literal empty pattern:
+        // Rust's `Regex::split` yields leading/trailing empty strings at every
+        // zero-width match. This pins the current behavior, which differs from
+        // PostgreSQL (where such splits collapse to {a,b,c}).
+        let result = invoke_with_scalars(&[
+            ScalarValue::Utf8(Some("abc".to_string())),
+            ScalarValue::Utf8(Some("x*".to_string())),
+        ])
+        .unwrap();
+        assert_eq!(result_to_string_vec(&result), vec!["", "a", "b", "c", ""]);
     }
 }

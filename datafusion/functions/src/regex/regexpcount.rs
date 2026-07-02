@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::regex::{compile_and_cache_regex, compile_regex};
+use crate::regex::{GlobalFlag, compile_and_cache_regex, compile_regex};
 use arrow::array::{Array, ArrayRef, AsArray, Datum, Int64Array, StringArrayType};
 use arrow::datatypes::{DataType, Int64Type};
 use arrow::datatypes::{
@@ -309,7 +309,7 @@ where
                 Some(regex) => regex,
             };
 
-            let pattern = compile_regex(regex, flags_scalar, false)?;
+            let pattern = compile_regex(regex, flags_scalar, GlobalFlag::Reject)?;
 
             Ok(Arc::new(
                 values
@@ -343,7 +343,7 @@ where
                         let pattern = compile_and_cache_regex(
                             regex,
                             flags,
-                            false,
+                            GlobalFlag::Reject,
                             &mut regex_cache,
                         )?;
                         count_matches(value, pattern, start_scalar)
@@ -359,7 +359,7 @@ where
                 Some(regex) => regex,
             };
 
-            let pattern = compile_regex(regex, flags_scalar, false)?;
+            let pattern = compile_regex(regex, flags_scalar, GlobalFlag::Reject)?;
 
             let start_array = start_array.unwrap();
 
@@ -395,8 +395,12 @@ where
                     flags_array.iter()
                 )
                 .map(|(value, start, flags)| {
-                    let pattern =
-                        compile_and_cache_regex(regex, flags, false, &mut regex_cache)?;
+                    let pattern = compile_and_cache_regex(
+                        regex,
+                        flags,
+                        GlobalFlag::Reject,
+                        &mut regex_cache,
+                    )?;
 
                     count_matches(value, pattern, start)
                 })
@@ -425,7 +429,7 @@ where
                         let pattern = compile_and_cache_regex(
                             regex,
                             flags_scalar,
-                            false,
+                            GlobalFlag::Reject,
                             &mut regex_cache,
                         )?;
                         count_matches(value, pattern, start_scalar)
@@ -462,7 +466,7 @@ where
                         let pattern = compile_and_cache_regex(
                             regex,
                             flags,
-                            false,
+                            GlobalFlag::Reject,
                             &mut regex_cache,
                         )?;
 
@@ -500,7 +504,7 @@ where
                         let pattern = compile_and_cache_regex(
                             regex,
                             flags_scalar,
-                            false,
+                            GlobalFlag::Reject,
                             &mut regex_cache,
                         )?;
                         count_matches(value, pattern, start)
@@ -548,8 +552,12 @@ where
                         Some(regex) => regex,
                     };
 
-                    let pattern =
-                        compile_and_cache_regex(regex, flags, false, &mut regex_cache)?;
+                    let pattern = compile_and_cache_regex(
+                        regex,
+                        flags,
+                        GlobalFlag::Reject,
+                        &mut regex_cache,
+                    )?;
                     count_matches(value, pattern, start)
                 })
                 .collect::<Result<Int64Array, ArrowError>>()?,

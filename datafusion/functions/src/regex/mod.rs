@@ -146,7 +146,7 @@ pub fn functions() -> Vec<Arc<datafusion_expr::ScalarUDF>> {
 pub fn compile_and_cache_regex<'strings, 'cache>(
     regex: &'strings str,
     flags: Option<&'strings str>,
-    allow_global: bool,
+    global: GlobalFlag,
     regex_cache: &'cache mut HashMap<(&'strings str, Option<&'strings str>), Regex>,
 ) -> Result<&'cache Regex, ArrowError>
 where
@@ -155,21 +155,35 @@ where
     let result = match regex_cache.entry((regex, flags)) {
         Entry::Occupied(occupied_entry) => occupied_entry.into_mut(),
         Entry::Vacant(vacant_entry) => {
-            let compiled = compile_regex(regex, flags, allow_global)?;
+            let compiled = compile_regex(regex, flags, global)?;
             vacant_entry.insert(compiled)
         }
     };
     Ok(result)
 }
 
+/// How [`compile_regex`] should treat a Postgres-style `g` (global) flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlobalFlag {
+    /// Reject the `g` flag with an error (e.g. `regexp_count`, `regexp_instr`).
+    Reject,
+    /// Silently strip the `g` flag; global matching is implicit or meaningless
+    /// (e.g. `regexp_split_to_array`).
+    Ignore,
+}
+
+/// Compile `regex` with optional Postgres-style inline `flags`.
+///
+/// The `global` policy controls how a `g` flag is handled: [`GlobalFlag::Ignore`]
+/// strips it, [`GlobalFlag::Reject`] returns an error.
 pub fn compile_regex(
     regex: &str,
     flags: Option<&str>,
-    allow_global: bool,
+    global: GlobalFlag,
 ) -> Result<Regex, ArrowError> {
     let pattern = match flags {
         None | Some("") => regex.to_string(),
-        Some(flags) if allow_global => {
+        Some(flags) if global == GlobalFlag::Ignore => {
             let filtered: String = flags.chars().filter(|&c| c != 'g').collect();
             if filtered.is_empty() {
                 regex.to_string()
