@@ -63,7 +63,7 @@ use futures::StreamExt;
 use tokio::fs::File;
 
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn init() {
     // Enable RUST_LOG logging configuration for test
     let _ = env_logger::try_init();
@@ -514,7 +514,7 @@ async fn test_in_mem_buffer_almost_full() {
 
     let ctx = SessionContext::new_with_config_rt(config, runtime);
 
-    let query = "select * from generate_series(1,9000000) as t1(v1) order by v1;";
+    let query = "select * from generate_series(1,9000000) as t1(v1) order by v1 desc;";
     let df = ctx.sql(query).await.unwrap();
 
     // Check not fail
@@ -535,7 +535,7 @@ async fn test_external_sort_zero_merge_reservation() {
 
     let ctx = SessionContext::new_with_config_rt(config, runtime);
 
-    let query = "select * from generate_series(1,10000000) as t1(v1) order by v1;";
+    let query = "select * from generate_series(1,10000000) as t1(v1) order by v1 desc;";
     let df = ctx.sql(query).await.unwrap();
 
     let physical_plan = df.create_physical_plan().await.unwrap();
@@ -549,6 +549,65 @@ async fn test_external_sort_zero_merge_reservation() {
     let metrics = physical_plan.metrics().unwrap();
     let spill_count = metrics.spill_count().unwrap();
     assert!(spill_count > 0);
+}
+
+/// End-to-end (SQL-level) reproducer for the skewed-batch multi-level merge bug.
+///
+/// The workload is a sort over wide rows under a tight memory budget. Each spilled
+/// run's largest record batch is so wide that two merge streams cannot both be
+/// reserved at once (`~4 * max_batch > pool`), yet a single stream still fits
+/// (`~2 * max_batch < pool`). Reducing the read-ahead buffer therefore cannot help.
+///
+/// Before the fix the multi-level merge gave up here with `ResourcesExhausted`; now
+/// it re-spills the blocking run with a smaller batch size and the query completes.
+///
+/// This complements the low-level unit tests in `multi_level_merge.rs`: it drives the
+/// whole sort -> spill -> multi-level-merge pipeline from a SQL query, so the coverage
+/// survives refactors of the merge internals.
+#[tokio::test]
+async fn test_sort_skewed_batches_spill() {
+    let pool_size = 2 * 1024 * 1024; // 2MB
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
+        .build_arc()
+        .unwrap();
+
+    let config = SessionConfig::new()
+        .with_sort_spill_reservation_bytes(1)
+        .with_batch_size(8192)
+        .with_target_partitions(1);
+
+    let ctx = SessionContext::new_with_config_rt(config, runtime);
+
+    // Each row carries a ~100-byte string payload, so a full 8192-row batch is
+    // ~0.9MB. Reserving two such streams needs ~4 * 0.9MB > 2MB and cannot fit,
+    // while a single stream (~1.8MB) still fits - exactly the skew the fix handles.
+    // Sorting by the narrow `v` key forces the wide payload to be carried through
+    // the spill/merge path.
+    let row_count = 131072;
+    let query = "SELECT v, repeat('a', 100) AS payload \
+                 FROM generate_series(1, 131072) AS t(v) \
+                 ORDER BY v DESC";
+    let df = ctx.sql(query).await.unwrap();
+
+    let physical_plan = df.create_physical_plan().await.unwrap();
+    let task_ctx = Arc::new(TaskContext::from(&ctx.state()));
+    let stream = physical_plan.execute(0, task_ctx).unwrap();
+    let batches = collect(stream)
+        .await
+        .expect("skewed sort should re-spill and complete, not exhaust memory");
+
+    // Every input row must come out of the merge.
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, row_count);
+
+    // The query must actually spill, otherwise it never reaches the merge path
+    // this test is meant to cover.
+    let metrics = physical_plan.metrics().unwrap();
+    assert!(
+        metrics.spill_count().unwrap() > 0,
+        "expected the sort to spill to disk"
+    );
 }
 
 // Tests for disk limit (`max_temp_directory_size` in `DiskManager`)
@@ -599,7 +658,7 @@ async fn test_disk_spill_limit_reached() -> Result<()> {
     let ctx = setup_context(1024 * 1024, 1024 * 1024, spill_compression).await?; // 1MB disk limit, 1MB memory limit
 
     let df = ctx
-        .sql("select * from generate_series(1, 1000000000000) as t1(v1) order by v1")
+        .sql("select * from generate_series(1, 1000000000000) as t1(v1) order by v1 desc")
         .await
         .unwrap();
 
@@ -627,7 +686,7 @@ async fn test_disk_spill_limit_not_reached() -> Result<()> {
     let ctx = setup_context(disk_spill_limit, 128 * 1024, spill_compression).await?; // 1MB disk limit, 128KB memory limit
 
     let df = ctx
-        .sql("select * from generate_series(1, 10000) as t1(v1) order by v1")
+        .sql("select * from generate_series(1, 10000) as t1(v1) order by v1 desc")
         .await
         .unwrap();
     let plan = df.create_physical_plan().await.unwrap();
@@ -663,7 +722,7 @@ async fn test_spill_file_compressed_with_zstd() -> Result<()> {
     let ctx = setup_context(disk_spill_limit, 128 * 1024, spill_compression).await?; // 1MB disk limit, 128KB memory limit, zstd
 
     let df = ctx
-        .sql("select * from generate_series(1, 100000) as t1(v1) order by v1")
+        .sql("select * from generate_series(1, 100000) as t1(v1) order by v1 desc")
         .await
         .unwrap();
     let plan = df.create_physical_plan().await.unwrap();
@@ -699,7 +758,7 @@ async fn test_spill_file_compressed_with_lz4_frame() -> Result<()> {
     let ctx = setup_context(disk_spill_limit, 128 * 1024, spill_compression).await?; // 1MB disk limit, 128KB memory limit, lz4_frame
 
     let df = ctx
-        .sql("select * from generate_series(1, 100000) as t1(v1) order by v1")
+        .sql("select * from generate_series(1, 100000) as t1(v1) order by v1 desc")
         .await
         .unwrap();
     let plan = df.create_physical_plan().await.unwrap();

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::ops::ControlFlow;
+
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion_expr::planner::{
     PlannerResult, RawBinaryExpr, RawDictionaryExpr, RawFieldAccessExpr,
@@ -22,13 +24,14 @@ use datafusion_expr::planner::{
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastFormat, CastKind, CeilFloorKind,
     DataType as SQLDataType, DateTimeField, DictionaryField, Expr as SQLExpr,
-    ExprWithAlias as SQLExprWithAlias, JsonPath, MapEntry, StructField, Subscript,
-    TrimWhereField, TypedString, Value, ValueWithSpan,
+    ExprWithAlias as SQLExprWithAlias, JsonPath, MapEntry, Spanned, StructField,
+    Subscript, TrimWhereField, TypedString, Value, ValueWithSpan,
 };
+use sqlparser::ast::{Query, Visit, Visitor};
 
 use datafusion_common::{
-    DFSchema, Result, ScalarValue, internal_datafusion_err, internal_err, not_impl_err,
-    plan_err,
+    DFSchema, Diagnostic, Result, ScalarValue, Span, internal_datafusion_err,
+    internal_err, not_impl_err, plan_err,
 };
 
 use datafusion_expr::expr::ScalarFunction;
@@ -54,7 +57,86 @@ mod substring;
 mod unary_op;
 mod value;
 
+fn null_value_span(expr: &SQLExpr) -> Option<Option<Span>> {
+    if let SQLExpr::Value(ValueWithSpan {
+        value: Value::Null,
+        span,
+    }) = expr
+    {
+        Some(Span::try_from_sqlparser_span(*span))
+    } else {
+        None
+    }
+}
+
+fn null_equality_warning(expr: &SQLExpr) -> Option<Diagnostic> {
+    let SQLExpr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+
+    let null_span = null_value_span(left).or_else(|| null_value_span(right))?;
+
+    let (message, help) = match op {
+        BinaryOperator::Eq => (
+            "comparison with NULL using `=` always evaluates to NULL",
+            "use `IS NULL` to check for NULL values",
+        ),
+        BinaryOperator::NotEq => (
+            "comparison with NULL using `<>` always evaluates to NULL",
+            "use `IS NOT NULL` to check for non-NULL values",
+        ),
+        _ => return None,
+    };
+
+    Some(
+        Diagnostic::new_warning(message, Span::try_from_sqlparser_span(expr.span()))
+            .with_help(help, null_span),
+    )
+}
+
+struct NullEqualityPredicateVisitor<'a, 'b, S: ContextProvider> {
+    sql_to_rel: &'a SqlToRel<'b, S>,
+    subquery_depth: usize,
+}
+
+impl<'a, 'b, S: ContextProvider> NullEqualityPredicateVisitor<'a, 'b, S> {
+    fn new(sql_to_rel: &'a SqlToRel<'b, S>) -> Self {
+        Self {
+            sql_to_rel,
+            subquery_depth: 0,
+        }
+    }
+}
+
+impl<S: ContextProvider> Visitor for NullEqualityPredicateVisitor<'_, '_, S> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.subquery_depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.subquery_depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &SQLExpr) -> ControlFlow<Self::Break> {
+        if self.subquery_depth == 0
+            && let Some(warning) = null_equality_warning(expr)
+        {
+            self.sql_to_rel.add_warning(warning);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 impl<S: ContextProvider> SqlToRel<'_, S> {
+    pub(crate) fn warn_on_null_equality_predicate(&self, predicate: &SQLExpr) {
+        let mut visitor = NullEqualityPredicateVisitor::new(self);
+        let _ = predicate.visit(&mut visitor);
+    }
+
     pub(crate) fn sql_expr_to_logical_expr_with_alias(
         &self,
         sql: SQLExprWithAlias,
@@ -142,11 +224,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
 
         let RawBinaryExpr { op, left, right } = binary_expr;
-        Ok(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(left),
-            self.parse_sql_binary_op(&op)?,
-            Box::new(right),
-        )))
+        self.build_binary_expr(&op, left, right)
     }
 
     pub fn sql_to_expr_with_alias(
@@ -890,7 +968,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         negated: bool,
         expr: SQLExpr,
         pattern: SQLExpr,
-        escape_char: Option<Value>,
+        escape_char: Option<ValueWithSpan>,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
         case_insensitive: bool,
@@ -900,7 +978,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return not_impl_err!("ANY in LIKE expression");
         }
         let pattern = self.sql_expr_to_logical_expr(pattern, schema, planner_context)?;
-        let escape_char = match escape_char {
+        let escape_char = match escape_char.map(|v| v.value) {
             Some(Value::SingleQuotedString(char)) if char.len() == 1 => {
                 Some(char.chars().next().unwrap())
             }
@@ -925,7 +1003,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         negated: bool,
         expr: SQLExpr,
         pattern: SQLExpr,
-        escape_char: Option<Value>,
+        escape_char: Option<ValueWithSpan>,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
@@ -934,7 +1012,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         if pattern_type != DataType::Utf8 && pattern_type != DataType::Null {
             return plan_err!("Invalid pattern in SIMILAR TO expression");
         }
-        let escape_char = match escape_char {
+        let escape_char = match escape_char.map(|v| v.value) {
             Some(Value::SingleQuotedString(char)) if char.len() == 1 => {
                 Some(char.chars().next().unwrap())
             }
@@ -1373,7 +1451,9 @@ mod tests {
     use datafusion_common::TableReference;
     use datafusion_common::config::ConfigOptions;
     use datafusion_expr::logical_plan::builder::LogicalTableSource;
-    use datafusion_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
+    use datafusion_expr::{
+        AggregateUDF, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF,
+    };
 
     use super::*;
 
@@ -1413,6 +1493,10 @@ mod tests {
             None
         }
 
+        fn get_higher_order_meta(&self, _name: &str) -> Option<Arc<HigherOrderUDF>> {
+            None
+        }
+
         fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
             match name {
                 "sum" => Some(datafusion_functions_aggregate::sum::sum_udaf()),
@@ -1433,6 +1517,10 @@ mod tests {
         }
 
         fn udf_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn higher_order_function_names(&self) -> Vec<String> {
             Vec::new()
         }
 
