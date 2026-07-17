@@ -814,8 +814,8 @@ pub trait PhysicalPlanNodeExt: Sized {
             PhysicalPlanType::Interleave(interleave) => {
                 self.try_into_interleave_physical_plan(interleave, ctx, proto_converter)
             }
-            PhysicalPlanType::CrossJoin(crossjoin) => {
-                self.try_into_cross_join_physical_plan(crossjoin, ctx, proto_converter)
+            PhysicalPlanType::CrossJoin(_) => {
+                CrossJoinExec::try_from_proto(self.node(), &decode_ctx)
             }
             PhysicalPlanType::Empty(empty) => {
                 self.try_into_empty_physical_plan(empty, ctx, proto_converter)
@@ -831,8 +831,8 @@ pub trait PhysicalPlanNodeExt: Sized {
             PhysicalPlanType::Extension(extension) => {
                 self.try_into_extension_physical_plan(extension, ctx, proto_converter)
             }
-            PhysicalPlanType::NestedLoopJoin(join) => {
-                self.try_into_nested_loop_join_physical_plan(join, ctx, proto_converter)
+            PhysicalPlanType::NestedLoopJoin(_) => {
+                NestedLoopJoinExec::try_from_proto(self.node(), &decode_ctx)
             }
             PhysicalPlanType::Analyze(analyze) => {
                 self.try_into_analyze_physical_plan(analyze, ctx, proto_converter)
@@ -959,14 +959,6 @@ pub trait PhysicalPlanNodeExt: Sized {
             );
         }
 
-        if let Some(exec) = plan.downcast_ref::<CrossJoinExec>() {
-            return protobuf::PhysicalPlanNode::try_from_cross_join_exec(
-                exec,
-                codec,
-                proto_converter,
-            );
-        }
-
         if let Some(exec) = plan.downcast_ref::<AggregateExec>() {
             return protobuf::PhysicalPlanNode::try_from_aggregate_exec(
                 exec,
@@ -1046,14 +1038,6 @@ pub trait PhysicalPlanNodeExt: Sized {
 
         if let Some(exec) = plan.downcast_ref::<SortPreservingMergeExec>() {
             return protobuf::PhysicalPlanNode::try_from_sort_preserving_merge_exec(
-                exec,
-                codec,
-                proto_converter,
-            );
-        }
-
-        if let Some(exec) = plan.downcast_ref::<NestedLoopJoinExec>() {
-            return protobuf::PhysicalPlanNode::try_from_nested_loop_join_exec(
                 exec,
                 codec,
                 proto_converter,
@@ -2141,6 +2125,10 @@ pub trait PhysicalPlanNodeExt: Sized {
         Ok(Arc::new(InterleaveExec::try_new(inputs)?))
     }
 
+    #[deprecated(
+        since = "55.0.0",
+        note = "unused by DataFusion; `CrossJoinExec` deserializes itself via `CrossJoinExec::try_from_proto`"
+    )]
     fn try_into_cross_join_physical_plan(
         &self,
         crossjoin: &protobuf::CrossJoinExecNode,
@@ -2329,6 +2317,10 @@ pub trait PhysicalPlanNodeExt: Sized {
         Ok(extension_node)
     }
 
+    #[deprecated(
+        since = "55.0.0",
+        note = "unused by DataFusion; `NestedLoopJoinExec` deserializes itself via `NestedLoopJoinExec::try_from_proto`"
+    )]
     fn try_into_nested_loop_join_physical_plan(
         &self,
         join: &protobuf::NestedLoopJoinExecNode,
@@ -3341,6 +3333,10 @@ pub trait PhysicalPlanNodeExt: Sized {
         })
     }
 
+    #[deprecated(
+        since = "55.0.0",
+        note = "unused by DataFusion; `CrossJoinExec` serializes itself via `ExecutionPlan::try_to_proto`"
+    )]
     fn try_from_cross_join_exec(
         exec: &CrossJoinExec,
         codec: &dyn PhysicalExtensionCodec,
@@ -3868,6 +3864,10 @@ pub trait PhysicalPlanNodeExt: Sized {
         })
     }
 
+    #[deprecated(
+        since = "55.0.0",
+        note = "unused by DataFusion; `NestedLoopJoinExec` serializes itself via `ExecutionPlan::try_to_proto`"
+    )]
     fn try_from_nested_loop_join_exec(
         exec: &NestedLoopJoinExec,
         codec: &dyn PhysicalExtensionCodec,
