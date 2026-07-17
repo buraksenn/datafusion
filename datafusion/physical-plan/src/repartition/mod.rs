@@ -1821,7 +1821,14 @@ impl RepartitionExec {
                     .iter()
                     .map(|expr| ctx.decode_expr(expr, input_schema.as_ref()))
                     .collect::<Result<Vec<_>>>()?;
-                Partitioning::Hash(exprs, hash.partition_count as usize)
+                let partition_count =
+                    usize::try_from(hash.partition_count).map_err(|_| {
+                        datafusion_common::internal_datafusion_err!(
+                            "Hash partition count {} exceeds usize::MAX",
+                            hash.partition_count
+                        )
+                    })?;
+                Partitioning::Hash(exprs, partition_count)
             }
             protobuf::partitioning::PartitionMethod::Unknown(n) => {
                 Partitioning::UnknownPartitioning(*n as usize)
