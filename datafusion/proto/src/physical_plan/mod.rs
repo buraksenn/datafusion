@@ -784,8 +784,8 @@ pub trait PhysicalPlanNodeExt: Sized {
             PhysicalPlanType::Merge(merge) => {
                 self.try_into_merge_physical_plan(merge, ctx, proto_converter)
             }
-            PhysicalPlanType::Repartition(repart) => {
-                self.try_into_repartition_physical_plan(repart, ctx, proto_converter)
+            PhysicalPlanType::Repartition(_) => {
+                RepartitionExec::try_from_proto(self.node(), &decode_ctx)
             }
             PhysicalPlanType::GlobalLimit(limit) => {
                 self.try_into_global_limit_physical_plan(limit, ctx, proto_converter)
@@ -1006,14 +1006,6 @@ pub trait PhysicalPlanNodeExt: Sized {
 
         if let Some(exec) = plan.downcast_ref::<CoalescePartitionsExec>() {
             return protobuf::PhysicalPlanNode::try_from_coalesce_partitions_exec(
-                exec,
-                codec,
-                proto_converter,
-            );
-        }
-
-        if let Some(exec) = plan.downcast_ref::<RepartitionExec>() {
-            return protobuf::PhysicalPlanNode::try_from_repartition_exec(
                 exec,
                 codec,
                 proto_converter,
@@ -1540,6 +1532,10 @@ pub trait PhysicalPlanNodeExt: Sized {
         ))
     }
 
+    #[deprecated(
+        since = "55.0.0",
+        note = "unused by DataFusion; `RepartitionExec` deserializes itself via `RepartitionExec::try_from_proto`"
+    )]
     fn try_into_repartition_physical_plan(
         &self,
         repart: &protobuf::RepartitionExecNode,
@@ -3714,6 +3710,10 @@ pub trait PhysicalPlanNodeExt: Sized {
         })
     }
 
+    #[deprecated(
+        since = "55.0.0",
+        note = "unused by DataFusion; `RepartitionExec` serializes itself via `ExecutionPlan::try_to_proto`"
+    )]
     fn try_from_repartition_exec(
         exec: &RepartitionExec,
         codec: &dyn PhysicalExtensionCodec,
