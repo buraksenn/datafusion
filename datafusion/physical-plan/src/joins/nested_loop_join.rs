@@ -841,11 +841,6 @@ impl ExecutionPlan for NestedLoopJoinExec {
 
 #[cfg(feature = "proto")]
 impl NestedLoopJoinExec {
-    /// Reconstruct a [`NestedLoopJoinExec`] from its protobuf representation.
-    ///
-    /// The inverse of [`ExecutionPlan::try_to_proto`].
-    ///
-    /// [`ExecutionPlan::try_to_proto`]: crate::ExecutionPlan::try_to_proto
     pub fn try_from_proto(
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
