@@ -1560,9 +1560,6 @@ impl ExecutionPlan for SortExec {
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
         use datafusion_proto_models::protobuf;
         let input = ctx.encode_child(self.input())?;
-        // A PhysicalSortExpr is a PhysicalExpr + SortOptions. The expr is encoded
-        // through the ctx; the SortOptions wrapping into a PhysicalSortExprNode
-        // (asc/nulls_first) is plain data and inlined here.
         let expr = self
             .expr()
             .iter()
@@ -1608,16 +1605,6 @@ impl ExecutionPlan for SortExec {
 
 #[cfg(feature = "proto")]
 impl SortExec {
-    /// Reconstruct a [`SortExec`] from its protobuf representation.
-    ///
-    /// The exact inverse of [`ExecutionPlan::try_to_proto`]: it takes the whole
-    /// [`PhysicalPlanNode`] and decodes the child plan and sort expressions
-    /// recursively through the [`ExecutionPlanDecodeCtx`]. The `SortOptions`
-    /// (asc/nulls_first) are read directly off the plain `PhysicalSortExprNode`.
-    ///
-    /// [`PhysicalPlanNode`]: datafusion_proto_models::protobuf::PhysicalPlanNode
-    /// [`ExecutionPlan::try_to_proto`]: crate::ExecutionPlan::try_to_proto
-    /// [`ExecutionPlanDecodeCtx`]: crate::proto::ExecutionPlanDecodeCtx
     pub fn try_from_proto(
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
