@@ -1705,11 +1705,7 @@ impl ExecutionPlan for RepartitionExec {
 
         let input = ctx.encode_child(self.input())?;
 
-        // Inlined equivalent of datafusion-proto's `serialize_partitioning`.
-        // Only child physical expressions and `ScalarValue`s need serializing,
-        // both of which are reachable from `datafusion-physical-plan`, so the
-        // `protobuf::Partitioning` wrapping is built directly here. The proto
-        // wire format is unchanged.
+        // Keep the existing protobuf wire representation unchanged.
         let partition_method = match self.partitioning() {
             Partitioning::RoundRobinBatch(n) => {
                 protobuf::partitioning::PartitionMethod::RoundRobin(*n as u64)
@@ -1778,11 +1774,6 @@ impl ExecutionPlan for RepartitionExec {
 #[cfg(feature = "proto")]
 impl RepartitionExec {
     /// Reconstruct a [`RepartitionExec`] from its protobuf representation.
-    ///
-    /// The exact inverse of [`ExecutionPlan::try_to_proto`]. Inlines the
-    /// equivalent of datafusion-proto's `parse_protobuf_partitioning`; the
-    /// `protobuf::Partitioning` wrapping is read directly here since only child
-    /// expressions and `ScalarValue`s need decoding.
     pub fn try_from_proto(
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
