@@ -424,7 +424,6 @@ pub fn aggregate_functional_dependencies(
 ) -> FunctionalDependencies {
     let mut aggregate_func_dependencies = vec![];
     let aggr_input_fields = aggr_input_schema.field_names();
-    let aggr_fields = aggr_schema.fields();
     // Association covers the whole table:
     let target_indices = (0..aggr_schema.fields().len()).collect::<Vec<_>>();
     // Get functional dependencies of the schema:
@@ -468,13 +467,22 @@ pub fn aggregate_functional_dependencies(
             // Otherwise, existing mode is preserved:
             *mode
         };
+        // If the determinant covers *every* GROUP BY expression, it is a
+        // non-nullable key of the output even when it was only a nullable key
+        // of the input: grouping collapses multiple NULL rows from a nullable
+        // key (e.g. a SQL `UNIQUE` constraint).
+        //
+        // However, if determinant covers only some grouping columns, rows differing
+        // in the remaining GROUP BY expressions can still repeat a NULL
+        // determinant, so the input nullability is preserved.
+        let nullable = *nullable && new_source_indices.len() < group_by_expr_names.len();
         // All of the composite indices occur in the GROUP BY expression:
         if new_source_indices.len() == source_indices.len() {
             aggregate_func_dependencies.push(
                 FunctionalDependence::new(
                     new_source_indices,
                     target_indices.clone(),
-                    *nullable,
+                    nullable,
                 )
                 .with_mode(mode),
             );
@@ -486,9 +494,6 @@ pub fn aggregate_functional_dependencies(
     if !group_by_expr_names.is_empty() {
         let count = group_by_expr_names.len();
         let source_indices = (0..count).collect::<Vec<_>>();
-        let nullable = source_indices
-            .iter()
-            .any(|idx| aggr_fields[*idx].is_nullable());
         // If GROUP BY expressions do not already act as a determinant:
         if !aggregate_func_dependencies.iter().any(|item| {
             // If `item.source_indices` is a subset of GROUP BY expressions, we shouldn't add
@@ -498,10 +503,15 @@ pub fn aggregate_functional_dependencies(
             // GROUP BY expressions come here as a prefix.
             item.source_indices.iter().all(|idx| idx < &count)
         }) {
-            // Add a new functional dependency associated with the whole table:
-            // Use nullable property of the GROUP BY expression:
+            // Add a new functional dependency associated with the whole table.
+            //
+            // `nullable` is `false`: a nullable dependence means multiple NULL
+            // keys may coexist (as under a SQL UNIQUE constraint, where NULLs
+            // compare distinct). That cannot happen after grouping: GROUP BY
+            // treats NULLs as equal, so every key combination -- NULL included
+            // -- occurs in exactly one output row, like a primary key.
+            let nullable = false;
             aggregate_func_dependencies.push(
-                // Use nullable property of the GROUP BY expression:
                 FunctionalDependence::new(source_indices, target_indices, nullable)
                     .with_mode(Dependency::Single),
             );
@@ -516,15 +526,57 @@ pub fn get_target_functional_dependencies(
     schema: &DFSchema,
     group_by_expr_names: &[String],
 ) -> Option<Vec<usize>> {
+    target_functional_dependencies(schema, group_by_expr_names, false)
+}
+
+/// Like [`get_target_functional_dependencies`], but only considers
+/// dependencies that hold across NULL rows: non-nullable dependencies, or
+/// nullable ones whose determinant keys cannot actually contain NULLs. A
+/// nullable dependency over an actually-nullable determinant (e.g. a UNIQUE
+/// constraint on a nullable column) may repeat NULL keys with differing
+/// dependent values, so dependent columns must not be derived through it.
+/// Use this variant when deriving additional columns, such as implicit
+/// GROUP BY expressions (see issue #23819).
+pub fn get_reliable_target_functional_dependencies(
+    schema: &DFSchema,
+    group_by_expr_names: &[String],
+) -> Option<Vec<usize>> {
+    target_functional_dependencies(schema, group_by_expr_names, true)
+}
+
+/// Computes the union of target indices of the dependencies whose
+/// determinant keys are all inside `group_by_expr_names`, optionally
+/// restricted to dependencies that hold across NULL rows. Note that the
+/// unrestricted variant is not merely a laxer version of the restricted one:
+/// [`aggregate_functional_dependencies`] relies on it to compare reachable
+/// target sets symmetrically when upgrading dependency modes, and filtering
+/// there would upgrade modes based on spuriously-equal sets.
+fn target_functional_dependencies(
+    schema: &DFSchema,
+    group_by_expr_names: &[String],
+    only_reliable: bool,
+) -> Option<Vec<usize>> {
     let mut combined_target_indices = HashSet::new();
     let dependencies = schema.functional_dependencies();
     let field_names = schema.field_names();
     for FunctionalDependence {
         source_indices,
         target_indices,
+        nullable,
         ..
     } in &dependencies.deps
     {
+        // See `get_reliable_target_functional_dependencies`: a dependency
+        // whose source columns can actually contain NULLs does not hold
+        // across NULL rows.
+        if only_reliable
+            && *nullable
+            && source_indices
+                .iter()
+                .any(|&source_idx| schema.field(source_idx).is_nullable())
+        {
+            continue;
+        }
         let source_key_names = source_indices
             .iter()
             .map(|id_key_idx| &field_names[*id_key_idx])
@@ -547,7 +599,10 @@ pub fn get_target_functional_dependencies(
 }
 
 /// Returns indices for the minimal subset of GROUP BY expressions that are
-/// functionally equivalent to the original set of GROUP BY expressions.
+/// functionally equivalent to the original set of GROUP BY expressions. Only
+/// dependencies that hold across NULL rows (non-nullable dependencies, or
+/// nullable ones whose determinant keys cannot actually contain NULLs) are
+/// used for pruning.
 pub fn get_required_group_by_exprs_indices(
     schema: &DFSchema,
     group_by_expr_names: &[String],
@@ -567,9 +622,23 @@ pub fn get_required_group_by_exprs_indices(
     for FunctionalDependence {
         source_indices,
         target_indices,
+        nullable,
         ..
     } in &dependencies.deps
     {
+        // A dependency whose source columns can actually contain NULLs (e.g.
+        // one derived from a UNIQUE constraint on a nullable column) does not
+        // hold across NULL rows: multiple NULL keys may exist whose dependent
+        // columns differ, so pruning GROUP BY columns based on such a
+        // dependency would incorrectly merge those distinct groups. A nullable
+        // dependency whose source columns are all NOT NULL remains usable.
+        if *nullable
+            && source_indices
+                .iter()
+                .any(|&source_idx| schema.field(source_idx).is_nullable())
+        {
+            continue;
+        }
         if source_indices
             .iter()
             .all(|source_idx| groupby_expr_indices.contains(source_idx))
@@ -708,5 +777,282 @@ mod tests {
             true,
         )]);
         assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn test_required_group_by_exprs_nullable_dependency() {
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        let fields: Fields = vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+        ]
+        .into();
+
+        // A nullable dependency (e.g. from a UNIQUE constraint): `x` determines
+        // `y`, but the source column is nullable. Because multiple NULL rows may
+        // exist with differing `y` values, the dependency must NOT be used to
+        // prune `y` from the GROUP BY.
+        let nullable_schema = DFSchema::from_unqualified_fields(
+            fields.clone(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .with_functional_dependencies(FunctionalDependencies::new(vec![
+            FunctionalDependence::new(vec![0], vec![0, 1], true)
+                .with_mode(Dependency::Single),
+        ]))
+        .unwrap();
+
+        let group_by = vec!["x".to_string(), "y".to_string()];
+        let res =
+            get_required_group_by_exprs_indices(&nullable_schema, &group_by).unwrap();
+        // Both columns must be retained.
+        assert_eq!(res, vec![0, 1]);
+
+        // A non-nullable dependency (e.g. from a PRIMARY KEY): `x` determines `y`
+        // and never holds NULLs, so `y` can be pruned from the GROUP BY.
+        let non_nullable_schema =
+            DFSchema::from_unqualified_fields(fields, std::collections::HashMap::new())
+                .unwrap()
+                .with_functional_dependencies(FunctionalDependencies::new(vec![
+                    FunctionalDependence::new(vec![0], vec![0, 1], false)
+                        .with_mode(Dependency::Single),
+                ]))
+                .unwrap();
+
+        let res =
+            get_required_group_by_exprs_indices(&non_nullable_schema, &group_by).unwrap();
+        // Only the source column `x` is required.
+        assert_eq!(res, vec![0]);
+
+        // A nullable dependency whose source column is declared NOT NULL
+        // (e.g. from a UNIQUE constraint on a NOT NULL column): no NULL keys
+        // can occur, so the dependency holds and `y` can still be pruned.
+        let not_null_source_fields: Fields = vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, true),
+        ]
+        .into();
+        let unique_not_null_schema = DFSchema::from_unqualified_fields(
+            not_null_source_fields,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .with_functional_dependencies(FunctionalDependencies::new(vec![
+            FunctionalDependence::new(vec![0], vec![0, 1], true)
+                .with_mode(Dependency::Single),
+        ]))
+        .unwrap();
+
+        let res = get_required_group_by_exprs_indices(&unique_not_null_schema, &group_by)
+            .unwrap();
+        assert_eq!(res, vec![0]);
+    }
+
+    #[test]
+    fn test_get_reliable_target_functional_dependencies() {
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        let group_by = vec!["x".to_string()];
+        let unique_dependencies = FunctionalDependencies::new(vec![
+            FunctionalDependence::new(vec![0], vec![0, 1], true)
+                .with_mode(Dependency::Single),
+        ]);
+
+        // Nullable source column: the dependency does not hold across NULL
+        // rows, so no dependent columns can be reliably derived from `x`.
+        // The unrestricted variant must still report them: it stays
+        // symmetric for the mode-upgrade comparison in
+        // `aggregate_functional_dependencies`.
+        let nullable_fields: Fields = vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+        ]
+        .into();
+        let nullable_schema = DFSchema::from_unqualified_fields(
+            nullable_fields,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .with_functional_dependencies(unique_dependencies.clone())
+        .unwrap();
+        assert_eq!(
+            get_reliable_target_functional_dependencies(&nullable_schema, &group_by),
+            None
+        );
+        assert_eq!(
+            get_target_functional_dependencies(&nullable_schema, &group_by),
+            Some(vec![0, 1])
+        );
+
+        // NOT NULL source column: the dependency holds, so `x` determines all
+        // columns for both variants.
+        let not_null_source_fields: Fields = vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, true),
+        ]
+        .into();
+        let unique_not_null_schema = DFSchema::from_unqualified_fields(
+            not_null_source_fields,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .with_functional_dependencies(unique_dependencies)
+        .unwrap();
+        assert_eq!(
+            get_reliable_target_functional_dependencies(
+                &unique_not_null_schema,
+                &group_by
+            ),
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn test_aggregate_functional_dependencies_nullability() {
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        // Input: nullable `x` with a UNIQUE-style (nullable) dependency
+        // covering the whole table.
+        let input_fields: Fields = vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+        ]
+        .into();
+        let input_schema = DFSchema::from_unqualified_fields(
+            input_fields.clone(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .with_functional_dependencies(FunctionalDependencies::new(vec![
+            FunctionalDependence::new(vec![0], vec![0, 1], true)
+                .with_mode(Dependency::Single),
+        ]))
+        .unwrap();
+
+        let aggr_fields: Fields = vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("cnt", DataType::Int64, false),
+        ]
+        .into();
+        let aggr_schema = DFSchema::from_unqualified_fields(
+            aggr_fields,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+        // GROUP BY x: the determinant covers every GROUP BY expression, so
+        // grouping collapses duplicate NULL keys and the propagated
+        // dependency becomes non-nullable.
+        let deps = aggregate_functional_dependencies(
+            &input_schema,
+            &["x".to_string()],
+            &aggr_schema,
+        );
+        assert_eq!(
+            deps,
+            FunctionalDependencies::new(vec![
+                FunctionalDependence::new(vec![0], vec![0, 1], false,)
+                    .with_mode(Dependency::Single)
+            ])
+        );
+
+        // GROUP BY x, y: the determinant covers only part of the GROUP BY,
+        // so rows differing in `y` can still repeat a NULL `x` and the
+        // propagated dependency stays nullable.
+        let aggr_schema_xy = DFSchema::from_unqualified_fields(
+            input_fields.clone(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let deps = aggregate_functional_dependencies(
+            &input_schema,
+            &["x".to_string(), "y".to_string()],
+            &aggr_schema_xy,
+        );
+        assert_eq!(
+            deps,
+            FunctionalDependencies::new(vec![
+                FunctionalDependence::new(vec![0], vec![0, 1], true,)
+                    .with_mode(Dependency::Single)
+            ])
+        );
+
+        // No input dependencies: grouping introduces a fresh whole-table
+        // dependency that holds across NULLs even when the key fields are
+        // nullable, since each key combination (NULL included) occurs in
+        // exactly one output row.
+        let plain_input_schema = DFSchema::from_unqualified_fields(
+            input_fields,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let deps = aggregate_functional_dependencies(
+            &plain_input_schema,
+            &["x".to_string(), "y".to_string()],
+            &aggr_schema_xy,
+        );
+        assert_eq!(
+            deps,
+            FunctionalDependencies::new(vec![
+                FunctionalDependence::new(vec![0, 1], vec![0, 1], false,)
+                    .with_mode(Dependency::Single)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_aggregate_functional_dependencies_no_mode_upgrade_via_unreliable_deps() {
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        // Join-like input: `a` reliably determines `a, b` but may repeat
+        // (Multi mode), while `c` only has an unreliable (nullable)
+        // self-dependency, e.g. from a UNIQUE constraint on a nullable
+        // column of the joined table.
+        let input_fields: Fields = vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
+            Field::new("c", DataType::Int32, true),
+        ]
+        .into();
+        let input_schema = DFSchema::from_unqualified_fields(
+            input_fields,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .with_functional_dependencies(FunctionalDependencies::new(vec![
+            FunctionalDependence::new(vec![0], vec![0, 1], false),
+            FunctionalDependence::new(vec![2], vec![2], true),
+        ]))
+        .unwrap();
+
+        let aggr_fields: Fields = vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("c", DataType::Int32, true),
+        ]
+        .into();
+        let aggr_schema = DFSchema::from_unqualified_fields(
+            aggr_fields,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+        let deps = aggregate_functional_dependencies(
+            &input_schema,
+            &["a".to_string(), "c".to_string()],
+            &aggr_schema,
+        );
+        // `a` does NOT determine `c`, so its dependency must keep Multi
+        // mode. Upgrading it to Single (e.g. by ignoring the unreliable `c`
+        // dependency when comparing reachable target sets) would let
+        // optimizations such as DISTINCT elimination or join elimination
+        // produce wrong results, since `a` repeats in the GROUP BY a, c
+        // output.
+        let a_dep = deps
+            .iter()
+            .find(|dep| dep.source_indices == vec![0])
+            .unwrap();
+        assert_eq!(a_dep.mode, Dependency::Multi);
     }
 }

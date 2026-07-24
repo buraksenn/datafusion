@@ -1463,3 +1463,23 @@ FROM list_struct_table;
 
 statement ok
 DROP TABLE list_struct_table;
+
+## Functional dependencies must not survive unnesting: unnest may emit
+## multiple output rows per input row, so a key of the input (here the GROUP
+## BY key of the subquery) no longer guarantees at most one row. The
+## correlated scalar subquery below must therefore be rejected instead of
+## silently duplicating outer rows.
+statement ok
+CREATE TABLE unnest_dep_base (k INT NOT NULL, v INT) AS VALUES (1, 10), (1, 20);
+
+statement ok
+CREATE TABLE unnest_dep_outer (k INT) AS VALUES (1), (2);
+
+query error Correlated scalar subquery must be aggregated to return at most one row
+SELECT o.k, (SELECT sq.u FROM (SELECT k, unnest(arr) AS u FROM (SELECT k, array_agg(v) AS arr FROM unnest_dep_base GROUP BY k) agg) sq WHERE sq.k = o.k) FROM unnest_dep_outer o;
+
+statement ok
+DROP TABLE unnest_dep_base;
+
+statement ok
+DROP TABLE unnest_dep_outer;

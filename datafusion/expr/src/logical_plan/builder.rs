@@ -56,8 +56,8 @@ use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{
     Column, Constraints, DFSchema, DFSchemaRef, NullEquality, Result, ScalarValue,
     TableReference, ToDFSchema, UnnestOptions, exec_err,
-    get_target_functional_dependencies, internal_datafusion_err, plan_datafusion_err,
-    plan_err,
+    get_reliable_target_functional_dependencies, internal_datafusion_err,
+    plan_datafusion_err, plan_err,
 };
 use datafusion_expr_common::type_coercion::binary::type_union_resolution;
 
@@ -1866,8 +1866,11 @@ pub fn add_group_by_exprs_from_dependencies(
         .map(|e| e.schema_name().to_string())
         .collect::<Vec<_>>();
 
+    // Only dependencies that hold across NULL rows may introduce additional
+    // GROUP BY columns: a nullable UNIQUE determinant can repeat NULL keys
+    // with differing dependent values (see issue #23819).
     if let Some(target_indices) =
-        get_target_functional_dependencies(schema, &group_by_field_names)
+        get_reliable_target_functional_dependencies(schema, &group_by_field_names)
     {
         for idx in target_indices {
             let expr = Expr::Column(Column::from(schema.qualified_field(idx)));

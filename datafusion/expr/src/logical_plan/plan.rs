@@ -4791,9 +4791,11 @@ impl Unnest {
 
         let metadata = input_schema.metadata().clone();
         let df_schema = DFSchema::new_with_metadata(fields, metadata)?;
-        // We can use the existing functional dependencies:
-        let deps = input_schema.functional_dependencies().clone();
-        let schema = Arc::new(df_schema.with_functional_dependencies(deps)?);
+        // The input's functional dependencies do not carry over: unnesting
+        // may emit multiple output rows per input row (one per collection
+        // element), so a former determinant key can repeat and no longer
+        // determines the unnested columns. Start with no dependencies.
+        let schema = Arc::new(df_schema);
 
         Ok(Unnest {
             input,

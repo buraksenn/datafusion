@@ -3536,9 +3536,13 @@ SELECT r.sn, SUM(l.amount), r.amount
   GROUP BY r.sn
   ORDER BY r.sn
 
-# left join should propagate right side constraint,
-# if right side is a primary key (unique and doesn't contain null)
-query IRR
+# After a LEFT JOIN, right-side columns become nullable, so the right side's
+# primary key constraint is downgraded to a nullable dependency. Nullable
+# dependencies whose key columns can actually contain NULLs are no longer
+# usable to select dependent columns (see
+# https://github.com/apache/datafusion/issues/23819), so `r.amount` must now
+# be grouped or aggregated explicitly.
+statement error DataFusion error: Error during planning: Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column "r\.amount" must appear in the GROUP BY clause or must be part of an aggregate function, currently only "r\.sn, sum\(r\.amount\)" appears in the SELECT clause satisfies this requirement
 SELECT r.sn, r.amount, SUM(r.amount)
   FROM (SELECT *
     FROM sales_global_with_pk as l
@@ -3546,12 +3550,6 @@ SELECT r.sn, r.amount, SUM(r.amount)
     ON l.amount >= r.amount + 10)
   GROUP BY r.sn
 ORDER BY r.sn
-----
-0 30 120
-1 50 150
-2 75 150
-4 100 100
-NULL NULL NULL
 
 # left join shouldn't propagate right side constraint,
 # if right side is a unique key (unique and can contain null)
@@ -3565,8 +3563,12 @@ SELECT r.sn, r.amount, SUM(r.amount)
   GROUP BY r.sn
 ORDER BY r.sn
 
-# left semi join should propagate constraint of left side as is.
-query IRR
+# Left semi join propagates the constraint of the left side as is. However, a
+# UNIQUE constraint on a nullable column permits multiple NULL keys whose
+# dependent columns may differ, so it cannot justify selecting `l.amount`
+# without grouping or aggregating it
+# (see https://github.com/apache/datafusion/issues/23819).
+statement error DataFusion error: Error during planning: Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column "l\.amount" must appear in the GROUP BY clause or must be part of an aggregate function, currently only "l\.sn, sum\(l\.amount\)" appears in the SELECT clause satisfies this requirement
 SELECT l.sn, l.amount, SUM(l.amount)
   FROM (SELECT *
     FROM sales_global_with_unique as l
@@ -3574,15 +3576,11 @@ SELECT l.sn, l.amount, SUM(l.amount)
     ON l.amount >= r.amount + 10)
   GROUP BY l.sn
 ORDER BY l.sn
-----
-1 50 50
-2 75 75
-3 200 200
-4 100 100
-NULL 100 100
 
-# Similarly, left anti join should propagate constraint of left side as is.
-query IRR
+# Similarly, left anti join propagates the constraint of the left side as is,
+# and the nullable UNIQUE constraint likewise cannot justify selecting
+# `l.amount` (see https://github.com/apache/datafusion/issues/23819).
+statement error DataFusion error: Error during planning: Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column "l\.amount" must appear in the GROUP BY clause or must be part of an aggregate function, currently only "l\.sn, sum\(l\.amount\)" appears in the SELECT clause satisfies this requirement
 SELECT l.sn, l.amount, SUM(l.amount)
   FROM (SELECT *
     FROM sales_global_with_unique as l
@@ -3590,8 +3588,6 @@ SELECT l.sn, l.amount, SUM(l.amount)
     ON l.amount >= r.amount + 10)
   GROUP BY l.sn
 ORDER BY l.sn
-----
-0 30 30
 
 # Should support grouping by list column
 query ?I
@@ -5694,3 +5690,157 @@ drop table users_with_pk;
 
 statement ok
 drop table user_orders;
+
+# A GROUP BY column must NOT be dropped based on a functional dependency
+# derived from a nullable UNIQUE constraint. A UNIQUE column permits multiple
+# NULL rows, so `x` does not functionally determine `y` across those NULL rows.
+# See https://github.com/apache/datafusion/issues/23819
+statement ok
+CREATE TABLE t_unique_null (x INT UNIQUE, y INT) AS VALUES (NULL, 2), (NULL, 1), (1, 3);
+
+# Three distinct groups: the two NULL-x rows differ in `y` and must stay separate.
+query I rowsort
+SELECT x FROM t_unique_null GROUP BY x, y;
+----
+1
+NULL
+NULL
+
+# `y` must be retained in the GROUP BY (not pruned away by the nullable dependency).
+query TT
+EXPLAIN SELECT x FROM t_unique_null GROUP BY x, y;
+----
+logical_plan
+01)Projection: t_unique_null.x
+02)--Aggregate: groupBy=[[t_unique_null.x, t_unique_null.y]], aggr=[[]]
+03)----TableScan: t_unique_null projection=[x, y]
+physical_plan
+01)ProjectionExec: expr=[x@0 as x]
+02)--AggregateExec: mode=FinalPartitioned, gby=[x@0 as x, y@1 as y], aggr=[]
+03)----RepartitionExec: partitioning=Hash([x@0, y@1], 4), input_partitions=1
+04)------AggregateExec: mode=Partial, gby=[x@0 as x, y@1 as y], aggr=[]
+05)--------DataSourceExec: partitions=1, partition_sizes=[1]
+
+# The nullable UNIQUE dependency must also not be used to implicitly expand
+# `GROUP BY x` with dependent columns: NULLs form a single group.
+query I rowsort
+SELECT x FROM t_unique_null GROUP BY x;
+----
+1
+NULL
+
+query II rowsort
+SELECT x, count(*) FROM t_unique_null GROUP BY x;
+----
+1 1
+NULL 2
+
+query TT
+EXPLAIN SELECT x FROM t_unique_null GROUP BY x;
+----
+logical_plan
+01)Aggregate: groupBy=[[t_unique_null.x]], aggr=[[]]
+02)--TableScan: t_unique_null projection=[x]
+physical_plan
+01)AggregateExec: mode=FinalPartitioned, gby=[x@0 as x], aggr=[]
+02)--RepartitionExec: partitioning=Hash([x@0], 4), input_partitions=1
+03)----AggregateExec: mode=Partial, gby=[x@0 as x], aggr=[]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+# DISTINCT must also not be removed based on the nullable UNIQUE constraint
+# (https://github.com/apache/datafusion/issues/23634): the duplicate NULL
+# keys must collapse into one row.
+query I rowsort
+SELECT DISTINCT x FROM t_unique_null;
+----
+1
+NULL
+
+# Same through a GROUP BY subquery: its output still contains two NULL-x
+# rows (one per distinct y), so the propagated dependency must not let the
+# outer DISTINCT be dropped.
+query I rowsort
+SELECT DISTINCT x FROM (SELECT x FROM t_unique_null GROUP BY x, y);
+----
+1
+NULL
+
+statement ok
+drop table t_unique_null;
+
+# Control case: with a non-nullable PRIMARY KEY, `x` does functionally determine
+# `y`, so `y` can still be safely pruned from the GROUP BY.
+statement ok
+CREATE TABLE t_pk (x INT PRIMARY KEY, y INT) AS VALUES (1, 2), (2, 1), (3, 3);
+
+query I rowsort
+SELECT x FROM t_pk GROUP BY x, y;
+----
+1
+2
+3
+
+# `y` is pruned: the primary key `x` alone is a sufficient GROUP BY key.
+query TT
+EXPLAIN SELECT x FROM t_pk GROUP BY x, y;
+----
+logical_plan
+01)Aggregate: groupBy=[[t_pk.x]], aggr=[[]]
+02)--TableScan: t_pk projection=[x]
+physical_plan
+01)AggregateExec: mode=FinalPartitioned, gby=[x@0 as x], aggr=[]
+02)--RepartitionExec: partitioning=Hash([x@0], 4), input_partitions=1
+03)----AggregateExec: mode=Partial, gby=[x@0 as x], aggr=[]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+drop table t_pk;
+
+# Control case: UNIQUE on a NOT NULL column admits no NULL keys, so its
+# dependency holds across all rows and `y` can still be pruned.
+statement ok
+CREATE TABLE t_unique_nn (x INT NOT NULL UNIQUE, y INT) AS VALUES (1, 2), (2, 1), (3, 3);
+
+query I rowsort
+SELECT x FROM t_unique_nn GROUP BY x, y;
+----
+1
+2
+3
+
+query TT
+EXPLAIN SELECT x FROM t_unique_nn GROUP BY x, y;
+----
+logical_plan
+01)Aggregate: groupBy=[[t_unique_nn.x]], aggr=[[]]
+02)--TableScan: t_unique_nn projection=[x]
+physical_plan
+01)AggregateExec: mode=FinalPartitioned, gby=[x@0 as x], aggr=[]
+02)--RepartitionExec: partitioning=Hash([x@0], 4), input_partitions=1
+03)----AggregateExec: mode=Partial, gby=[x@0 as x], aggr=[]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+drop table t_unique_nn;
+
+# A dependency must not be upgraded to Single mode by ignoring unreliable
+# (nullable) dependencies when comparing reachable target sets: below, `a`
+# does not determine `c`, so `a` repeats in the GROUP BY a, c output and the
+# outer DISTINCT must be kept.
+statement ok
+CREATE TABLE t_pk_left (a INT PRIMARY KEY, b INT) AS VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE TABLE t_unique_right (c INT UNIQUE) AS VALUES (5), (7);
+
+query I rowsort
+SELECT DISTINCT a FROM (SELECT a, c FROM t_pk_left CROSS JOIN t_unique_right GROUP BY a, c);
+----
+1
+2
+
+statement ok
+drop table t_pk_left;
+
+statement ok
+drop table t_unique_right;
