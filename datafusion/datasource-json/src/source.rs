@@ -231,6 +231,64 @@ impl FileSource for JsonSource {
     fn file_type(&self) -> &str {
         "json"
     }
+
+    /// Emit a `JsonScan` node wrapping the shared base config; JSON has no
+    /// format-specific fields, so the node is `base_conf` only.
+    #[cfg(feature = "proto")]
+    fn try_to_proto(
+        &self,
+        base: &FileScanConfig,
+        ctx: &datafusion_physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        use datafusion_proto_models::protobuf;
+        use protobuf::physical_plan_node::PhysicalPlanType;
+
+        let node = protobuf::JsonScanExecNode {
+            base_conf: Some(base.try_to_proto(ctx)?),
+        };
+        Ok(Some(protobuf::PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::JsonScan(node)),
+        }))
+    }
+}
+
+#[cfg(feature = "proto")]
+impl JsonSource {
+    /// Reconstruct a `DataSourceExec` (wrapping a `FileScanConfig` over a
+    /// `JsonSource`) from a `JsonScan` [`PhysicalPlanNode`].
+    ///
+    /// The inverse of [`FileSource::try_to_proto`] on `JsonSource`.
+    ///
+    /// [`PhysicalPlanNode`]: datafusion_proto_models::protobuf::PhysicalPlanNode
+    pub fn try_from_proto(
+        node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
+        ctx: &datafusion_physical_plan::proto::ExecutionPlanDecodeCtx<'_>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_datasource::file_scan_config::FileScanConfig;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_proto_models::protobuf;
+
+        let scan = match &node.physical_plan_type {
+            Some(protobuf::physical_plan_node::PhysicalPlanType::JsonScan(scan)) => scan,
+            _ => {
+                return datafusion_common::internal_err!(
+                    "PhysicalPlanNode is not a JsonScan"
+                );
+            }
+        };
+
+        let base_conf = scan.base_conf.as_ref().ok_or_else(|| {
+            datafusion_common::internal_datafusion_err!(
+                "JsonScanExecNode is missing required field 'base_conf'"
+            )
+        })?;
+
+        let table_schema = FileScanConfig::parse_table_schema_from_proto(base_conf)?;
+        let source = Arc::new(JsonSource::new(table_schema));
+
+        let conf = FileScanConfig::try_from_proto(base_conf, ctx, source)?;
+        Ok(DataSourceExec::from_data_source(conf))
+    }
 }
 
 impl FileOpener for JsonOpener {
