@@ -32,7 +32,10 @@ use crate::utils::{
 use arrow::datatypes::DataType;
 use datafusion_common::error::DataFusionErrorBuilder;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{Column, DFSchema, DFSchemaRef, Result, not_impl_err, plan_err};
+use datafusion_common::{
+    Column, DFSchema, DFSchemaRef, Result, get_target_functional_dependencies,
+    not_impl_err, plan_err,
+};
 use datafusion_common::{RecursionUnnestOption, UnnestOptions};
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::builder::get_struct_unnested_columns;
@@ -72,6 +75,26 @@ struct AggregatePlanResult {
     order_by_exprs: Vec<SortExpr>,
     /// DISTINCT ON expressions rewritten to reference aggregate output columns
     on_exprs: Vec<Expr>,
+}
+
+fn aggregate_projection_exprs(group_by_exprs: &[Expr], aggr_exprs: &[Expr]) -> Vec<Expr> {
+    let mut projection_exprs = vec![];
+    for expr in group_by_exprs {
+        match expr {
+            Expr::GroupingSet(GroupingSet::Rollup(exprs))
+            | Expr::GroupingSet(GroupingSet::Cube(exprs)) => {
+                projection_exprs.extend_from_slice(exprs)
+            }
+            Expr::GroupingSet(GroupingSet::GroupingSets(lists_of_exprs)) => {
+                for exprs in lists_of_exprs {
+                    projection_exprs.extend_from_slice(exprs);
+                }
+            }
+            _ => projection_exprs.push(expr.clone()),
+        }
+    }
+    projection_exprs.extend_from_slice(aggr_exprs);
+    projection_exprs
 }
 
 struct DistinctOnUnnestPlanResult {
@@ -1180,12 +1203,64 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         group_by_exprs: &[Expr],
         aggr_exprs: &[Expr],
     ) -> Result<AggregatePlanResult> {
-        // create the aggregate plan
-        let options =
-            LogicalPlanBuilderOptions::new().with_add_implicit_group_by_exprs(true);
+        // Add only functionally dependent columns that are referenced outside
+        // aggregate expressions. Adding every target column and relying on
+        // projection pruning to remove unused ones loses the distinction
+        // between explicit and synthetic GROUP BY expressions.
+        let mut group_by_exprs = group_by_exprs.to_vec();
+        let initial_aggr_projection_exprs =
+            aggregate_projection_exprs(&group_by_exprs, aggr_exprs);
+        let initial_aggr_projection_exprs = initial_aggr_projection_exprs
+            .iter()
+            .map(|expr| resolve_columns(expr, input))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut referenced_columns = HashSet::new();
+        for expr in select_exprs
+            .iter()
+            .chain(having_expr_opt)
+            .chain(qualify_expr_opt)
+            .chain(order_by_exprs.iter().map(|sort_expr| &sort_expr.expr))
+            .chain(on_exprs)
+        {
+            let rebased = rebase_expr(expr, &initial_aggr_projection_exprs, input)?;
+            expr_to_columns(&rebased, &mut referenced_columns)?;
+        }
+
+        let mut group_by_field_names = group_by_exprs
+            .iter()
+            .map(|expr| expr.schema_name().to_string())
+            .collect::<Vec<_>>();
+        if let Some(target_indices) =
+            get_target_functional_dependencies(input.schema(), &group_by_field_names)
+        {
+            // Preserve the existing validation context for invalid queries by
+            // adding every dependent column when at least one referenced input
+            // column is not functionally determined by the grouping keys.
+            let has_invalid_reference = referenced_columns.iter().any(|column| {
+                let Ok(idx) = input.schema().index_of_column(column) else {
+                    return false;
+                };
+                let expr_name = Expr::Column(column.clone()).schema_name().to_string();
+                !group_by_field_names.contains(&expr_name)
+                    && !target_indices.contains(&idx)
+            });
+
+            for idx in target_indices {
+                let column = Column::from(input.schema().qualified_field(idx));
+                let expr = Expr::Column(column.clone());
+                let expr_name = expr.schema_name().to_string();
+                if (has_invalid_reference || referenced_columns.contains(&column))
+                    && !group_by_field_names.contains(&expr_name)
+                {
+                    group_by_field_names.push(expr_name);
+                    group_by_exprs.push(expr);
+                }
+            }
+        }
+
         let plan = LogicalPlanBuilder::from(input.clone())
-            .with_options(options)
-            .aggregate(group_by_exprs.to_vec(), aggr_exprs.to_vec())?
+            .aggregate(group_by_exprs, aggr_exprs.to_vec())?
             .build()?;
         let group_by_exprs = if let LogicalPlan::Aggregate(agg) = &plan {
             &agg.group_expr
@@ -1200,24 +1275,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         // combine the original grouping and aggregate expressions into one list (note that
         // we do not add the "having" expression since that is not part of the projection)
-        let mut aggr_projection_exprs = vec![];
-        for expr in group_by_exprs {
-            match expr {
-                Expr::GroupingSet(GroupingSet::Rollup(exprs)) => {
-                    aggr_projection_exprs.extend_from_slice(exprs)
-                }
-                Expr::GroupingSet(GroupingSet::Cube(exprs)) => {
-                    aggr_projection_exprs.extend_from_slice(exprs)
-                }
-                Expr::GroupingSet(GroupingSet::GroupingSets(lists_of_exprs)) => {
-                    for exprs in lists_of_exprs {
-                        aggr_projection_exprs.extend_from_slice(exprs)
-                    }
-                }
-                _ => aggr_projection_exprs.push(expr.clone()),
-            }
-        }
-        aggr_projection_exprs.extend_from_slice(aggr_exprs);
+        let aggr_projection_exprs =
+            aggregate_projection_exprs(group_by_exprs, aggr_exprs);
 
         // now attempt to resolve columns and replace with fully-qualified columns
         let aggr_projection_exprs = aggr_projection_exprs

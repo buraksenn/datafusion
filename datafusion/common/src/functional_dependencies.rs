@@ -567,9 +567,20 @@ pub fn get_required_group_by_exprs_indices(
     for FunctionalDependence {
         source_indices,
         target_indices,
+        nullable,
         ..
     } in &dependencies.deps
     {
+        // A nullable dependency does not hold for NULL determinant values. If
+        // any determinant field can contain NULL, pruning its target fields
+        // could merge groups whose target values differ.
+        if *nullable
+            && source_indices
+                .iter()
+                .any(|&source_idx| schema.field(source_idx).is_nullable())
+        {
+            continue;
+        }
         if source_indices
             .iter()
             .all(|source_idx| groupby_expr_indices.contains(source_idx))

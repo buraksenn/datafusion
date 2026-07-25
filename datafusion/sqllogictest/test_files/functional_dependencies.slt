@@ -180,24 +180,38 @@ logical_plan
 # 3.2 Nullable UNIQUE: grouping by `x, y` is NOT the same as grouping by
 # `x` -- two NULL rows differ in `y` and belong in separate groups.
 #
-# BUG: `y` is dropped from the GROUP BY and the two NULL groups are merged,
-# so one row goes missing.
-# Expected: `1`, `NULL`, `NULL` (three rows).
-# Issue: https://github.com/apache/datafusion/issues/23819
+# `y` must remain in the grouping keys so all three groups survive.
+# Regression test for https://github.com/apache/datafusion/issues/23819.
 query I rowsort
 SELECT x FROM t_uniq GROUP BY x, y;
 ----
 1
+NULL
 NULL
 
 query TT
 EXPLAIN SELECT x FROM t_uniq GROUP BY x, y;
 ----
 logical_plan
-01)Aggregate: groupBy=[[t_uniq.x]], aggr=[[]]
-02)--TableScan: t_uniq projection=[x]
+01)Projection: t_uniq.x
+02)--Aggregate: groupBy=[[t_uniq.x, t_uniq.y]], aggr=[[]]
+03)----TableScan: t_uniq projection=[x, y]
 
-# 3.3 The same grouping, but with `y` selected so the parent needs it: no
+# 3.3 A UNIQUE determinant remains usable when its source column is NOT NULL.
+statement ok
+CREATE TABLE t_uniq_not_null (x INT NOT NULL UNIQUE, y INT) AS VALUES (1, 10), (2, 20);
+
+query TT
+EXPLAIN SELECT x FROM t_uniq_not_null GROUP BY x, y;
+----
+logical_plan
+01)Aggregate: groupBy=[[t_uniq_not_null.x]], aggr=[[]]
+02)--TableScan: t_uniq_not_null projection=[x]
+
+statement ok
+drop table t_uniq_not_null;
+
+# 3.4 The same grouping, but with `y` selected so the parent needs it: no
 # column can be dropped and the answer is right.
 query II rowsort
 SELECT x, y FROM t_uniq GROUP BY x, y;
