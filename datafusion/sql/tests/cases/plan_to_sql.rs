@@ -115,6 +115,7 @@ fn roundtrip_expr(table: TableReference, sql: &str) -> Result<String> {
 fn roundtrip_statement() -> Result<()> {
     let tests: Vec<&str> = vec![
             "select 1;",
+            "SELECT '123' SIMILAR TO '[0-9]+';",
             "select 1 limit 0;",
             "select ta.j1_id from j1 ta join (select 1 as j1_id) tb on ta.j1_id = tb.j1_id;",
             "select ta.j1_id from j1 ta join (select 1 as j1_id) tb using (j1_id);",

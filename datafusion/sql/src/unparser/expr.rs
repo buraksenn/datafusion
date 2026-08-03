@@ -356,13 +356,12 @@ impl Unparser<'_> {
                 pattern,
                 escape_char,
                 case_insensitive: _,
-            }) => Ok(ast::Expr::Like {
+            }) => Ok(ast::Expr::SimilarTo {
                 negated: *negated,
                 expr: Box::new(self.expr_to_sql_inner(expr)?),
                 pattern: Box::new(self.expr_to_sql_inner(pattern)?),
                 escape_char: escape_char
                     .map(|c| SingleQuotedString(c.to_string()).into()),
-                any: false,
             }),
             Expr::Like(Like {
                 negated,
@@ -2177,9 +2176,19 @@ mod tests {
                     expr: Box::new(col("a")),
                     pattern: Box::new(lit("foo")),
                     escape_char: Some('o'),
-                    case_insensitive: true,
+                    case_insensitive: false,
                 }),
-                r#"a LIKE 'foo' ESCAPE 'o'"#,
+                r#"a SIMILAR TO 'foo' ESCAPE 'o'"#,
+            ),
+            (
+                Expr::SimilarTo(Like {
+                    negated: true,
+                    expr: Box::new(col("a")),
+                    pattern: Box::new(lit("foo")),
+                    escape_char: None,
+                    case_insensitive: false,
+                }),
+                r#"a NOT SIMILAR TO 'foo'"#,
             ),
             (
                 Expr::Literal(ScalarValue::Date64(Some(0)), None),
