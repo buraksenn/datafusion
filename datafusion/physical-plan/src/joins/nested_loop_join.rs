@@ -27,6 +27,7 @@ use super::utils::{
     asymmetric_join_output_partitioning, need_produce_result_in_final,
     reorder_output_after_swap, swap_join_projection,
 };
+use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::common::can_project;
 use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::joins::SharedBitmapBuilder;
@@ -54,17 +55,14 @@ use arrow::array::{
     UInt64Array, new_null_array,
 };
 use arrow::buffer::BooleanBuffer;
-use arrow::compute::{
-    BatchCoalescer, concat_batches, filter, filter_record_batch, not, take,
-};
+use arrow::compute::{concat_batches, filter, filter_record_batch, not, take};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::DataType;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{
-    JoinSide, NullEquality, Result, ScalarValue, Statistics, arrow_err,
-    assert_eq_or_internal_err, internal_datafusion_err, internal_err, project_schema,
-    unwrap_or_internal_err,
+    JoinSide, NullEquality, Result, ScalarValue, Statistics, assert_eq_or_internal_err,
+    internal_datafusion_err, internal_err, project_schema, unwrap_or_internal_err,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::{SpillFile, TaskContext};
@@ -633,6 +631,9 @@ impl ExecutionPlan for NestedLoopJoinExec {
         let load_reservation =
             MemoryConsumer::new(format!("NestedLoopJoinLoad[{partition}]"))
                 .register(context.memory_pool());
+        let output_reservation =
+            MemoryConsumer::new(format!("NestedLoopJoinOutput[{partition}]"))
+                .register(context.memory_pool());
 
         let build_side_data = self.build_side_data.try_once(|| {
             let stream = self.left.execute(0, Arc::clone(&context))?;
@@ -687,6 +688,7 @@ impl ExecutionPlan for NestedLoopJoinExec {
             metrics,
             batch_size,
             spill_state,
+            output_reservation,
         )))
     }
 
@@ -1139,7 +1141,7 @@ pub(crate) struct NestedLoopJoinStream {
     state: NLJState,
     /// Output buffer holds the join result to output. It will emit eagerly when
     /// the threshold is reached.
-    output_buffer: Box<BatchCoalescer>,
+    output_buffer: LimitedBatchCoalescer,
     /// See comments in [`NLJState::Done`] for its purpose
     handled_empty_output: bool,
 
@@ -1456,6 +1458,7 @@ impl NestedLoopJoinStream {
         metrics: NestedLoopJoinMetrics,
         batch_size: usize,
         spill_state: SpillState,
+        output_reservation: MemoryReservation,
     ) -> Self {
         Self {
             output_schema: Arc::clone(&schema),
@@ -1466,7 +1469,16 @@ impl NestedLoopJoinStream {
             left_data,
             metrics,
             buffered_left_data: None,
-            output_buffer: Box::new(BatchCoalescer::new(schema, batch_size)),
+            // Unenforced: the memory-limited path completes queries by
+            // spilling the build side; failing this bounded, unspillable
+            // output buffer would defeat that.
+            output_buffer: LimitedBatchCoalescer::new_exact_with_reservation(
+                schema,
+                batch_size,
+                None,
+                output_reservation,
+            )
+            .with_unenforced_accounting(),
             batch_size,
             current_right_batch: None,
             current_right_batch_matched: None,
@@ -1953,13 +1965,13 @@ impl NestedLoopJoinStream {
             "This state is yielding output for unmatched rows in the current right batch, so both the right batch and the bitmap must be present"
         );
         match self.process_right_unmatched() {
-            Ok(Some(batch)) => match self.output_buffer.push_batch(batch) {
+            Ok(Some(batch)) => match self.push_output_batch(batch) {
                 Ok(()) => {
                     debug_assert!(self.current_right_batch.is_none());
                     self.state = NLJState::FetchingRight;
                     ControlFlow::Continue(())
                 }
-                Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
+                Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
             },
             Ok(None) => {
                 debug_assert!(self.current_right_batch.is_none());
@@ -2017,48 +2029,64 @@ impl NestedLoopJoinStream {
             // Continue processing until we have processed all unmatched rows
             Ok(true) => ControlFlow::Continue(()),
             // We have finished processing all unmatched rows for this chunk
-            Ok(false) => match self.output_buffer.finish_buffered_batch() {
-                Ok(()) => {
-                    // Flush any completed batch before transitioning.
-                    // This is critical for the memory-limited path: the
-                    // ProbeRight results must be emitted before we discard
-                    // the current chunk and load the next one.
-                    if let Some(poll) = self.maybe_flush_ready_batch() {
-                        return ControlFlow::Break(poll);
-                    }
-
-                    if !self.left_exhausted && self.is_memory_limited() {
-                        // More left data to process — free current chunk and
-                        // go back to BufferingLeft for the next chunk
-                        if let SpillState::Active(ref active) = self.spill_state {
-                            active.reservation.resize(0);
+            Ok(false) => {
+                // Decide the next state first: it determines whether the
+                // output buffer must stay open (later chunks or the replay
+                // pass push more batches) or can be finished for good.
+                let next_state = if !self.left_exhausted && self.is_memory_limited() {
+                    // More left data to process — free current chunk and
+                    // go back to BufferingLeft for the next chunk
+                    NLJState::BufferingLeft
+                } else if self.is_memory_limited() && self.should_track_unmatched_right {
+                    // All left chunks done — emit global right unmatched
+                    NLJState::EmitGlobalRightUnmatched
+                } else {
+                    NLJState::Done
+                };
+                let flush_result = if matches!(next_state, NLJState::Done) {
+                    self.output_buffer.finish()
+                } else {
+                    self.output_buffer.flush_buffered_batch()
+                };
+                match flush_result {
+                    Ok(()) => {
+                        // Flush any completed batch before transitioning.
+                        // This is critical for the memory-limited path: the
+                        // ProbeRight results must be emitted before we discard
+                        // the current chunk and load the next one.
+                        if let Some(poll) = self.maybe_flush_ready_batch() {
+                            return ControlFlow::Break(poll);
                         }
-                        self.buffered_left_data = None;
-                        self.left_probe_idx = 0;
-                        self.left_emit_idx = 0;
-                        // Each memory-limited chunk gets a fresh per-chunk
-                        // `JoinLeftData`/counter; `is_unmatched_left_emitter` is
-                        // recomputed when `ProbeEnd` is re-entered for the next
-                        // chunk, so it does not need to be reset here.
-                        self.state = NLJState::BufferingLeft;
-                    } else if self.is_memory_limited()
-                        && self.should_track_unmatched_right
-                    {
-                        // All left chunks done — emit global right unmatched.
-                        // Drop the exhausted right stream so that
-                        // EmitGlobalRightUnmatched opens a fresh replay pass
-                        // from the spill file. (process_left_unmatched_range
-                        // already ran with right_data still set, so its
-                        // schema access is not affected.)
-                        self.right_data = None;
-                        self.state = NLJState::EmitGlobalRightUnmatched;
-                    } else {
-                        self.state = NLJState::Done;
+
+                        match next_state {
+                            NLJState::BufferingLeft => {
+                                if let SpillState::Active(ref active) = self.spill_state {
+                                    active.reservation.resize(0);
+                                }
+                                self.buffered_left_data = None;
+                                self.left_probe_idx = 0;
+                                self.left_emit_idx = 0;
+                                // Each memory-limited chunk gets a fresh per-chunk
+                                // `JoinLeftData`/counter; `is_unmatched_left_emitter` is
+                                // recomputed when `ProbeEnd` is re-entered for the next
+                                // chunk, so it does not need to be reset here.
+                            }
+                            NLJState::EmitGlobalRightUnmatched => {
+                                // Drop the exhausted right stream so that
+                                // EmitGlobalRightUnmatched opens a fresh replay pass
+                                // from the spill file. (process_left_unmatched_range
+                                // already ran with right_data still set, so its
+                                // schema access is not affected.)
+                                self.right_data = None;
+                            }
+                            _ => {}
+                        }
+                        self.state = next_state;
+                        ControlFlow::Continue(())
                     }
-                    ControlFlow::Continue(())
+                    Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
                 }
-                Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
-            },
+            }
             Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
         }
     }
@@ -2137,9 +2165,9 @@ impl NestedLoopJoinStream {
                     self.join_type,
                     JoinSide::Right,
                 ) {
-                    Ok(Some(batch)) => match self.output_buffer.push_batch(batch) {
+                    Ok(Some(batch)) => match self.push_output_batch(batch) {
                         Ok(()) => ControlFlow::Continue(()),
-                        Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
+                        Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
                     },
                     Ok(None) => ControlFlow::Continue(()),
                     Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
@@ -2148,12 +2176,12 @@ impl NestedLoopJoinStream {
             Poll::Ready(Some(Err(e))) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
             Poll::Ready(None) => {
                 // All right batches replayed
-                match self.output_buffer.finish_buffered_batch() {
+                match self.output_buffer.finish() {
                     Ok(()) => {
                         self.state = NLJState::Done;
                         ControlFlow::Continue(())
                     }
-                    Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
+                    Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
                 }
             }
             Poll::Pending => ControlFlow::Break(Poll::Pending),
@@ -2243,7 +2271,7 @@ impl NestedLoopJoinStream {
             )?;
 
             if let Some(batch) = joined_batch {
-                self.output_buffer.push_batch(batch)?;
+                self.push_output_batch(batch)?;
             }
 
             self.left_probe_idx += l_row_count;
@@ -2256,7 +2284,7 @@ impl NestedLoopJoinStream {
             self.process_single_left_row_join(&left_data, &right_batch, l_idx)?;
 
         if let Some(batch) = joined_batch {
-            self.output_buffer.push_batch(batch)?;
+            self.push_output_batch(batch)?;
         }
 
         // ==== Prepare for the next iteration ====
@@ -2548,7 +2576,7 @@ impl NestedLoopJoinStream {
         if let Some(batch) =
             self.process_left_unmatched_range(left_data, start_idx, end_idx)?
         {
-            self.output_buffer.push_batch(batch)?;
+            self.push_output_batch(batch)?;
         }
 
         // ==== Prepare for the next iteration ====
@@ -2654,12 +2682,19 @@ impl NestedLoopJoinStream {
             .ok_or_else(|| internal_datafusion_err!("LeftData should be available"))
     }
 
+    fn push_output_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        match self.output_buffer.push_batch(batch)? {
+            PushBatchStatus::Continue => Ok(()),
+            PushBatchStatus::LimitReached => {
+                internal_err!("nested loop join output coalescer has no fetch limit")
+            }
+        }
+    }
+
     /// Flush the `output_buffer` if there are batches ready to output
     /// None if no result batch ready.
     fn maybe_flush_ready_batch(&mut self) -> Option<Poll<Option<Result<RecordBatch>>>> {
-        if self.output_buffer.has_completed_batch()
-            && let Some(batch) = self.output_buffer.next_completed_batch()
-        {
+        if let Some(batch) = self.output_buffer.next_completed_batch() {
             // Update output rows for selectivity metric
             let output_rows = batch.num_rows();
             self.metrics.selectivity.add_part(output_rows);
