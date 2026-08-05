@@ -20,8 +20,7 @@
 use arrow::{
     array::{Array, AsArray},
     compute::{
-        BatchCoalescer, FilterBuilder, interleave_record_batch, prep_null_mask_filter,
-        take_record_batch,
+        FilterBuilder, interleave_record_batch, prep_null_mask_filter, take_record_batch,
     },
     row::{OwnedRow, RowConverter, Rows, SortField},
 };
@@ -34,6 +33,7 @@ use super::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricCategory,
     RecordOutput,
 };
+use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::spill::get_record_batch_memory_size;
 use crate::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 
@@ -790,7 +790,7 @@ impl TopK {
         let Self {
             schema,
             metrics,
-            reservation: _,
+            reservation,
             batch_size,
             expr: _,
             row_converter: _,
@@ -807,26 +807,25 @@ impl TopK {
         // local emitter marks the dynamic filter complete.
         filter.read().mark_topk_emitted();
 
-        // break into record batches as needed
-        let mut batches = vec![];
-        if let Some(mut batch) = heap.emit()? {
-            (&batch).record_output(&metrics.baseline);
-
-            loop {
-                if batch.num_rows() <= batch_size {
-                    batches.push(Ok(batch));
-                    break;
-                } else {
-                    batches.push(Ok(batch.slice(0, batch_size)));
-                    let remaining_length = batch.num_rows() - batch_size;
-                    batch = batch.slice(batch_size, remaining_length);
-                }
-            }
+        let Some(batch) = heap.emit()? else {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::empty::<Result<RecordBatch>>(),
+            )));
         };
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        (&batch).record_output(&metrics.baseline);
+
+        // Preserve the original zero-copy slicing path. Every emitted slice
+        // shares `batch`'s backing buffers, so retain one charge for the full
+        // batch until the stream is exhausted or dropped.
+        let output_reservation = reservation.new_empty();
+        output_reservation.try_grow(batch.get_array_memory_size())?;
+        Ok(sliced_output_stream(
             schema,
-            futures::stream::iter(batches),
-        )))
+            batch,
+            batch_size,
+            output_reservation,
+        ))
     }
 
     /// return the size of memory used by this operator, in bytes
@@ -1410,7 +1409,7 @@ impl PartitionedTopK {
         let Self {
             schema,
             metrics,
-            reservation: _,
+            reservation,
             expr: _,
             row_converter: _,
             scratch_rows: _,
@@ -1425,26 +1424,24 @@ impl PartitionedTopK {
         let mut sorted_pks: Vec<OwnedRow> = heaps.keys().cloned().collect();
         sorted_pks.sort();
 
-        let mut coalescer = BatchCoalescer::new(Arc::clone(&schema), batch_size);
+        let output_reservation = reservation.new_empty();
+        let mut coalescer = LimitedBatchCoalescer::new_exact_with_reservation(
+            Arc::clone(&schema),
+            batch_size,
+            None,
+            output_reservation,
+        );
 
         for pk in sorted_pks {
             let mut heap = heaps.remove(&pk).expect("key from heaps.keys()");
             if let Some(batch) = heap.emit()? {
                 (&batch).record_output(&metrics.baseline);
-                coalescer.push_batch(batch)?;
+                push_coalesced_output(&mut coalescer, batch)?;
             }
         }
-        coalescer.finish_buffered_batch()?;
+        coalescer.finish()?;
 
-        let mut out: Vec<Result<RecordBatch>> = Vec::new();
-        while let Some(b) = coalescer.next_completed_batch() {
-            out.push(Ok(b));
-        }
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::iter(out),
-        )))
+        Ok(coalesced_output_stream(schema, coalescer))
     }
 
     /// Total memory currently held by this operator, including all
@@ -1457,6 +1454,50 @@ impl PartitionedTopK {
             + self.heaps.values().map(|h| h.size()).sum::<usize>()
             + self.heaps.capacity() * (size_of::<OwnedRow>() + size_of::<TopKHeap>())
     }
+}
+
+fn push_coalesced_output(
+    coalescer: &mut LimitedBatchCoalescer,
+    batch: RecordBatch,
+) -> Result<()> {
+    match coalescer.push_batch(batch)? {
+        PushBatchStatus::Continue => Ok(()),
+        PushBatchStatus::LimitReached => {
+            internal_err!("TopK output coalescer has no fetch limit")
+        }
+    }
+}
+
+fn sliced_output_stream(
+    schema: SchemaRef,
+    batch: RecordBatch,
+    batch_size: usize,
+    reservation: MemoryReservation,
+) -> SendableRecordBatchStream {
+    let stream = futures::stream::unfold(
+        (batch, 0, reservation),
+        move |(batch, offset, reservation)| async move {
+            if offset == batch.num_rows() {
+                return None;
+            }
+            let len = batch_size.min(batch.num_rows() - offset);
+            let output = batch.slice(offset, len);
+            Some((Ok(output), (batch, offset + len, reservation)))
+        },
+    );
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+}
+
+fn coalesced_output_stream(
+    schema: SchemaRef,
+    coalescer: LimitedBatchCoalescer,
+) -> SendableRecordBatchStream {
+    let stream = futures::stream::unfold(coalescer, |mut coalescer| async move {
+        coalescer
+            .next_completed_batch()
+            .map(|batch| (Ok(batch), coalescer))
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// A run of rows from a single source [`RecordBatch`] that tied at the
@@ -1753,7 +1794,7 @@ impl PartitionedTopKRank {
         let Self {
             schema,
             metrics,
-            reservation: _,
+            reservation,
             expr: _,
             row_converter: _,
             scratch_rows: _,
@@ -1769,33 +1810,31 @@ impl PartitionedTopKRank {
         let mut sorted_pks: Vec<OwnedRow> = states.keys().cloned().collect();
         sorted_pks.sort();
 
-        let mut coalescer = BatchCoalescer::new(Arc::clone(&schema), batch_size);
+        let output_reservation = reservation.new_empty();
+        let mut coalescer = LimitedBatchCoalescer::new_exact_with_reservation(
+            Arc::clone(&schema),
+            batch_size,
+            None,
+            output_reservation,
+        );
 
         for pk in sorted_pks {
             let RankPartitionState { mut heap, ties, .. } =
                 states.remove(&pk).expect("key from states.keys()");
             if let Some(batch) = heap.emit()? {
                 (&batch).record_output(&metrics.baseline);
-                coalescer.push_batch(batch)?;
+                push_coalesced_output(&mut coalescer, batch)?;
             }
             for tie in ties {
                 let indices = UInt32Array::from(tie.row_indices);
                 let tie_batch = take_record_batch(&tie.batch, &indices)?;
                 (&tie_batch).record_output(&metrics.baseline);
-                coalescer.push_batch(tie_batch)?;
+                push_coalesced_output(&mut coalescer, tie_batch)?;
             }
         }
-        coalescer.finish_buffered_batch()?;
+        coalescer.finish()?;
 
-        let mut out: Vec<Result<RecordBatch>> = Vec::new();
-        while let Some(b) = coalescer.next_completed_batch() {
-            out.push(Ok(b));
-        }
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::iter(out),
-        )))
+        Ok(coalesced_output_stream(schema, coalescer))
     }
 
     /// Total memory currently held, including all per-partition states.
@@ -2770,6 +2809,58 @@ mod tests {
                 "+----+-----+",
             ],
             &results
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn test_topk_output_memory_accounting_across_yield_and_drop() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("value", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+        let runtime = Arc::new(RuntimeEnv::default());
+        let pool = Arc::clone(&runtime.memory_pool);
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            vec![],
+            LexOrdering::from([sort_expr]),
+            3,
+            1,
+            runtime,
+            &ExecutionPlanMetricsSet::new(),
+            make_topk_filter(),
+        )?;
+        topk.insert_batch(RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![3, 1, 2]))],
+        )?)?;
+
+        let mut output = topk.emit()?;
+        let reserved_after_emit = pool.reserved();
+        assert!(
+            reserved_after_emit > 0,
+            "emitted batches must remain reserved while buffered"
+        );
+
+        let first = output.try_next().await?.expect("first output batch");
+        assert_eq!(first.num_rows(), 1, "fixture must span multiple batches");
+        let reserved_after_yield = pool.reserved();
+        assert_eq!(
+            reserved_after_yield, reserved_after_emit,
+            "zero-copy slices share one fully reserved backing batch"
+        );
+
+        drop(output);
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "dropping the stream releases all memory"
         );
         Ok(())
     }
