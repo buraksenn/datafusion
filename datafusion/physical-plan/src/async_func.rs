@@ -26,6 +26,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::{FieldRef, Fields, Schema, SchemaRef};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{Result, assert_eq_or_internal_err};
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::async_scalar_function::AsyncFuncExpr;
@@ -208,12 +209,15 @@ impl ExecutionPlan for AsyncFuncExec {
         let schema_captured = self.schema();
         let config_options_ref = Arc::clone(context.session_config().options());
 
+        let reservation = MemoryConsumer::new(format!("AsyncFuncInput[{partition}]"))
+            .register(context.memory_pool());
         let coalesced_input_stream = CoalesceInputStream {
             input_stream,
-            batch_coalescer: LimitedBatchCoalescer::new(
+            batch_coalescer: LimitedBatchCoalescer::new_with_reservation(
                 Arc::clone(&self.input.schema()),
                 config_options_ref.execution.batch_size.get(),
                 None,
+                reservation,
             ),
         };
 

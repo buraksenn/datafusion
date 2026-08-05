@@ -61,7 +61,7 @@ use datafusion_common::{
 use datafusion_common::{Result, not_impl_err};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::MemoryConsumer;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr, RangePartitioning};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
@@ -199,10 +199,23 @@ impl PartitionSpillWriters {
 }
 
 impl OutputChannel {
-    fn coalesce(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    /// Push `batch` through the shared coalescer (if any) and return the
+    /// completed batches, each paired with the staging charge it carries.
+    /// Callers must pass that charge to [`Self::release_staged`] right
+    /// before handing the batch to [`Self::send`], so batches awaiting their
+    /// turn stay accounted without double-counting the one being sent.
+    fn coalesce(&mut self, batch: RecordBatch) -> Result<Vec<(RecordBatch, usize)>> {
         match &self.shared_coalescer {
             Some(shared) => Ok(shared.push_and_drain(batch)?),
-            None => Ok(vec![batch]),
+            None => Ok(vec![(batch, 0)]),
+        }
+    }
+
+    /// Release the staging charge carried by a batch returned from
+    /// [`Self::coalesce`].
+    fn release_staged(&self, charged_bytes: usize) {
+        if let Some(shared) = &self.shared_coalescer {
+            shared.release_staged(charged_bytes);
         }
     }
 
@@ -237,7 +250,10 @@ impl OutputChannel {
         let Some(shared) = self.shared_coalescer.take() else {
             return Ok(());
         };
-        for batch in shared.finalize()? {
+        for (batch, charged_bytes) in shared.finalize()? {
+            // Hand the charge over right before `send` re-accounts (or
+            // spills) the batch.
+            shared.release_staged(charged_bytes);
             // If this errored, it means that nobody is listening on the other side, which is fine
             // and can happen in certain cases, like when a LIMIT drops the stream that listens.
             let _ = self.send(batch).await;
@@ -254,41 +270,59 @@ impl OutputChannel {
 /// into it. The last task to call [`Self::finalize`] is the one that
 /// finalizes the coalescer and ships the residual batch.
 ///
-/// Cheap to [`Clone`]: both fields are [`Arc`]s.
+/// Cheap to [`Clone`]: all fields are [`Arc`]s.
 #[derive(Clone)]
 struct SharedCoalescer {
     inner: Arc<Mutex<LimitedBatchCoalescer>>,
+    /// Holds the charge for batches drained out of `inner` until the
+    /// receiving channel has re-accounted or spilled them.
+    staging: Arc<MemoryReservation>,
     active_senders: Arc<AtomicUsize>,
 }
 
 impl SharedCoalescer {
-    fn new(schema: SchemaRef, target_batch_size: usize, num_senders: usize) -> Self {
+    fn new(
+        schema: SchemaRef,
+        target_batch_size: usize,
+        num_senders: usize,
+        reservation: MemoryReservation,
+    ) -> Self {
+        let staging = Arc::new(reservation.new_empty());
         Self {
-            inner: Arc::new(Mutex::new(LimitedBatchCoalescer::new(
-                schema,
-                target_batch_size,
-                None,
-            ))),
+            // Unenforced: repartitioning handles memory pressure by spilling
+            // at the channel level (see `OutputChannel::send`); failing this
+            // bounded pre-channel buffer would defeat that.
+            inner: Arc::new(Mutex::new(
+                LimitedBatchCoalescer::new_with_reservation(
+                    schema,
+                    target_batch_size,
+                    None,
+                    reservation,
+                )
+                .with_unenforced_accounting(),
+            )),
+            staging,
             active_senders: Arc::new(AtomicUsize::new(num_senders)),
         }
     }
 
     /// Push `batch` into the coalescer and drain any newly completed
-    /// batches. The mutex is held only briefly.
-    fn push_and_drain(&self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    /// batches together with the staging charge each one carries. The mutex
+    /// is held only briefly.
+    fn push_and_drain(&self, batch: RecordBatch) -> Result<Vec<(RecordBatch, usize)>> {
         let mut acc = Vec::new();
         let mut c = self.inner.lock();
         c.push_batch(batch)?;
-        while let Some(b) = c.next_completed_batch() {
-            acc.push(b);
+        while let Some(entry) = c.next_completed_batch_with_reservation(&self.staging) {
+            acc.push(entry);
         }
         Ok(acc)
     }
 
     /// Decrement the active-senders counter. If this caller was the last
     /// sender, finalize the coalescer and return its residual batches; if
-    /// other senders are still active, return `Ok(None)`.
-    fn finalize(&self) -> Result<Vec<RecordBatch>> {
+    /// other senders are still active, return an empty `Vec`.
+    fn finalize(&self) -> Result<Vec<(RecordBatch, usize)>> {
         let was_last = self.active_senders.fetch_sub(1, AtomicOrdering::AcqRel) == 1;
         if !was_last {
             return Ok(vec![]);
@@ -296,10 +330,18 @@ impl SharedCoalescer {
         let mut acc = Vec::new();
         let mut c = self.inner.lock();
         c.finish()?;
-        while let Some(b) = c.next_completed_batch() {
-            acc.push(b);
+        while let Some(entry) = c.next_completed_batch_with_reservation(&self.staging) {
+            acc.push(entry);
         }
         Ok(acc)
+    }
+
+    /// Release the staging charge for a drained batch once the channel has
+    /// re-accounted, spilled, or dropped it.
+    fn release_staged(&self, charged_bytes: usize) {
+        if charged_bytes > 0 {
+            self.staging.shrink(charged_bytes);
+        }
     }
 }
 
@@ -525,13 +567,19 @@ impl RepartitionExecState {
             // the consumer never sees the per-input-task small batches.
             // Skip in preserve-order mode: each input has its own dedicated
             // channel and `StreamingMergeBuilder` handles batching.
-            let shared_coalescer = (!preserve_order).then(|| {
-                SharedCoalescer::new(
+            let shared_coalescer = if preserve_order {
+                None
+            } else {
+                let coalescer_reservation =
+                    MemoryConsumer::new(format!("{name}[Coalesce {partition}]"))
+                        .register(context.memory_pool());
+                Some(SharedCoalescer::new(
                     input.schema(),
                     context.session_config().batch_size(),
                     num_input_partitions,
-                )
-            });
+                    coalescer_reservation,
+                ))
+            };
 
             channels.insert(
                 partition,
@@ -1908,13 +1956,20 @@ impl RepartitionExec {
                 let timer = metrics.send_time[partition].timer();
                 // if there is still a receiver, send to it
                 if let Some(output_channel) = output_channels.get_mut(&partition) {
-                    for batch in output_channel.coalesce(batch)? {
-                        if output_channel.send(batch).await.is_err() {
-                            // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
-                            // so ignore this channel from now on.
-                            output_channels.remove(&partition);
-                            break;
+                    let mut hung_up = false;
+                    for (batch, charged_bytes) in output_channel.coalesce(batch)? {
+                        // Hand the charge over right before `send`
+                        // re-accounts (or spills) the batch; batches still
+                        // waiting in this list remain staged.
+                        output_channel.release_staged(charged_bytes);
+                        if !hung_up {
+                            hung_up = output_channel.send(batch).await.is_err();
                         }
+                    }
+                    if hung_up {
+                        // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
+                        // so ignore this channel from now on.
+                        output_channels.remove(&partition);
                     }
                 }
                 timer.done();
@@ -2244,9 +2299,40 @@ mod tests {
     use datafusion_common::test_util::batches_to_sort_string;
     use datafusion_common_runtime::JoinSet;
     use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_physical_expr::{PhysicalSortExpr, RangePartitioning, SplitPoint};
     use insta::assert_snapshot;
+
+    #[test]
+    fn shared_coalescer_stages_final_batch_until_released() -> Result<()> {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(UInt32Array::from(vec![1])) as ArrayRef,
+        )])?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("RepartitionCoalescerTest").register(&pool);
+        let coalescer = SharedCoalescer::new(batch.schema(), 4, 2, reservation);
+        let other_sender = coalescer.clone();
+
+        assert!(coalescer.push_and_drain(batch)?.is_empty());
+        assert!(coalescer.finalize()?.is_empty());
+
+        let output = other_sender.finalize()?;
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].0.num_rows(), 1);
+        let charged_bytes = output[0].1;
+        assert!(charged_bytes > 0);
+        assert_eq!(coalescer.staging.size(), charged_bytes);
+
+        coalescer.release_staged(charged_bytes);
+        assert_eq!(coalescer.staging.size(), 0);
+        drop(output);
+        drop(other_sender);
+        drop(coalescer);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
 
     #[test]
     fn strength_reduced_u64_remainder_matches_modulo() {
