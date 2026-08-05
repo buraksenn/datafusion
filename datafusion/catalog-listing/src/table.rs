@@ -752,7 +752,11 @@ impl TableProvider for ListingTable {
             table_partition_cols: self.options.table_partition_cols.clone(),
             insert_op,
             keep_partition_by_columns,
-            file_extension: self.options().format.get_ext(),
+            file_extension: match self.options.file_extension.trim_start_matches('.') {
+                "" => self.options().format.get_ext(),
+                extension => extension.to_string(),
+            },
+            overwrite_file_extension: Some(self.options.file_extension.clone()),
             file_output_mode: FileOutputMode::Automatic,
         };
 

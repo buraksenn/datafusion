@@ -22,12 +22,12 @@ use crate::datasource::file_format::{
 };
 
 use super::{
-    DataFrame, DataFrameWriteOptions, DataFusionError, LogicalPlanBuilder, RecordBatch,
+    DataFrame, DataFrameWriteOptions, DataFusionError, LogicalPlan, LogicalPlanBuilder,
+    RecordBatch,
 };
 
 use datafusion_common::config::TableParquetOptions;
-use datafusion_common::not_impl_err;
-use datafusion_expr::dml::InsertOp;
+use datafusion_expr::dml::CopyTo;
 
 impl DataFrame {
     /// Execute the `DataFrame` and write the results to Parquet file(s).
@@ -61,13 +61,6 @@ impl DataFrame {
         options: DataFrameWriteOptions,
         writer_options: Option<TableParquetOptions>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        if options.insert_op != InsertOp::Append {
-            return not_impl_err!(
-                "{} is not implemented for DataFrame::write_parquet.",
-                options.insert_op
-            );
-        }
-
         let format = if let Some(parquet_opts) = writer_options {
             Arc::new(ParquetFormatFactory::new_with_options(parquet_opts))
         } else {
@@ -86,14 +79,14 @@ impl DataFrame {
                 .build()?
         };
 
-        let plan = LogicalPlanBuilder::copy_to(
-            plan,
+        let plan = LogicalPlan::Copy(CopyTo::new_with_insert_op(
+            Arc::new(plan),
             path.into(),
+            options.partition_by,
             file_type,
             copy_options,
-            options.partition_by,
-        )?
-        .build()?;
+            options.insert_op,
+        ));
         DataFrame {
             session_state: self.session_state,
             plan,

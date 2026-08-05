@@ -78,9 +78,8 @@ use datafusion_common::{
     TableReference, internal_datafusion_err, internal_err, not_impl_err, plan_err,
 };
 use datafusion_execution::TaskContext;
-use datafusion_expr::dml::CopyTo;
 use datafusion_expr::dml::{
-    MergeIntoAction, MergeIntoClause, MergeIntoClauseKind, MergeIntoOp,
+    CopyTo, InsertOp, MergeIntoAction, MergeIntoClause, MergeIntoClauseKind, MergeIntoOp,
 };
 use datafusion_expr::expr::{
     self, Between, BinaryExpr, Case, Cast, GroupingSet, InList, LambdaVariable, Like,
@@ -832,26 +831,61 @@ fn parse_merge_into_action_missing_oneof_errors() {
     );
 }
 
-#[tokio::test]
-async fn roundtrip_logical_plan_copy_to_sql_options() -> Result<()> {
-    let ctx = SessionContext::new();
+#[test]
+fn copy_to_proto_preserves_legacy_format_tags() {
+    let node = protobuf::CopyToNode {
+        insert_op: protobuf::InsertOp::Overwrite as i32,
+        options: HashMap::from([("k".to_string(), "v".to_string())]),
+        ..Default::default()
+    };
+    assert_eq!(
+        node.encode_to_vec(),
+        [0x68, 0x01, 0x72, 0x06, 0x0a, 0x01, b'k', 0x12, 0x01, b'v']
+    );
 
+    // Tags 8 and 9 were legacy format oneofs and must remain ignored.
+    let legacy =
+        protobuf::CopyToNode::decode([0x42, 0x00, 0x4a, 0x00].as_slice()).unwrap();
+    assert_eq!(legacy.insert_op(), protobuf::InsertOp::Append);
+    assert!(legacy.options.is_empty());
+}
+
+#[tokio::test]
+async fn roundtrip_logical_plan_copy_to() -> Result<()> {
+    let ctx = SessionContext::new();
     let input = create_csv_scan(&ctx).await?;
     let file_type = format_as_file_type(Arc::new(CsvFormatFactory::new()));
-
-    let plan = LogicalPlan::Copy(CopyTo::new(
-        Arc::new(input),
-        "test.csv".to_string(),
-        vec!["a".to_string(), "b".to_string(), "c".to_string()],
-        file_type,
-        Default::default(),
-    ));
-
     let codec = CsvLogicalExtensionCodec {};
-    let bytes = logical_plan_to_bytes_with_extension_codec(&plan, &codec)?;
-    let logical_round_trip =
-        logical_plan_from_bytes_with_extension_codec(&bytes, &ctx.task_ctx(), &codec)?;
-    assert_eq!(format!("{plan}"), format!("{logical_round_trip}"));
+
+    for insert_op in [InsertOp::Append, InsertOp::Overwrite, InsertOp::Replace] {
+        for single_file_output in ["true", "false"] {
+            let options = HashMap::from([(
+                "single_file_output".to_string(),
+                single_file_output.to_string(),
+            )]);
+            let plan = LogicalPlan::Copy(CopyTo::new_with_insert_op(
+                Arc::new(input.clone()),
+                "test.csv".to_string(),
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                Arc::clone(&file_type),
+                options.clone(),
+                insert_op,
+            ));
+
+            let bytes = logical_plan_to_bytes_with_extension_codec(&plan, &codec)?;
+            let round_trip = logical_plan_from_bytes_with_extension_codec(
+                &bytes,
+                &ctx.task_ctx(),
+                &codec,
+            )?;
+            assert_eq!(plan, round_trip);
+            assert_eq!(format!("{plan}"), format!("{round_trip}"));
+            let LogicalPlan::Copy(copy) = round_trip else {
+                unreachable!()
+            };
+            assert_eq!(copy.options, options);
+        }
+    }
 
     Ok(())
 }

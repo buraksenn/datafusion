@@ -53,13 +53,15 @@ use arrow_schema::FieldRef;
 use datafusion_common::config::{CsvOptions, JsonOptions};
 use datafusion_common::{
     Column, DFSchema, DataFusionError, ParamValues, ScalarValue, SchemaError,
-    TableReference, UnnestOptions, exec_err, internal_datafusion_err, not_impl_err,
+    TableReference, UnnestOptions, exec_err, internal_datafusion_err,
     plan_datafusion_err, plan_err, unqualified_field_not_found,
 };
 use datafusion_expr::select_expr::SelectExpr;
 use datafusion_expr::{
     ExplainOption, ScalarUDF, SortExpr, TableProviderFilterPushDown, UNNAMED_TABLE, case,
-    dml::InsertOp, is_null, lit, utils::COUNT_STAR_EXPANSION,
+    dml::{CopyTo, InsertOp},
+    is_null, lit,
+    utils::COUNT_STAR_EXPANSION,
 };
 use datafusion_functions::core::coalesce;
 use datafusion_functions::math::nanvl;
@@ -101,7 +103,13 @@ impl DataFrameWriteOptions {
         }
     }
 
-    /// Set the insert operation
+    /// Set the insert operation.
+    ///
+    /// For file writes, appending to an existing exact file is rejected, overwrite
+    /// replaces the exact file or the whole directory dataset, and replace is unsupported.
+    /// Directory overwrite deletes the old-file snapshot after writing and is not transactional.
+    /// The exact-file append existence check is not atomic with creation, so concurrent writers
+    /// can race.
     pub fn with_insert_operation(mut self, insert_op: InsertOp) -> Self {
         self.insert_op = insert_op;
         self
@@ -2065,13 +2073,6 @@ impl DataFrame {
         options: DataFrameWriteOptions,
         writer_options: Option<CsvOptions>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        if options.insert_op != InsertOp::Append {
-            return not_impl_err!(
-                "{} is not implemented for DataFrame::write_csv.",
-                options.insert_op
-            );
-        }
-
         let format = if let Some(csv_opts) = writer_options {
             Arc::new(CsvFormatFactory::new_with_options(csv_opts))
         } else {
@@ -2090,14 +2091,14 @@ impl DataFrame {
                 .build()?
         };
 
-        let plan = LogicalPlanBuilder::copy_to(
-            plan,
+        let plan = LogicalPlan::Copy(CopyTo::new_with_insert_op(
+            Arc::new(plan),
             path.into(),
+            options.partition_by,
             file_type,
             copy_options,
-            options.partition_by,
-        )?
-        .build()?;
+            options.insert_op,
+        ));
 
         DataFrame {
             session_state: self.session_state,
@@ -2135,13 +2136,6 @@ impl DataFrame {
         options: DataFrameWriteOptions,
         writer_options: Option<JsonOptions>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        if options.insert_op != InsertOp::Append {
-            return not_impl_err!(
-                "{} is not implemented for DataFrame::write_json.",
-                options.insert_op
-            );
-        }
-
         let format = if let Some(json_opts) = writer_options {
             Arc::new(JsonFormatFactory::new_with_options(json_opts))
         } else {
@@ -2160,14 +2154,14 @@ impl DataFrame {
                 .build()?
         };
 
-        let plan = LogicalPlanBuilder::copy_to(
-            plan,
+        let plan = LogicalPlan::Copy(CopyTo::new_with_insert_op(
+            Arc::new(plan),
             path.into(),
+            options.partition_by,
             file_type,
             copy_options,
-            options.partition_by,
-        )?
-        .build()?;
+            options.insert_op,
+        ));
 
         DataFrame {
             session_state: self.session_state,

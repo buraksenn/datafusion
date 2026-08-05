@@ -820,23 +820,13 @@ impl LogicalPlan {
                     Arc::new(input),
                 )))
             }
-            LogicalPlan::Copy(CopyTo {
-                input: _,
-                output_url,
-                file_type,
-                options,
-                partition_by,
-                output_schema: _,
-            }) => {
+            LogicalPlan::Copy(copy) => {
                 self.assert_no_expressions(expr)?;
                 let input = self.only_input(inputs)?;
-                Ok(LogicalPlan::Copy(CopyTo::new(
-                    Arc::new(input),
-                    output_url.clone(),
-                    partition_by.clone(),
-                    Arc::clone(file_type),
-                    options.clone(),
-                )))
+                Ok(LogicalPlan::Copy(CopyTo {
+                    input: Arc::new(input),
+                    ..copy.clone()
+                }))
             }
             LogicalPlan::Values(Values { schema, .. }) => {
                 self.assert_no_inputs(inputs)?;
@@ -2026,6 +2016,7 @@ impl LogicalPlan {
                         output_url,
                         file_type,
                         options,
+                        insert_op,
                         ..
                     }) => {
                         let op_str = options
@@ -2036,7 +2027,7 @@ impl LogicalPlan {
 
                         write!(
                             f,
-                            "CopyTo: format={} output_url={output_url} options: ({op_str})",
+                            "CopyTo: format={} output_url={output_url} insert_op={insert_op:?} options: ({op_str})",
                             file_type.get_ext()
                         )
                     }

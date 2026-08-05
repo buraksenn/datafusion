@@ -77,7 +77,7 @@ use datafusion_common::{
 };
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_expr::dml::{CopyTo, InsertOp};
+use datafusion_expr::dml::CopyTo;
 use datafusion_expr::expr::{
     Alias, GroupingSet, NullTreatment, WindowFunction, WindowFunctionParams,
     physical_name,
@@ -652,6 +652,7 @@ impl DefaultPhysicalPlanner {
                 file_type,
                 partition_by,
                 options: source_option_tuples,
+                insert_op,
                 output_schema: _,
             }) => {
                 let original_url = output_url.clone();
@@ -730,9 +731,10 @@ impl DefaultPhysicalPlanner {
                     file_group: FileGroup::default(),
                     output_schema: schema,
                     table_partition_cols,
-                    insert_op: InsertOp::Append,
+                    insert_op: *insert_op,
                     keep_partition_by_columns,
                     file_extension,
+                    overwrite_file_extension: None,
                     file_output_mode,
                 };
 

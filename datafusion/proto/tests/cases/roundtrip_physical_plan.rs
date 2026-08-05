@@ -111,6 +111,7 @@ use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err,
 };
 use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file_sink_config::FileSink;
 use datafusion_datasource::{TableSchema, TableSchemaBuilder};
 use datafusion_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion_expr::dml::InsertOp;
@@ -2080,6 +2081,7 @@ fn roundtrip_json_sink() -> Result<()> {
         insert_op: InsertOp::Overwrite,
         keep_partition_by_columns: true,
         file_extension: "json".into(),
+        overwrite_file_extension: None,
         file_output_mode: FileOutputMode::SingleFile,
     };
     let data_sink = Arc::new(JsonSink::new(
@@ -2119,6 +2121,7 @@ fn roundtrip_csv_sink() -> Result<()> {
         insert_op: InsertOp::Overwrite,
         keep_partition_by_columns: true,
         file_extension: "csv".into(),
+        overwrite_file_extension: Some(String::new()),
         file_output_mode: FileOutputMode::Directory,
     };
     let data_sink = Arc::new(CsvSink::new(
@@ -2151,6 +2154,10 @@ fn roundtrip_csv_sink() -> Result<()> {
         CompressionTypeVariant::ZSTD,
         csv_sink.writer_options().compression
     );
+    assert_eq!(
+        csv_sink.config().overwrite_file_extension.as_deref(),
+        Some("")
+    );
 
     Ok(())
 }
@@ -2172,6 +2179,7 @@ fn roundtrip_parquet_sink() -> Result<()> {
         insert_op: InsertOp::Overwrite,
         keep_partition_by_columns: true,
         file_extension: "parquet".into(),
+        overwrite_file_extension: None,
         file_output_mode: FileOutputMode::Automatic,
     };
     let data_sink = Arc::new(ParquetSink::new(

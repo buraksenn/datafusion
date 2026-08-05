@@ -3240,6 +3240,12 @@ impl serde::Serialize for CopyToNode {
         if !self.partition_by.is_empty() {
             len += 1;
         }
+        if self.insert_op != 0 {
+            len += 1;
+        }
+        if !self.options.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.CopyToNode", len)?;
         if let Some(v) = self.input.as_ref() {
             struct_ser.serialize_field("input", v)?;
@@ -3254,6 +3260,14 @@ impl serde::Serialize for CopyToNode {
         }
         if !self.partition_by.is_empty() {
             struct_ser.serialize_field("partitionBy", &self.partition_by)?;
+        }
+        if self.insert_op != 0 {
+            let v = InsertOp::try_from(self.insert_op)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.insert_op)))?;
+            struct_ser.serialize_field("insertOp", &v)?;
+        }
+        if !self.options.is_empty() {
+            struct_ser.serialize_field("options", &self.options)?;
         }
         struct_ser.end()
     }
@@ -3272,6 +3286,9 @@ impl<'de> serde::Deserialize<'de> for CopyToNode {
             "fileType",
             "partition_by",
             "partitionBy",
+            "insert_op",
+            "insertOp",
+            "options",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -3280,6 +3297,8 @@ impl<'de> serde::Deserialize<'de> for CopyToNode {
             OutputUrl,
             FileType,
             PartitionBy,
+            InsertOp,
+            Options,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -3305,6 +3324,8 @@ impl<'de> serde::Deserialize<'de> for CopyToNode {
                             "outputUrl" | "output_url" => Ok(GeneratedField::OutputUrl),
                             "fileType" | "file_type" => Ok(GeneratedField::FileType),
                             "partitionBy" | "partition_by" => Ok(GeneratedField::PartitionBy),
+                            "insertOp" | "insert_op" => Ok(GeneratedField::InsertOp),
+                            "options" => Ok(GeneratedField::Options),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -3328,6 +3349,8 @@ impl<'de> serde::Deserialize<'de> for CopyToNode {
                 let mut output_url__ = None;
                 let mut file_type__ = None;
                 let mut partition_by__ = None;
+                let mut insert_op__ = None;
+                let mut options__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Input => {
@@ -3356,6 +3379,20 @@ impl<'de> serde::Deserialize<'de> for CopyToNode {
                             }
                             partition_by__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::InsertOp => {
+                            if insert_op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("insertOp"));
+                            }
+                            insert_op__ = Some(map_.next_value::<InsertOp>()? as i32);
+                        }
+                        GeneratedField::Options => {
+                            if options__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("options"));
+                            }
+                            options__ = Some(
+                                map_.next_value::<std::collections::HashMap<_, _>>()?
+                            );
+                        }
                     }
                 }
                 Ok(CopyToNode {
@@ -3363,6 +3400,8 @@ impl<'de> serde::Deserialize<'de> for CopyToNode {
                     output_url: output_url__.unwrap_or_default(),
                     file_type: file_type__.unwrap_or_default(),
                     partition_by: partition_by__.unwrap_or_default(),
+                    insert_op: insert_op__.unwrap_or_default(),
+                    options: options__.unwrap_or_default(),
                 })
             }
         }
@@ -7285,6 +7324,9 @@ impl serde::Serialize for FileSinkConfig {
         if self.file_output_mode != 0 {
             len += 1;
         }
+        if self.overwrite_file_extension.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.FileSinkConfig", len)?;
         if !self.object_store_url.is_empty() {
             struct_ser.serialize_field("objectStoreUrl", &self.object_store_url)?;
@@ -7317,6 +7359,9 @@ impl serde::Serialize for FileSinkConfig {
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.file_output_mode)))?;
             struct_ser.serialize_field("fileOutputMode", &v)?;
         }
+        if let Some(v) = self.overwrite_file_extension.as_ref() {
+            struct_ser.serialize_field("overwriteFileExtension", v)?;
+        }
         struct_ser.end()
     }
 }
@@ -7345,6 +7390,8 @@ impl<'de> serde::Deserialize<'de> for FileSinkConfig {
             "fileExtension",
             "file_output_mode",
             "fileOutputMode",
+            "overwrite_file_extension",
+            "overwriteFileExtension",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7358,6 +7405,7 @@ impl<'de> serde::Deserialize<'de> for FileSinkConfig {
             InsertOp,
             FileExtension,
             FileOutputMode,
+            OverwriteFileExtension,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7388,6 +7436,7 @@ impl<'de> serde::Deserialize<'de> for FileSinkConfig {
                             "insertOp" | "insert_op" => Ok(GeneratedField::InsertOp),
                             "fileExtension" | "file_extension" => Ok(GeneratedField::FileExtension),
                             "fileOutputMode" | "file_output_mode" => Ok(GeneratedField::FileOutputMode),
+                            "overwriteFileExtension" | "overwrite_file_extension" => Ok(GeneratedField::OverwriteFileExtension),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7416,6 +7465,7 @@ impl<'de> serde::Deserialize<'de> for FileSinkConfig {
                 let mut insert_op__ = None;
                 let mut file_extension__ = None;
                 let mut file_output_mode__ = None;
+                let mut overwrite_file_extension__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ObjectStoreUrl => {
@@ -7472,6 +7522,12 @@ impl<'de> serde::Deserialize<'de> for FileSinkConfig {
                             }
                             file_output_mode__ = Some(map_.next_value::<FileOutputMode>()? as i32);
                         }
+                        GeneratedField::OverwriteFileExtension => {
+                            if overwrite_file_extension__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("overwriteFileExtension"));
+                            }
+                            overwrite_file_extension__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(FileSinkConfig {
@@ -7484,6 +7540,7 @@ impl<'de> serde::Deserialize<'de> for FileSinkConfig {
                     insert_op: insert_op__.unwrap_or_default(),
                     file_extension: file_extension__.unwrap_or_default(),
                     file_output_mode: file_output_mode__.unwrap_or_default(),
+                    overwrite_file_extension: overwrite_file_extension__,
                 })
             }
         }

@@ -446,6 +446,13 @@ pub struct CopyToNode {
     pub file_type: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, repeated, tag = "7")]
     pub partition_by: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration = "InsertOp", tag = "13")]
+    pub insert_op: i32,
+    #[prost(map = "string, string", tag = "14")]
+    pub options: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Wraps a serialized FileFormatFactory with its format kind tag,
 /// so the decoder can dispatch to the correct format-specific codec.
@@ -1458,6 +1465,9 @@ pub struct FileSinkConfig {
     /// Determines how the output path is interpreted.
     #[prost(enumeration = "FileOutputMode", tag = "12")]
     pub file_output_mode: i32,
+    /// Optional existing-file suffix used for overwrite cleanup.
+    #[prost(string, optional, tag = "13")]
+    pub overwrite_file_extension: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JsonSink {

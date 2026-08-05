@@ -22,8 +22,9 @@ mod describe;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, FixedSizeListArray,
     FixedSizeListBuilder, Float32Array, Float64Array, Int8Array, Int32Array,
-    Int32Builder, LargeListArray, ListArray, ListBuilder, RecordBatch, StringArray,
-    StringBuilder, StructBuilder, UInt32Array, UInt32Builder, UnionArray, record_batch,
+    Int32Builder, Int64Array, LargeListArray, ListArray, ListBuilder, RecordBatch,
+    StringArray, StringBuilder, StructBuilder, UInt32Array, UInt32Builder, UnionArray,
+    record_batch,
 };
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{
@@ -34,6 +35,7 @@ use arrow::util::pretty::pretty_format_batches;
 use arrow_schema::{SortOptions, TimeUnit};
 use datafusion::{assert_batches_eq, dataframe};
 use datafusion_common::metadata::FieldMetadata;
+use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_functions_aggregate::count::{count_all, count_all_window};
 use datafusion_functions_aggregate::expr_fn::{
     array_agg, avg, avg_distinct, count, count_distinct, max, median, min, sum,
@@ -73,6 +75,7 @@ use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::file_format::format_as_file_type;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::runtime_env::RuntimeEnv;
+use datafusion_expr::dml::InsertOp;
 use datafusion_expr::expr::{GroupingSet, NullTreatment, Sort, WindowFunction};
 use datafusion_expr::var_provider::{VarProvider, VarType};
 use datafusion_expr::{
@@ -2925,6 +2928,518 @@ async fn write_json_with_order() -> Result<()> {
     +---+---+
     "
     );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TestFileFormat {
+    Csv,
+    Json,
+    Parquet,
+}
+
+impl TestFileFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Json => "json",
+            Self::Parquet => "parquet",
+        }
+    }
+}
+
+async fn write_file_query(
+    ctx: &SessionContext,
+    path: &str,
+    format: TestFileFormat,
+    query: &str,
+    options: DataFrameWriteOptions,
+) -> Result<()> {
+    let df = ctx.sql(query).await?;
+    match format {
+        TestFileFormat::Csv => df.write_csv(path, options, None).await?,
+        TestFileFormat::Json => df.write_json(path, options, None).await?,
+        TestFileFormat::Parquet => df.write_parquet(path, options, None).await?,
+    };
+    Ok(())
+}
+
+async fn read_file_values(path: &str, format: TestFileFormat) -> Result<Vec<i64>> {
+    read_file_values_with_compression(path, format, false).await
+}
+
+async fn read_file_values_with_compression(
+    path: &str,
+    format: TestFileFormat,
+    gzip: bool,
+) -> Result<Vec<i64>> {
+    let ctx = SessionContext::new();
+    let schema = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+    let df = match format {
+        TestFileFormat::Csv => {
+            let options = CsvReadOptions::new().schema(&schema);
+            let options = if gzip {
+                options
+                    .file_extension(".csv.gz")
+                    .file_compression_type(
+                        datafusion_datasource::file_compression_type::FileCompressionType::GZIP,
+                    )
+            } else {
+                options
+            };
+            ctx.read_csv(path, options).await?
+        }
+        TestFileFormat::Json => {
+            ctx.read_json(path, JsonReadOptions::default().schema(&schema))
+                .await?
+        }
+        TestFileFormat::Parquet => {
+            let options = ParquetReadOptions::new().schema(&schema);
+            let options =
+                if Path::new(path).is_file() && Path::new(path).extension().is_none() {
+                    options.file_extension("")
+                } else {
+                    options
+                };
+            ctx.read_parquet(path, options).await?
+        }
+    };
+    let mut values = df
+        .collect()
+        .await?
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    Ok(values)
+}
+
+#[rstest]
+#[case(TestFileFormat::Csv)]
+#[case(TestFileFormat::Json)]
+#[case(TestFileFormat::Parquet)]
+#[tokio::test]
+async fn write_exact_file_insert_operations(
+    #[case] format: TestFileFormat,
+) -> Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let path = tmp_dir.path().join(format!("data.{}", format.extension()));
+    let path = path.to_str().unwrap();
+    let ctx = SessionContext::new();
+
+    write_file_query(
+        &ctx,
+        path,
+        format,
+        "SELECT 1::BIGINT AS value",
+        DataFrameWriteOptions::new(),
+    )
+    .await?;
+    assert_eq!(read_file_values(path, format).await?, vec![1]);
+
+    let err = write_file_query(
+        &ctx,
+        path,
+        format,
+        "SELECT 2::BIGINT AS value",
+        DataFrameWriteOptions::new().with_insert_operation(InsertOp::Append),
+    )
+    .await
+    .unwrap_err();
+    assert_contains!(err.to_string(), "exact-file append is not supported");
+    assert_eq!(read_file_values(path, format).await?, vec![1]);
+
+    let err = write_file_query(
+        &ctx,
+        path,
+        format,
+        "SELECT 2::BIGINT AS value",
+        DataFrameWriteOptions::new().with_insert_operation(InsertOp::Replace),
+    )
+    .await
+    .unwrap_err();
+    assert_contains!(err.to_string(), "raw files have no row key");
+    assert_eq!(read_file_values(path, format).await?, vec![1]);
+
+    write_file_query(
+        &ctx,
+        path,
+        format,
+        "SELECT 2::BIGINT AS value",
+        DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+    )
+    .await?;
+    assert_eq!(read_file_values(path, format).await?, vec![2]);
+
+    let missing_path = tmp_dir
+        .path()
+        .join(format!("missing.{}", format.extension()));
+    write_file_query(
+        &ctx,
+        missing_path.to_str().unwrap(),
+        format,
+        "SELECT 3::BIGINT AS value",
+        DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+    )
+    .await?;
+    assert_eq!(
+        read_file_values(missing_path.to_str().unwrap(), format).await?,
+        vec![3]
+    );
+
+    write_file_query(
+        &ctx,
+        path,
+        format,
+        "SELECT CAST(NULL AS BIGINT) AS value WHERE false",
+        DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+    )
+    .await?;
+    assert!(read_file_values(path, format).await?.is_empty());
+
+    Ok(())
+}
+
+#[rstest]
+#[case(TestFileFormat::Csv)]
+#[case(TestFileFormat::Json)]
+#[case(TestFileFormat::Parquet)]
+#[tokio::test]
+async fn write_directory_insert_operations(#[case] format: TestFileFormat) -> Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let path = tmp_dir.path().join("data");
+    let path_str = path.to_str().unwrap();
+    let ctx = SessionContext::new();
+
+    write_file_query(
+        &ctx,
+        path_str,
+        format,
+        "SELECT 1::BIGINT AS value",
+        DataFrameWriteOptions::new(),
+    )
+    .await?;
+    write_file_query(
+        &ctx,
+        path_str,
+        format,
+        "SELECT 2::BIGINT AS value",
+        DataFrameWriteOptions::new().with_insert_operation(InsertOp::Append),
+    )
+    .await?;
+    assert_eq!(read_file_values(path_str, format).await?, vec![1, 2]);
+
+    let unrelated_file = path.join("keep.txt");
+    fs::write(&unrelated_file, "keep")?;
+    let csv_options = matches!(format, TestFileFormat::Csv).then(|| {
+        datafusion_common::config::CsvOptions::default()
+            .with_compression(CompressionTypeVariant::GZIP)
+    });
+    let df = ctx.sql("SELECT 3::BIGINT AS value").await?;
+    match format {
+        TestFileFormat::Csv => {
+            df.write_csv(
+                path_str,
+                DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+                csv_options,
+            )
+            .await?;
+        }
+        TestFileFormat::Json => {
+            df.write_json(
+                path_str,
+                DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+                None,
+            )
+            .await?;
+        }
+        TestFileFormat::Parquet => {
+            df.write_parquet(
+                path_str,
+                DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+                None,
+            )
+            .await?;
+        }
+    }
+    assert_eq!(
+        read_file_values_with_compression(
+            path_str,
+            format,
+            matches!(format, TestFileFormat::Csv),
+        )
+        .await?,
+        vec![3]
+    );
+    if matches!(format, TestFileFormat::Csv) {
+        assert!(
+            fs::read_dir(&path)?
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".csv"))
+        );
+    }
+    assert!(unrelated_file.exists());
+
+    write_file_query(
+        &ctx,
+        path_str,
+        format,
+        "SELECT CAST(NULL AS BIGINT) AS value WHERE false",
+        DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+    )
+    .await?;
+    assert!(read_file_values(path_str, format).await?.is_empty());
+    assert!(unrelated_file.exists());
+    assert_eq!(
+        fs::read_dir(&path)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name() != "keep.txt")
+            .count(),
+        0
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn listing_table_overwrite_uses_current_storage_snapshot() -> Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let path = tmp_dir.path().join("data");
+    let path_str = path.to_str().unwrap();
+    let ctx = SessionContext::new();
+    assert!(
+        ctx.runtime_env()
+            .cache_manager
+            .get_list_files_cache()
+            .is_some()
+    );
+
+    write_file_query(
+        &ctx,
+        path_str,
+        TestFileFormat::Parquet,
+        "SELECT 1::BIGINT AS value",
+        DataFrameWriteOptions::new(),
+    )
+    .await?;
+    assert_eq!(
+        read_file_values(path_str, TestFileFormat::Parquet).await?,
+        vec![1]
+    );
+
+    // Warm this session's listing cache, then add a file behind its back.
+    let original = fs::read_dir(&path)?.next().unwrap()?.path();
+    let existing = path.join("existing.custom");
+    fs::rename(original, &existing)?;
+    let schema = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+    ctx.register_parquet(
+        "target",
+        path_str,
+        ParquetReadOptions::new().schema(&schema).file_extension(""),
+    )
+    .await?;
+    ctx.table("target").await?.collect().await?;
+    let out_of_band = path.join("out_of_band.custom");
+    fs::copy(existing, &out_of_band)?;
+
+    ctx.sql("SELECT 2::BIGINT AS value")
+        .await?
+        .write_table(
+            "target",
+            DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+        )
+        .await?;
+    assert!(!out_of_band.exists());
+    let batches = ctx.table("target").await?.collect().await?;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[2]
+    );
+    assert!(
+        fs::read_dir(&path)?
+            .all(|entry| { entry.unwrap().path().extension().unwrap() == "parquet" })
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_insert_operations_respect_forced_output_mode() -> Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let ctx = SessionContext::new();
+
+    let exact_path = tmp_dir.path().join("exact_without_extension");
+    let exact_path = exact_path.to_str().unwrap();
+    write_file_query(
+        &ctx,
+        exact_path,
+        TestFileFormat::Parquet,
+        "SELECT 1::BIGINT AS value",
+        DataFrameWriteOptions::new().with_single_file_output(true),
+    )
+    .await?;
+    assert!(
+        write_file_query(
+            &ctx,
+            exact_path,
+            TestFileFormat::Parquet,
+            "SELECT 2::BIGINT AS value",
+            DataFrameWriteOptions::new().with_single_file_output(true),
+        )
+        .await
+        .is_err()
+    );
+    write_file_query(
+        &ctx,
+        exact_path,
+        TestFileFormat::Parquet,
+        "SELECT 2::BIGINT AS value",
+        DataFrameWriteOptions::new()
+            .with_single_file_output(true)
+            .with_insert_operation(InsertOp::Overwrite),
+    )
+    .await?;
+    assert_eq!(
+        read_file_values(exact_path, TestFileFormat::Parquet).await?,
+        vec![2]
+    );
+
+    let directory_path = tmp_dir.path().join("directory.parquet");
+    let directory_path = directory_path.to_str().unwrap();
+    for value in [1, 2] {
+        write_file_query(
+            &ctx,
+            directory_path,
+            TestFileFormat::Parquet,
+            &format!("SELECT {value}::BIGINT AS value"),
+            DataFrameWriteOptions::new().with_single_file_output(false),
+        )
+        .await?;
+    }
+    assert_eq!(
+        read_file_values(directory_path, TestFileFormat::Parquet).await?,
+        vec![1, 2]
+    );
+    write_file_query(
+        &ctx,
+        directory_path,
+        TestFileFormat::Parquet,
+        "SELECT 3::BIGINT AS value",
+        DataFrameWriteOptions::new()
+            .with_single_file_output(false)
+            .with_insert_operation(InsertOp::Overwrite),
+    )
+    .await?;
+    assert_eq!(
+        read_file_values(directory_path, TestFileFormat::Parquet).await?,
+        vec![3]
+    );
+
+    Ok(())
+}
+
+async fn read_partitioned_parquet_values(
+    ctx: &SessionContext,
+    path: &str,
+) -> Result<Vec<i64>> {
+    let schema = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+    let batches = ctx
+        .read_parquet(
+            path,
+            ParquetReadOptions::new()
+                .schema(&schema)
+                .table_partition_cols(vec![("part".to_string(), DataType::Utf8)]),
+        )
+        .await?
+        .collect()
+        .await?;
+    Ok(batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+        })
+        .collect())
+}
+
+#[tokio::test]
+async fn write_partitioned_directory_overwrite_removes_stale_partitions() -> Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let path = tmp_dir.path().join("data");
+    let path = path.to_str().unwrap();
+    let ctx = SessionContext::new();
+    let partition_by = || vec!["part".to_string()];
+
+    write_file_query(
+        &ctx,
+        path,
+        TestFileFormat::Parquet,
+        "SELECT 1::BIGINT AS value, 'old' AS part \
+         UNION ALL SELECT 2::BIGINT AS value, 'stale' AS part",
+        DataFrameWriteOptions::new().with_partition_by(partition_by()),
+    )
+    .await?;
+
+    write_file_query(
+        &ctx,
+        path,
+        TestFileFormat::Parquet,
+        "SELECT 3::BIGINT AS value, 'new' AS part",
+        DataFrameWriteOptions::new()
+            .with_partition_by(partition_by())
+            .with_insert_operation(InsertOp::Overwrite),
+    )
+    .await?;
+
+    assert_eq!(read_partitioned_parquet_values(&ctx, path).await?, vec![3]);
+    assert!(tmp_dir.path().join("data/part=new").is_dir());
+    assert_eq!(
+        fs::read_dir(tmp_dir.path().join("data/part=old"))?.count(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(tmp_dir.path().join("data/part=stale"))?.count(),
+        0
+    );
+
+    write_file_query(
+        &ctx,
+        path,
+        TestFileFormat::Parquet,
+        "SELECT CAST(NULL AS BIGINT) AS value, CAST(NULL AS VARCHAR) AS part WHERE false",
+        DataFrameWriteOptions::new()
+            .with_partition_by(partition_by())
+            .with_insert_operation(InsertOp::Overwrite),
+    )
+    .await?;
+    assert!(
+        read_partitioned_parquet_values(&ctx, path)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        fs::read_dir(tmp_dir.path().join("data"))?
+            .all(|entry| !entry.unwrap().path().is_file())
+    );
+
     Ok(())
 }
 

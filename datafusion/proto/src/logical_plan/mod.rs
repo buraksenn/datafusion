@@ -1177,12 +1177,19 @@ impl AsLogicalPlan for LogicalPlanNode {
                     extension_codec.try_decode_file_format(&copy.file_type, ctx)?,
                 );
 
-                Ok(LogicalPlan::Copy(dml::CopyTo::new(
+                let insert_op = match copy.insert_op() {
+                    protobuf::InsertOp::Append => InsertOp::Append,
+                    protobuf::InsertOp::Overwrite => InsertOp::Overwrite,
+                    protobuf::InsertOp::Replace => InsertOp::Replace,
+                };
+
+                Ok(LogicalPlan::Copy(dml::CopyTo::new_with_insert_op(
                     Arc::new(input),
                     copy.output_url.clone(),
                     copy.partition_by.clone(),
                     file_type,
-                    Default::default(),
+                    copy.options.clone(),
+                    insert_op,
                 )))
             }
             LogicalPlanType::Unnest(unnest) => {
@@ -2168,6 +2175,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                 output_url,
                 file_type,
                 partition_by,
+                options,
+                insert_op,
                 ..
             }) => {
                 let input =
@@ -2183,6 +2192,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                             output_url: output_url.to_string(),
                             file_type: buf,
                             partition_by: partition_by.clone(),
+                            insert_op: *insert_op as i32,
+                            options: options.clone(),
                         },
                     ))),
                 })

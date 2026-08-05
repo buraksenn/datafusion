@@ -288,10 +288,14 @@ message DistinctOnNode {
 }
 
 message CopyToNode {
+  reserved 8 to 12; // previously format_options
+
   LogicalPlanNode input = 1;
   string output_url = 2;
   bytes file_type = 3;
   repeated string partition_by = 7;
+  InsertOp insert_op = 13;
+  map<string, string> options = 14;
 }
 
 // Identifies a built-in file format supported by DataFusion.
@@ -932,6 +936,8 @@ message FileSinkConfig {
   string file_extension = 11;
   // Determines how the output path is interpreted.
   FileOutputMode file_output_mode = 12;
+  // Optional existing-file suffix used for overwrite cleanup.
+  optional string overwrite_file_extension = 13;
 }
 
 enum InsertOp {

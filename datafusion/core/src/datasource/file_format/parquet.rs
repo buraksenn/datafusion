@@ -1554,6 +1554,7 @@ mod tests {
             insert_op: InsertOp::Overwrite,
             keep_partition_by_columns: false,
             file_extension: "parquet".into(),
+            overwrite_file_extension: None,
             file_output_mode: FileOutputMode::Automatic,
         };
         let parquet_sink = Arc::new(ParquetSink::new(
@@ -1646,6 +1647,7 @@ mod tests {
             insert_op: InsertOp::Overwrite,
             keep_partition_by_columns: false,
             file_extension: "parquet".into(),
+            overwrite_file_extension: None,
             file_output_mode: FileOutputMode::Automatic,
         };
         let parquet_sink = Arc::new(ParquetSink::new(
@@ -1737,6 +1739,7 @@ mod tests {
                 insert_op: InsertOp::Overwrite,
                 keep_partition_by_columns: false,
                 file_extension: "parquet".into(),
+                overwrite_file_extension: None,
                 file_output_mode: FileOutputMode::Automatic,
             };
             let parquet_sink = Arc::new(ParquetSink::new(

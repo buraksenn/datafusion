@@ -60,13 +60,7 @@ pub struct FileCompressionType {
 
 impl GetExt for FileCompressionType {
     fn get_ext(&self) -> String {
-        match self.variant {
-            GZIP => ".gz".to_owned(),
-            BZIP2 => ".bz2".to_owned(),
-            XZ => ".xz".to_owned(),
-            ZSTD => ".zst".to_owned(),
-            UNCOMPRESSED => "".to_owned(),
-        }
+        self.extension().to_owned()
     }
 }
 
@@ -111,6 +105,19 @@ impl FileCompressionType {
     pub const UNCOMPRESSED: Self = Self {
         variant: UNCOMPRESSED,
     };
+
+    pub(crate) const COMPRESSED: [Self; 4] =
+        [Self::GZIP, Self::BZIP2, Self::XZ, Self::ZSTD];
+
+    pub(crate) const fn extension(&self) -> &'static str {
+        match self.variant {
+            GZIP => ".gz",
+            BZIP2 => ".bz2",
+            XZ => ".xz",
+            ZSTD => ".zst",
+            UNCOMPRESSED => "",
+        }
+    }
 
     /// Read only access to self.variant
     pub fn get_variant(&self) -> &CompressionTypeVariant {

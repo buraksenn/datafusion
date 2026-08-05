@@ -593,6 +593,7 @@ impl TryFromProto<&FileSinkConfig> for protobuf::FileSinkConfig {
             insert_op: conf.insert_op as i32,
             file_extension: conf.file_extension.to_string(),
             file_output_mode: file_output_mode.into(),
+            overwrite_file_extension: conf.overwrite_file_extension.clone(),
         })
     }
 }

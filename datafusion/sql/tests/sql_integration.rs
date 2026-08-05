@@ -655,7 +655,7 @@ fn plan_copy_to() {
     assert_snapshot!(
         plan,
         @r"
-    CopyTo: format=csv output_url=output.csv options: ()
+    CopyTo: format=csv output_url=output.csv insert_op=Append options: ()
       TableScan: test_decimal
     "
     );
@@ -669,7 +669,7 @@ fn plan_explain_copy_to() {
         plan,
         @r"
     Explain
-      CopyTo: format=csv output_url=output.csv options: ()
+      CopyTo: format=csv output_url=output.csv insert_op=Append options: ()
         TableScan: test_decimal
     "
     );
@@ -683,7 +683,7 @@ fn plan_explain_copy_to_format() {
         plan,
         @r"
     Explain
-      CopyTo: format=csv output_url=output.tbl options: ()
+      CopyTo: format=csv output_url=output.tbl insert_op=Append options: ()
         TableScan: test_decimal
     "
     );

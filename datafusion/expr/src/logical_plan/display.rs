@@ -411,12 +411,11 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                 })
             }
             LogicalPlan::Copy(CopyTo {
-                input: _,
                 output_url,
                 file_type,
-                partition_by: _,
                 options,
-                output_schema: _,
+                insert_op,
+                ..
             }) => {
                 let op_str = options
                     .iter()
@@ -427,6 +426,7 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                     "Node Type": "CopyTo",
                     "Output URL": output_url,
                     "File Type": format!("{}", file_type.get_ext()),
+                    "Insert Operation": format!("{insert_op:?}"),
                     "Options": op_str
                 })
             }

@@ -33,9 +33,7 @@ use arrow::json::reader::{ValueIter, infer_json_schema_from_iterator};
 use bytes::{Buf, Bytes};
 use datafusion_common::config::{ConfigField, ConfigFileType, JsonOptions};
 use datafusion_common::file_options::json_writer::JsonWriterOptions;
-use datafusion_common::{
-    DEFAULT_JSON_EXTENSION, GetExt, Result, Statistics, not_impl_err,
-};
+use datafusion_common::{DEFAULT_JSON_EXTENSION, GetExt, Result, Statistics};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::decoder::Decoder;
@@ -53,7 +51,6 @@ use datafusion_datasource::write::BatchSerializer;
 use datafusion_datasource::write::demux::DemuxedStreamReceiver;
 use datafusion_datasource::write::orchestration::spawn_writer_tasks_and_join;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_session::Session;
@@ -361,10 +358,6 @@ impl FileFormat for JsonFormat {
         conf: FileSinkConfig,
         order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if conf.insert_op != InsertOp::Append {
-            return not_impl_err!("Overwrites are not implemented yet for Json");
-        }
-
         let writer_options = JsonWriterOptions::try_from(&self.options)?;
 
         let sink = Arc::new(JsonSink::new(conf, writer_options));

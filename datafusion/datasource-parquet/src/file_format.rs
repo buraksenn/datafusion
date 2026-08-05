@@ -45,12 +45,11 @@ use datafusion_common::encryption::FileDecryptionProperties;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::{
     DEFAULT_PARQUET_EXTENSION, DataFusionError, GetExt, Result, internal_datafusion_err,
-    internal_err, not_impl_err,
+    internal_err,
 };
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::sink::DataSinkExec;
-use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_session::Session;
@@ -526,10 +525,6 @@ impl FileFormat for ParquetFormat {
         conf: FileSinkConfig,
         order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if conf.insert_op != InsertOp::Append {
-            return not_impl_err!("Overwrites are not implemented yet for Parquet");
-        }
-
         // Convert ordering requirements to Parquet SortingColumns for file metadata
         let sorting_columns = if let Some(ref requirements) = order_requirements {
             let ordering: LexOrdering = requirements.clone().into();

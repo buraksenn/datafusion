@@ -250,23 +250,10 @@ impl TreeNode for LogicalPlan {
                     output_schema,
                 })
             }),
-            LogicalPlan::Copy(CopyTo {
-                input,
-                output_url,
-                partition_by,
-                file_type,
-                options,
-                output_schema,
-            }) => input.map_elements(f)?.update_data(|input| {
-                LogicalPlan::Copy(CopyTo {
-                    input,
-                    output_url,
-                    partition_by,
-                    file_type,
-                    options,
-                    output_schema,
-                })
-            }),
+            LogicalPlan::Copy(copy) => copy
+                .input
+                .map_elements(f)?
+                .update_data(|input| LogicalPlan::Copy(CopyTo { input, ..copy })),
             LogicalPlan::Ddl(ddl) => {
                 match ddl {
                     DdlStatement::CreateMemoryTable(CreateMemoryTable {

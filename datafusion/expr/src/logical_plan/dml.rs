@@ -40,6 +40,8 @@ pub struct CopyTo {
     pub file_type: Arc<dyn FileType>,
     /// SQL Options that can affect the formats
     pub options: HashMap<String, String>,
+    /// Controls how new data is written to the output
+    pub insert_op: InsertOp,
     /// The schema of the output (a single column "count")
     pub output_schema: DFSchemaRef,
 }
@@ -52,6 +54,7 @@ impl Debug for CopyTo {
             .field("partition_by", &self.partition_by)
             .field("file_type", &"...")
             .field("options", &self.options)
+            .field("insert_op", &self.insert_op)
             .field("output_schema", &self.output_schema)
             .finish_non_exhaustive()
     }
@@ -60,7 +63,10 @@ impl Debug for CopyTo {
 // Implement PartialEq manually
 impl PartialEq for CopyTo {
     fn eq(&self, other: &Self) -> bool {
-        self.input == other.input && self.output_url == other.output_url
+        self.input == other.input
+            && self.output_url == other.output_url
+            && self.partition_by == other.partition_by
+            && self.insert_op == other.insert_op
     }
 }
 
@@ -71,18 +77,20 @@ impl Eq for CopyTo {}
 // Comparison excludes these field.
 impl PartialOrd for CopyTo {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match self.input.partial_cmp(&other.input) {
-            Some(Ordering::Equal) => match self.output_url.partial_cmp(&other.output_url)
-            {
-                Some(Ordering::Equal) => {
-                    self.partition_by.partial_cmp(&other.partition_by)
-                }
-                cmp => cmp,
-            },
-            cmp => cmp,
-        }
-        // TODO (https://github.com/apache/datafusion/issues/17477) avoid recomparing all fields
-        .filter(|cmp| *cmp != Ordering::Equal || self == other)
+        (
+            &self.input,
+            &self.output_url,
+            &self.partition_by,
+            &self.insert_op,
+        )
+            .partial_cmp(&(
+                &other.input,
+                &other.output_url,
+                &other.partition_by,
+                &other.insert_op,
+            ))
+            // TODO (https://github.com/apache/datafusion/issues/17477) avoid recomparing all fields
+            .filter(|cmp| *cmp != Ordering::Equal || self == other)
     }
 }
 
@@ -91,6 +99,8 @@ impl Hash for CopyTo {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.input.hash(state);
         self.output_url.hash(state);
+        self.partition_by.hash(state);
+        self.insert_op.hash(state);
     }
 }
 
@@ -102,12 +112,32 @@ impl CopyTo {
         file_type: Arc<dyn FileType>,
         options: HashMap<String, String>,
     ) -> Self {
+        Self::new_with_insert_op(
+            input,
+            output_url,
+            partition_by,
+            file_type,
+            options,
+            InsertOp::Append,
+        )
+    }
+
+    /// Creates a copy operation with the specified insert operation.
+    pub fn new_with_insert_op(
+        input: Arc<LogicalPlan>,
+        output_url: String,
+        partition_by: Vec<String>,
+        file_type: Arc<dyn FileType>,
+        options: HashMap<String, String>,
+        insert_op: InsertOp,
+    ) -> Self {
         Self {
             input,
             output_url,
             partition_by,
             file_type,
             options,
+            insert_op,
             // The output schema is always a single column "count" with the number of rows copied
             output_schema: make_count_schema(),
         }
@@ -399,7 +429,68 @@ fn make_count_schema() -> DFSchemaRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{col, lit};
+    use crate::{LogicalPlanBuilder, col, lit};
+    use datafusion_common::file_options::file_type::{FileType, GetExt};
+    use std::any::Any;
+    use std::collections::hash_map::DefaultHasher;
+
+    #[derive(Debug)]
+    struct TestFileType;
+
+    impl GetExt for TestFileType {
+        fn get_ext(&self) -> String {
+            "test".to_string()
+        }
+    }
+
+    impl Display for TestFileType {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "test")
+        }
+    }
+
+    impl FileType for TestFileType {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn copy_to(partition_by: Vec<String>, insert_op: InsertOp) -> CopyTo {
+        CopyTo::new_with_insert_op(
+            Arc::new(LogicalPlanBuilder::empty(false).build().unwrap()),
+            "output".to_string(),
+            partition_by,
+            Arc::new(TestFileType),
+            HashMap::new(),
+            insert_op,
+        )
+    }
+
+    fn hash(value: &CopyTo) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn copy_to_equality_order_and_hash_include_semantics() {
+        let append = copy_to(vec![], InsertOp::Append);
+        for other in [
+            copy_to(vec![], InsertOp::Overwrite),
+            copy_to(vec!["part".to_string()], InsertOp::Append),
+        ] {
+            assert_ne!(append, other);
+            assert_ne!(append.partial_cmp(&other), Some(Ordering::Equal));
+            assert_ne!(hash(&append), hash(&other));
+        }
+
+        let overwrite = LogicalPlan::Copy(copy_to(vec![], InsertOp::Overwrite));
+        assert!(format!("{overwrite}").contains("insert_op=Overwrite"));
+        assert!(
+            format!("{}", overwrite.display_pg_json())
+                .contains(r#""Insert Operation": "Overwrite""#)
+        );
+    }
 
     #[test]
     fn write_op_merge_into_name_and_display() {
