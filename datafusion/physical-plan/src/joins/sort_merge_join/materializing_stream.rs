@@ -29,6 +29,7 @@ use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::joins::sort_merge_join::filter::{
     FilterMetadata, filter_record_batch_by_join_type, get_corrected_filter_mask,
     get_filter_columns, needs_deferred_filtering,
@@ -42,8 +43,7 @@ use crate::{PhysicalExpr, SendableRecordBatchStream};
 
 use arrow::array::{types::UInt64Type, *};
 use arrow::compute::{
-    self, BatchCoalescer, SortOptions, concat_batches, filter_record_batch, interleave,
-    take_arrays,
+    self, SortOptions, concat_batches, filter_record_batch, interleave, take_arrays,
 };
 use arrow::datatypes::SchemaRef;
 use datafusion_common::cast::as_uint64_array;
@@ -341,7 +341,7 @@ pub(super) struct MaterializingSortMergeJoinStream {
     /// Output buffer. Currently used by filtering as it requires double buffering
     /// to avoid small/empty batches. Non-filtered joins output directly from
     /// `joined_record_batches.joined_batches`
-    pub output: BatchCoalescer,
+    pub output: LimitedBatchCoalescer,
     /// Manages the process of spilling and reading back intermediate data
     pub spill_manager: SpillManager,
 
@@ -387,35 +387,53 @@ pub(super) struct MaterializingSortMergeJoinStream {
 /// - Stream exhausted (flush remaining data)
 pub(super) struct JoinedRecordBatches {
     /// Joined batches. Each batch is already joined columns from left and right sources
-    pub(super) joined_batches: BatchCoalescer,
+    pub(super) joined_batches: LimitedBatchCoalescer,
     /// Filter metadata for deferred filtering
     pub(super) filter_metadata: FilterMetadata,
+    /// Owns batches drained for deferred filtering until their result is admitted downstream.
+    pub(super) concat_reservation: MemoryReservation,
+    /// Bytes currently transferred from `joined_batches` to `concat_reservation`.
+    pub(super) concat_charge: usize,
 }
 
 impl JoinedRecordBatches {
     /// Concatenates all accumulated batches into a single RecordBatch
     ///
-    /// Must drain ALL batches from BatchCoalescer for filtered joins to ensure
+    /// Must drain ALL batches from LimitedBatchCoalescer for filtered joins to ensure
     /// metadata alignment when applying get_corrected_filter_mask().
     pub(super) fn concat_batches(&mut self, schema: &SchemaRef) -> Result<RecordBatch> {
-        self.joined_batches.finish_buffered_batch()?;
+        self.joined_batches.flush_buffered_batch()?;
 
         let mut all_batches = vec![];
-        while let Some(batch) = self.joined_batches.next_completed_batch() {
+        while let Some((batch, charge)) = self
+            .joined_batches
+            .next_completed_batch_with_reservation(&self.concat_reservation)
+        {
+            self.concat_charge += charge;
             all_batches.push(batch);
         }
 
         match all_batches.as_slice() {
-            [] => unreachable!("concat_batches called with empty BatchCoalescer"),
+            [] => unreachable!("concat_batches called with empty LimitedBatchCoalescer"),
             [single_batch] => Ok(single_batch.clone()),
-            multiple_batches => Ok(concat_batches(schema, multiple_batches)?),
+            multiple_batches => {
+                let peak_bytes = multiple_batches
+                    .iter()
+                    .map(|batch| batch.get_array_memory_size())
+                    .sum();
+                let peak_reservation = self.concat_reservation.new_empty();
+                peak_reservation.grow(peak_bytes);
+                Ok(concat_batches(schema, multiple_batches)?)
+            }
         }
     }
 
-    /// Clears batches without touching metadata (for early return when no filtering needed)
-    fn clear_batches(&mut self, schema: &SchemaRef, batch_size: usize) {
-        self.joined_batches = BatchCoalescer::new(Arc::clone(schema), batch_size)
-            .with_biggest_coalesce_batch_size(Option::from(batch_size / 2));
+    /// Releases the charge retained by [`Self::concat_batches`] once the
+    /// deferred-filter result has been admitted downstream. Does not touch
+    /// filter metadata (see [`Self::clear`]).
+    fn clear_batches(&mut self) {
+        self.concat_reservation.shrink(self.concat_charge);
+        self.concat_charge = 0;
     }
 
     /// Asserts that if batches is empty, metadata is also empty
@@ -440,6 +458,15 @@ impl JoinedRecordBatches {
         }
     }
 
+    fn push_joined_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        match self.joined_batches.push_batch(batch)? {
+            PushBatchStatus::Continue => Ok(()),
+            PushBatchStatus::LimitReached => {
+                internal_err!("sort-merge join staging coalescer has no fetch limit")
+            }
+        }
+    }
+
     /// Pushes a batch with null metadata (rows that need no filter correction)
     ///
     /// Used for: (1) Full join buffered rows with no streamed match, and
@@ -449,7 +476,11 @@ impl JoinedRecordBatches {
     /// get_corrected_filter_mask() to pass them through unchanged.
     ///
     /// Maintains invariant: N rows → N metadata entries (nulls)
-    fn push_batch_with_null_metadata(&mut self, batch: RecordBatch, join_type: JoinType) {
+    fn push_batch_with_null_metadata(
+        &mut self,
+        batch: RecordBatch,
+        join_type: JoinType,
+    ) -> Result<()> {
         debug_assert!(
             matches!(join_type, JoinType::Left | JoinType::Right | JoinType::Full),
             "push_batch_with_null_metadata should only be called for deferred-filtered joins"
@@ -460,9 +491,8 @@ impl JoinedRecordBatches {
         self.filter_metadata.append_nulls(num_rows);
 
         self.filter_metadata.debug_assert_metadata_aligned();
-        self.joined_batches
-            .push_batch(batch)
-            .expect("Failed to push batch to BatchCoalescer");
+        self.push_joined_batch(batch)?;
+        Ok(())
     }
 
     /// Pushes a batch with filter metadata (filtered outer joins)
@@ -481,7 +511,7 @@ impl JoinedRecordBatches {
         filter_mask: &BooleanArray,
         streamed_batch_id: usize,
         join_type: JoinType,
-    ) {
+    ) -> Result<()> {
         debug_assert!(
             matches!(join_type, JoinType::Left | JoinType::Right | JoinType::Full),
             "push_batch_with_filter_metadata should only be called for outer joins that need deferred filtering"
@@ -500,9 +530,8 @@ impl JoinedRecordBatches {
         );
 
         self.filter_metadata.debug_assert_metadata_aligned();
-        self.joined_batches
-            .push_batch(batch)
-            .expect("Failed to push batch to BatchCoalescer");
+        self.push_joined_batch(batch)?;
+        Ok(())
     }
 
     /// Pushes a batch without metadata (non-filtered joins)
@@ -510,15 +539,13 @@ impl JoinedRecordBatches {
     /// No deferred filtering needed. Either every join match is output (Inner),
     /// or null-joined rows are handled separately. No need to track which input
     /// row produced which output row.
-    fn push_batch_without_metadata(&mut self, batch: RecordBatch) {
-        self.joined_batches
-            .push_batch(batch)
-            .expect("Failed to push batch to BatchCoalescer");
+    fn push_batch_without_metadata(&mut self, batch: RecordBatch) -> Result<()> {
+        self.push_joined_batch(batch)?;
+        Ok(())
     }
 
-    fn clear(&mut self, schema: &SchemaRef, batch_size: usize) {
-        self.joined_batches = BatchCoalescer::new(Arc::clone(schema), batch_size)
-            .with_biggest_coalesce_batch_size(Option::from(batch_size / 2));
+    fn clear(&mut self) {
+        self.clear_batches();
         self.filter_metadata = FilterMetadata::new();
         self.debug_assert_empty_consistency();
     }
@@ -552,6 +579,9 @@ impl MaterializingSortMergeJoinStream {
             "MaterializingSortMergeJoinStream does not handle {join_type:?}; \
              semi/anti/mark joins use BitwiseSortMergeJoinStream"
         );
+        let staging_reservation = reservation.new_empty();
+        let concat_reservation = reservation.new_empty();
+        let output_reservation = reservation.new_empty();
         let join_time = join_metrics.join_time();
         let mut this = Self {
             sort_options,
@@ -570,13 +600,28 @@ impl MaterializingSortMergeJoinStream {
             on_buffered,
             deferred_filtering: needs_deferred_filtering(&filter, join_type),
             filter,
+            // Unenforced: sort-merge join completes queries under memory
+            // pressure by spilling buffered batches; failing these bounded,
+            // unspillable output buffers would defeat that.
             joined_record_batches: JoinedRecordBatches {
-                joined_batches: BatchCoalescer::new(Arc::clone(&schema), batch_size)
-                    .with_biggest_coalesce_batch_size(Option::from(batch_size / 2)),
+                joined_batches: LimitedBatchCoalescer::new_with_reservation(
+                    Arc::clone(&schema),
+                    batch_size,
+                    None,
+                    staging_reservation,
+                )
+                .with_unenforced_accounting(),
                 filter_metadata: FilterMetadata::new(),
+                concat_reservation,
+                concat_charge: 0,
             },
-            output: BatchCoalescer::new(schema, batch_size)
-                .with_biggest_coalesce_batch_size(Option::from(batch_size / 2)),
+            output: LimitedBatchCoalescer::new_with_reservation(
+                schema,
+                batch_size,
+                None,
+                output_reservation,
+            )
+            .with_unenforced_accounting(),
             batch_size,
             join_type,
             join_metrics,
@@ -800,7 +845,10 @@ impl MaterializingSortMergeJoinStream {
         // Ensure required spilled batches are restored to memory before
         // processing, as this path invokes freeze_all().
         self.restore_spilled_batches_for_freeze().await?;
-        if let Some(batch) = self.process_filtered_batches()? {
+        self.process_filtered_batches()?;
+        // Drain every completed batch so the output buffer stays bounded to
+        // less than one target batch between pipeline runs.
+        while let Some(batch) = self.output.next_completed_batch() {
             // While the emitted batch is in the consumer's hands the join
             // isn't doing any work.
             self.stop_join_time();
@@ -852,27 +900,24 @@ impl MaterializingSortMergeJoinStream {
             // Filtered joins must concat and filter ALL remaining data at once
             if !self.joined_record_batches.joined_batches.is_empty() {
                 let record_batch = self.filter_joined_batch()?;
-                self.stop_join_time();
-                emitter.emit(record_batch).await;
-                self.start_join_time();
+                self.push_output_batch(record_batch)?;
+                self.joined_record_batches.clear();
             }
         } else if !self.joined_record_batches.joined_batches.is_empty() {
             // For non-filtered joins, finish buffered data first, then emit
             // every completed batch.
             self.joined_record_batches
                 .joined_batches
-                .finish_buffered_batch()?;
+                .flush_buffered_batch()?;
             self.emit_completed_joined_batches(emitter).await;
         }
 
         // Drain the double-buffering coalescer used by filtered joins.
-        if !self.output.is_empty() {
-            self.output.finish_buffered_batch()?;
-            while let Some(record_batch) = self.output.next_completed_batch() {
-                self.stop_join_time();
-                emitter.emit(record_batch).await;
-                self.start_join_time();
-            }
+        self.output.flush_buffered_batch()?;
+        while let Some(record_batch) = self.output.next_completed_batch() {
+            self.stop_join_time();
+            emitter.emit(record_batch).await;
+            self.start_join_time();
         }
 
         Ok(())
@@ -916,11 +961,21 @@ impl MaterializingSortMergeJoinStream {
         self.streamed_batch.num_output_rows()
     }
 
+    fn push_output_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        match self.output.push_batch(batch)? {
+            PushBatchStatus::Continue => Ok(()),
+            PushBatchStatus::LimitReached => {
+                internal_err!("sort-merge join output coalescer has no fetch limit")
+            }
+        }
+    }
+
     /// Process accumulated batches for filtered joins
     ///
-    /// Freezes unfrozen pairs, applies deferred filtering, and returns a
-    /// completed output batch if one is ready.
-    fn process_filtered_batches(&mut self) -> Result<Option<RecordBatch>> {
+    /// Freezes unfrozen pairs, applies deferred filtering, and pushes the
+    /// filtered result into `self.output`; the caller drains the completed
+    /// batches.
+    fn process_filtered_batches(&mut self) -> Result<()> {
         self.freeze_all()?;
 
         self.joined_record_batches
@@ -929,20 +984,11 @@ impl MaterializingSortMergeJoinStream {
 
         if !self.joined_record_batches.joined_batches.is_empty() {
             let out_filtered_batch = self.filter_joined_batch()?;
-            self.output
-                .push_batch(out_filtered_batch)
-                .expect("Failed to push output batch");
-
-            if self.output.has_completed_batch() {
-                let record_batch = self
-                    .output
-                    .next_completed_batch()
-                    .expect("Failed to get output batch");
-                return Ok(Some(record_batch));
-            }
+            self.push_output_batch(out_filtered_batch)?;
+            self.joined_record_batches.clear();
         }
 
-        Ok(None)
+        Ok(())
     }
 
     /// Identifies which buffered batches are needed for the upcoming freeze operation
@@ -1395,7 +1441,7 @@ impl MaterializingSortMergeJoinStream {
                 buffered_batch,
             )? {
                 self.joined_record_batches
-                    .push_batch_with_null_metadata(record_batch, self.join_type);
+                    .push_batch_with_null_metadata(record_batch, self.join_type)?;
             }
             buffered_batch.null_joined.clear();
         }
@@ -1432,7 +1478,7 @@ impl MaterializingSortMergeJoinStream {
             buffered_batch,
         )? {
             self.joined_record_batches
-                .push_batch_with_null_metadata(record_batch, self.join_type);
+                .push_batch_with_null_metadata(record_batch, self.join_type)?;
         }
         buffered_batch
             .join_filter_status
@@ -1477,10 +1523,10 @@ impl MaterializingSortMergeJoinStream {
                 // get_corrected_filter_mask() passes them through unchanged.
                 if self.deferred_filtering {
                     self.joined_record_batches
-                        .push_batch_with_null_metadata(batch, self.join_type);
+                        .push_batch_with_null_metadata(batch, self.join_type)?;
                 } else {
                     self.joined_record_batches
-                        .push_batch_without_metadata(batch);
+                        .push_batch_without_metadata(batch)?;
                 }
                 continue;
             }
@@ -1585,11 +1631,11 @@ impl MaterializingSortMergeJoinStream {
                         &mask,
                         self.streamed_batch_counter,
                         self.join_type,
-                    );
+                    )?;
                 } else {
                     let filtered_batch = filter_record_batch(&output_batch, &mask)?;
                     self.joined_record_batches
-                        .push_batch_without_metadata(filtered_batch);
+                        .push_batch_without_metadata(filtered_batch)?;
                 }
 
                 // Track which buffered rows had all filter matches fail,
@@ -1627,7 +1673,7 @@ impl MaterializingSortMergeJoinStream {
             }
         } else {
             self.joined_record_batches
-                .push_batch_without_metadata(output_batch);
+                .push_batch_without_metadata(output_batch)?;
         }
 
         Ok(())
@@ -1764,8 +1810,6 @@ impl MaterializingSortMergeJoinStream {
         );
 
         if out_mask.is_empty() {
-            self.joined_record_batches
-                .clear_batches(&self.schema, self.batch_size);
             return Ok(record_batch);
         }
 
@@ -1810,9 +1854,6 @@ impl MaterializingSortMergeJoinStream {
             &self.schema,
             &self.buffered_schema,
         )?;
-
-        self.joined_record_batches
-            .clear(&self.schema, self.batch_size);
 
         Ok(filtered_record_batch)
     }
@@ -1997,4 +2038,55 @@ fn join_arrays(batch: &RecordBatch, on_column: &[PhysicalExprRef]) -> Vec<ArrayR
             c.into_array(num_rows).unwrap()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion_execution::memory_pool::{
+        MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+    };
+
+    #[test]
+    fn concat_charge_is_held_until_staging_is_cleared() -> Result<()> {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new(
+                "value",
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
+        ]));
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("SMJConcatTest").register(&pool);
+        let mut batches = JoinedRecordBatches {
+            joined_batches: LimitedBatchCoalescer::new_with_reservation(
+                Arc::clone(&schema),
+                2,
+                None,
+                reservation.new_empty(),
+            ),
+            filter_metadata: FilterMetadata::new(),
+            concat_reservation: reservation.new_empty(),
+            concat_charge: 0,
+        };
+        for values in [[1, 2], [3, 4]] {
+            batches.push_batch_without_metadata(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from_iter_values(values))],
+            )?)?;
+        }
+
+        let output = batches.concat_batches(&schema)?;
+        assert_eq!(output.num_rows(), 4);
+        assert!(batches.concat_charge > 0);
+        assert_eq!(batches.concat_reservation.size(), batches.concat_charge);
+
+        batches.clear();
+        assert_eq!(batches.concat_reservation.size(), 0);
+        drop(output);
+        drop(batches);
+        drop(reservation);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
 }

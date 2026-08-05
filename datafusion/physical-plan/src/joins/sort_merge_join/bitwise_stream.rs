@@ -98,7 +98,7 @@
 //! - Inner key group buffer: only for filtered joins, one key group at a time.
 //!   Tracked via `MemoryReservation`; spilled to disk when the memory pool
 //!   limit is exceeded.
-//! - `BatchCoalescer`: output buffering to target batch size
+//! - `LimitedBatchCoalescer`: reservation-backed output buffering to target batch size
 //!
 //! # Degenerate cases
 //!
@@ -123,6 +123,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::EmptyRecordBatchStream;
+use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::joins::utils::{JoinFilter, JoinKeyComparator, compare_join_arrays};
 use crate::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, Time,
@@ -131,7 +132,7 @@ use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::{ObservedStream, RecordBatchStreamAdapter};
 use arrow::array::{Array, ArrayRef, BooleanArray, BooleanBufferBuilder, RecordBatch};
-use arrow::compute::{BatchCoalescer, SortOptions, filter_record_batch, not};
+use arrow::compute::{SortOptions, filter_record_batch, not};
 use arrow::datatypes::SchemaRef;
 use arrow::util::bit_chunk_iterator::UnalignedBitChunk;
 use arrow::util::bit_util::apply_bitwise_binary_op;
@@ -251,7 +252,7 @@ pub(crate) struct BitwiseSortMergeJoinStream {
     outer_is_left: bool,
 
     // Output
-    coalescer: BatchCoalescer,
+    coalescer: LimitedBatchCoalescer,
     schema: SchemaRef,
 
     // Metrics — output rows/batches and end time are recorded by the
@@ -327,6 +328,7 @@ impl BitwiseSortMergeJoinStream {
         let baseline_metrics = BaselineMetrics::new(metrics, partition);
         let peak_mem_used =
             MetricBuilder::new(metrics).peak_memory_usage("peak_mem_used", partition);
+        let output_reservation = reservation.new_empty();
 
         let mut state = Self {
             join_type,
@@ -346,8 +348,16 @@ impl BitwiseSortMergeJoinStream {
             sort_options,
             null_equality,
             outer_is_left,
-            coalescer: BatchCoalescer::new(Arc::clone(&schema), batch_size)
-                .with_biggest_coalesce_batch_size(Some(batch_size / 2)),
+            // Unenforced: this stream spills its inner key-group buffer
+            // under memory pressure; failing the bounded, unspillable
+            // output buffer would defeat that.
+            coalescer: LimitedBatchCoalescer::new_with_reservation(
+                Arc::clone(&schema),
+                batch_size,
+                None,
+                output_reservation,
+            )
+            .with_unenforced_accounting(),
             schema: Arc::clone(&schema),
             input_batches,
             input_rows,
@@ -544,6 +554,15 @@ impl BitwiseSortMergeJoinStream {
         }
     }
 
+    fn push_output_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        match self.coalescer.push_batch(batch)? {
+            PushBatchStatus::Continue => Ok(()),
+            PushBatchStatus::LimitReached => {
+                internal_err!("sort-merge join output coalescer has no fetch limit")
+            }
+        }
+    }
+
     /// Push the current outer batch into the coalescer, applying the matched
     /// bitset as a selection mask. Consumes the batch (`outer_batch` becomes
     /// `None`).
@@ -567,20 +586,20 @@ impl BitwiseSortMergeJoinStream {
                 columns.extend_from_slice(batch.columns());
                 columns.push(mark_col);
                 let output = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
-                self.coalescer.push_batch(output)?;
+                self.push_output_batch(output)?;
             }
             JoinType::LeftSemi | JoinType::RightSemi => {
                 let selection = BooleanArray::new(matched_buf, None);
                 let filtered = filter_record_batch(&batch, &selection)?;
                 if filtered.num_rows() > 0 {
-                    self.coalescer.push_batch(filtered)?;
+                    self.push_output_batch(filtered)?;
                 }
             }
             JoinType::LeftAnti | JoinType::RightAnti => {
                 let selection = not(&BooleanArray::new(matched_buf, None))?;
                 let filtered = filter_record_batch(&batch, &selection)?;
                 if filtered.num_rows() > 0 {
-                    self.coalescer.push_batch(filtered)?;
+                    self.push_output_batch(filtered)?;
                 }
             }
             _ => unreachable!(),
@@ -1097,7 +1116,7 @@ impl BitwiseSortMergeJoinStream {
         }
 
         // Flush whatever is still buffered in the coalescer.
-        self.coalescer.finish_buffered_batch()?;
+        self.coalescer.flush_buffered_batch()?;
         self.emit_completed_batches(emitter).await;
         Ok(())
     }

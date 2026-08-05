@@ -46,7 +46,7 @@ use arrow::array::{
     BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray,
     Int32Array, RecordBatch, UInt64Array,
 };
-use arrow::compute::{BatchCoalescer, SortOptions, filter_record_batch};
+use arrow::compute::{SortOptions, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_ord::sort::SortColumn;
 use arrow_schema::SchemaRef;
@@ -3052,9 +3052,20 @@ fn build_joined_record_batches() -> Result<JoinedRecordBatches> {
         Field::new("y", DataType::Int32, true),
     ]));
 
+    let runtime = RuntimeEnvBuilder::new().build_arc()?;
+    let reservation =
+        MemoryConsumer::new("SMJTestStaging").register(&runtime.memory_pool);
     let mut batches = JoinedRecordBatches {
-        joined_batches: BatchCoalescer::new(Arc::clone(&schema), 8192),
+        joined_batches: crate::coalesce::LimitedBatchCoalescer::new_with_reservation(
+            Arc::clone(&schema),
+            8192,
+            None,
+            reservation.new_empty(),
+        )
+        .with_unenforced_accounting(),
         filter_metadata: crate::joins::sort_merge_join::filter::FilterMetadata::new(),
+        concat_reservation: reservation.new_empty(),
+        concat_charge: 0,
     };
 
     // Insert already prejoined non-filtered rows
