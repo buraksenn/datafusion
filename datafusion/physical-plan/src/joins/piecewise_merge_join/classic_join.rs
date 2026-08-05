@@ -277,6 +277,25 @@ impl ClassicPWMJStream {
             return Ok(StatefulStreamResult::Ready(Some(batch)));
         }
 
+        if !self.batch_process_state.continue_process {
+            // Still draining the previous scan's completed batches: finish
+            // whatever is buffered and keep emitting one batch per poll
+            // WITHOUT leaving this state; transition only once empty.
+            self.batch_process_state
+                .output_batches
+                .finish_buffered_batch()?;
+            if let Some(batch) = self
+                .batch_process_state
+                .output_batches
+                .next_completed_batch()
+            {
+                return Ok(StatefulStreamResult::Ready(Some(batch)));
+            }
+
+            self.state = PiecewiseMergeJoinStreamState::FetchStreamBatch;
+            return Ok(StatefulStreamResult::Continue);
+        }
+
         // Produce more work
         let batch = resolve_classic_join(
             buffered_side,
@@ -289,25 +308,24 @@ impl ClassicPWMJStream {
         )?;
 
         if !self.batch_process_state.continue_process {
-            // We finished scanning this stream batch.
+            // We finished scanning this stream batch. Emit queued completed
+            // batches without changing state so none can be dropped by a
+            // premature transition; the block above drains the rest.
             self.batch_process_state
                 .output_batches
                 .finish_buffered_batch()?;
-            if let Some(b) = self
+            if let Some(batch) = self
                 .batch_process_state
                 .output_batches
                 .next_completed_batch()
             {
-                self.state = PiecewiseMergeJoinStreamState::FetchStreamBatch;
-                return Ok(StatefulStreamResult::Ready(Some(b)));
-            }
-
-            // Nothing pending; hand back whatever `resolve` returned (often empty) and move on.
-            if self.batch_process_state.output_batches.is_empty() {
-                self.state = PiecewiseMergeJoinStreamState::FetchStreamBatch;
-
                 return Ok(StatefulStreamResult::Ready(Some(batch)));
             }
+
+            // Nothing pending; hand back whatever `resolve` returned (often
+            // empty) and move on.
+            self.state = PiecewiseMergeJoinStreamState::FetchStreamBatch;
+            return Ok(StatefulStreamResult::Ready(Some(batch)));
         }
 
         Ok(StatefulStreamResult::Ready(Some(batch)))
@@ -340,9 +358,11 @@ impl ClassicPWMJStream {
                 .output_batches
                 .next_completed_batch()
             {
-                self.state = PiecewiseMergeJoinStreamState::Completed;
                 return Ok(StatefulStreamResult::Ready(Some(batch)));
             }
+
+            self.state = PiecewiseMergeJoinStreamState::Completed;
+            return Ok(StatefulStreamResult::Continue);
         }
 
         let buffered_data =
@@ -388,13 +408,14 @@ impl ClassicPWMJStream {
             .output_batches
             .next_completed_batch()
         {
-            self.state = PiecewiseMergeJoinStreamState::Completed;
+            // Do not transition yet: the block above drains any remaining
+            // completed batches on the next poll before completing.
             return Ok(StatefulStreamResult::Ready(Some(batch)));
         }
 
         self.state = PiecewiseMergeJoinStreamState::Completed;
         self.batch_process_state.reset();
-        Ok(StatefulStreamResult::Ready(None))
+        Ok(StatefulStreamResult::Continue)
     }
 }
 
@@ -660,10 +681,12 @@ mod tests {
         joins::PiecewiseMergeJoinExec,
         test::{TestMemoryExec, build_table_i32},
     };
-    use arrow::array::{Date32Array, Date64Array};
+    use arrow::array::{Date32Array, Date64Array, Int32Array};
+    use arrow::compute::concat_batches;
     use arrow_schema::{DataType, Field};
     use datafusion_common::test_util::batches_to_string;
     use datafusion_execution::TaskContext;
+    use datafusion_execution::config::SessionConfig;
     use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
     use insta::assert_snapshot;
     use std::sync::Arc;
@@ -816,6 +839,59 @@ mod tests {
         | 3  | 1  | 9  | 10 | 2  | 70 |
         +----+----+----+----+----+----+
         ");
+        Ok(())
+    }
+
+    /// Regression test: when the final flush produces more than one completed
+    /// batch (unmatched streamed rows exceeding the target batch size), every
+    /// completed batch must be emitted before the stream reaches `Completed`.
+    /// Prior to the drain-before-transition rework the state machine dequeued
+    /// a single completed batch and dropped the rest, losing rows.
+    #[tokio::test]
+    async fn join_right_unmatched_rows_exceeding_batch_size() -> Result<()> {
+        // Buffered side: one row that matches nothing (100 < {1, 2, 3} is
+        // always false).
+        let left = build_table(("a1", &vec![0]), ("b1", &vec![100]), ("c1", &vec![0]));
+        // Streamed side: three unmatched rows.
+        let right = build_table(
+            ("a2", &vec![10, 20, 30]),
+            ("b1", &vec![1, 2, 3]),
+            ("c2", &vec![70, 80, 90]),
+        );
+        let on = (
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        );
+
+        // A target batch size smaller than the unmatched row count makes the
+        // final flush queue multiple completed batches at once.
+        let session_config = SessionConfig::new().with_batch_size(2);
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(session_config));
+        let join = join(left, right, on, Operator::Lt, JoinType::Right)?;
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 3,
+            "every unmatched streamed row must be emitted"
+        );
+
+        let combined = concat_batches(&join.schema(), &batches)?;
+        // Buffered-side columns are null-extended for unmatched streamed rows.
+        for buffered_column in 0..3 {
+            assert_eq!(combined.column(buffered_column).null_count(), 3);
+        }
+        // Every streamed row survives, regardless of batch boundaries.
+        let a2 = combined
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut streamed_values: Vec<i32> = a2.iter().flatten().collect();
+        streamed_values.sort_unstable();
+        assert_eq!(streamed_values, vec![10, 20, 30]);
         Ok(())
     }
 
