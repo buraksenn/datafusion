@@ -17,8 +17,15 @@
 
 //! Stream Implementation for PiecewiseMergeJoin's Classic Join (Left, Right, Full, Inner)
 
+use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
+use crate::handle_state;
+use crate::joins::piecewise_merge_join::exec::{BufferedSide, BufferedSideReadyState};
+use crate::joins::piecewise_merge_join::utils::need_produce_result_in_final;
+use crate::joins::utils::{BuildProbeJoinMetrics, StatefulStreamResult};
+use crate::joins::utils::{JoinKeyComparator, get_final_indices_from_shared_bitmap};
+use crate::stream::EmptyRecordBatchStream;
 use arrow::array::{Array, PrimitiveBuilder, new_null_array};
-use arrow::compute::{BatchCoalescer, take};
+use arrow::compute::take;
 use arrow::datatypes::UInt32Type;
 use arrow::{
     array::{ArrayRef, RecordBatch, UInt32Array},
@@ -27,19 +34,14 @@ use arrow::{
 use arrow_schema::{Schema, SchemaRef, SortOptions};
 use datafusion_common::NullEquality;
 use datafusion_common::{Result, internal_err};
-use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion_execution::{
+    RecordBatchStream, SendableRecordBatchStream, memory_pool::MemoryReservation,
+};
 use datafusion_expr::{JoinType, Operator};
 use datafusion_physical_expr::PhysicalExprRef;
 use futures::{Stream, StreamExt};
 use std::{cmp::Ordering, task::ready};
 use std::{sync::Arc, task::Poll};
-
-use crate::handle_state;
-use crate::joins::piecewise_merge_join::exec::{BufferedSide, BufferedSideReadyState};
-use crate::joins::piecewise_merge_join::utils::need_produce_result_in_final;
-use crate::joins::utils::{BuildProbeJoinMetrics, StatefulStreamResult};
-use crate::joins::utils::{JoinKeyComparator, get_final_indices_from_shared_bitmap};
-use crate::stream::EmptyRecordBatchStream;
 
 pub(super) enum PiecewiseMergeJoinStreamState {
     WaitBufferedSide,
@@ -144,6 +146,7 @@ impl ClassicPWMJStream {
         sort_option: SortOptions,
         join_metrics: BuildProbeJoinMetrics,
         batch_size: usize,
+        output_reservation: MemoryReservation,
     ) -> Self {
         Self {
             schema: Arc::clone(&schema),
@@ -156,7 +159,11 @@ impl ClassicPWMJStream {
             state,
             sort_option,
             join_metrics,
-            batch_process_state: BatchProcessState::new(schema, batch_size),
+            batch_process_state: BatchProcessState::new(
+                schema,
+                batch_size,
+                output_reservation,
+            ),
         }
     }
 
@@ -271,22 +278,19 @@ impl ClassicPWMJStream {
 
         if let Some(batch) = self
             .batch_process_state
-            .output_batches
+            .output_buffer
             .next_completed_batch()
         {
             return Ok(StatefulStreamResult::Ready(Some(batch)));
         }
 
         if !self.batch_process_state.continue_process {
-            // Still draining the previous scan's completed batches: finish
-            // whatever is buffered and keep emitting one batch per poll
-            // WITHOUT leaving this state; transition only once empty.
             self.batch_process_state
-                .output_batches
-                .finish_buffered_batch()?;
+                .output_buffer
+                .flush_buffered_batch()?;
             if let Some(batch) = self
                 .batch_process_state
-                .output_batches
+                .output_buffer
                 .next_completed_batch()
             {
                 return Ok(StatefulStreamResult::Ready(Some(batch)));
@@ -308,22 +312,17 @@ impl ClassicPWMJStream {
         )?;
 
         if !self.batch_process_state.continue_process {
-            // We finished scanning this stream batch. Emit queued completed
-            // batches without changing state so none can be dropped by a
-            // premature transition; the block above drains the rest.
             self.batch_process_state
-                .output_batches
-                .finish_buffered_batch()?;
+                .output_buffer
+                .flush_buffered_batch()?;
             if let Some(batch) = self
                 .batch_process_state
-                .output_batches
+                .output_buffer
                 .next_completed_batch()
             {
                 return Ok(StatefulStreamResult::Ready(Some(batch)));
             }
 
-            // Nothing pending; hand back whatever `resolve` returned (often
-            // empty) and move on.
             self.state = PiecewiseMergeJoinStreamState::FetchStreamBatch;
             return Ok(StatefulStreamResult::Ready(Some(batch)));
         }
@@ -344,18 +343,18 @@ impl ClassicPWMJStream {
         if !self.batch_process_state.continue_process {
             if let Some(batch) = self
                 .batch_process_state
-                .output_batches
+                .output_buffer
                 .next_completed_batch()
             {
                 return Ok(StatefulStreamResult::Ready(Some(batch)));
             }
 
             self.batch_process_state
-                .output_batches
-                .finish_buffered_batch()?;
+                .output_buffer
+                .flush_buffered_batch()?;
             if let Some(batch) = self
                 .batch_process_state
-                .output_batches
+                .output_buffer
                 .next_completed_batch()
             {
                 return Ok(StatefulStreamResult::Ready(Some(batch)));
@@ -389,27 +388,25 @@ impl ClassicPWMJStream {
 
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), buffered_columns)?;
 
-        self.batch_process_state.output_batches.push_batch(batch)?;
+        self.batch_process_state.push_output_batch(batch)?;
 
         self.batch_process_state.continue_process = false;
         if let Some(batch) = self
             .batch_process_state
-            .output_batches
+            .output_buffer
             .next_completed_batch()
         {
             return Ok(StatefulStreamResult::Ready(Some(batch)));
         }
 
         self.batch_process_state
-            .output_batches
-            .finish_buffered_batch()?;
+            .output_buffer
+            .flush_buffered_batch()?;
         if let Some(batch) = self
             .batch_process_state
-            .output_batches
+            .output_buffer
             .next_completed_batch()
         {
-            // Do not transition yet: the block above drains any remaining
-            // completed batches on the next poll before completing.
             return Ok(StatefulStreamResult::Ready(Some(batch)));
         }
 
@@ -420,8 +417,8 @@ impl ClassicPWMJStream {
 }
 
 struct BatchProcessState {
-    // Used to pick up from the last index on the stream side
-    output_batches: Box<BatchCoalescer>,
+    // Output batches waiting to be emitted, charged to a partition-scoped reservation.
+    output_buffer: LimitedBatchCoalescer,
     // Used to store the unmatched stream indices for `JoinType::Right` and `JoinType::Full`
     unmatched_indices: PrimitiveBuilder<UInt32Type>,
     // Used to store the start index on the buffered side; used to resume processing on the correct
@@ -439,9 +436,18 @@ struct BatchProcessState {
 }
 
 impl BatchProcessState {
-    pub(crate) fn new(schema: Arc<Schema>, batch_size: usize) -> Self {
+    pub(crate) fn new(
+        schema: Arc<Schema>,
+        batch_size: usize,
+        output_reservation: MemoryReservation,
+    ) -> Self {
         Self {
-            output_batches: Box::new(BatchCoalescer::new(schema, batch_size)),
+            output_buffer: LimitedBatchCoalescer::new_exact_with_reservation(
+                schema,
+                batch_size,
+                None,
+                output_reservation,
+            ),
             unmatched_indices: PrimitiveBuilder::new(),
             start_buffer_idx: 0,
             start_stream_idx: 0,
@@ -458,6 +464,15 @@ impl BatchProcessState {
         self.found = false;
         self.continue_process = true;
         self.processed_null_count = false;
+    }
+
+    fn push_output_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        match self.output_buffer.push_batch(batch)? {
+            PushBatchStatus::Continue => Ok(()),
+            PushBatchStatus::LimitReached => {
+                internal_err!("piecewise merge join output coalescer has no fetch limit")
+            }
+        }
     }
 }
 
@@ -526,11 +541,11 @@ fn resolve_classic_join(
                             join_schema,
                         )?;
 
-                        batch_process_state.output_batches.push_batch(batch)?;
+                        batch_process_state.push_output_batch(batch)?;
 
                         // Flush batch and update pointers if we have a completed batch
                         if let Some(batch) =
-                            batch_process_state.output_batches.next_completed_batch()
+                            batch_process_state.output_buffer.next_completed_batch()
                         {
                             batch_process_state.found = false;
                             batch_process_state.start_buffer_idx = buffer_idx;
@@ -555,9 +570,9 @@ fn resolve_classic_join(
                         )?;
 
                         // Flush batch and update pointers if we have a completed batch
-                        batch_process_state.output_batches.push_batch(batch)?;
+                        batch_process_state.push_output_batch(batch)?;
                         if let Some(batch) =
-                            batch_process_state.output_batches.next_completed_batch()
+                            batch_process_state.output_buffer.next_completed_batch()
                         {
                             batch_process_state.found = false;
                             batch_process_state.start_buffer_idx = buffer_idx;
@@ -601,7 +616,7 @@ fn resolve_classic_join(
             join_schema,
         )?;
 
-        batch_process_state.output_batches.push_batch(batch)?;
+        batch_process_state.push_output_batch(batch)?;
     }
 
     batch_process_state.continue_process = false;
@@ -687,8 +702,13 @@ mod tests {
     use datafusion_common::test_util::batches_to_string;
     use datafusion_execution::TaskContext;
     use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::memory_pool::{
+        MemoryPool, TrackConsumersPool, UnboundedMemoryPool,
+    };
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
     use insta::assert_snapshot;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
     fn columns(schema: &Schema) -> Vec<String> {
@@ -892,6 +912,43 @@ mod tests {
         let mut streamed_values: Vec<i32> = a2.iter().flatten().collect();
         streamed_values.sort_unstable();
         assert_eq!(streamed_values, vec![10, 20, 30]);
+        Ok(())
+    }
+
+    #[test]
+    fn output_coalescer_reserves_and_releases_memory() -> Result<()> {
+        let left = build_table(("a1", &vec![0]), ("b1", &vec![1]), ("c1", &vec![2]));
+        let right = build_table(("a2", &vec![3]), ("b1", &vec![4]), ("c2", &vec![5]));
+        let on = (
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        );
+        let join = join(left, right, on, Operator::Lt, JoinType::Inner)?;
+
+        let pool = Arc::new(TrackConsumersPool::new(
+            UnboundedMemoryPool::default(),
+            NonZeroUsize::new(5).unwrap(),
+        ));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+            .build()?;
+        let task_ctx = Arc::new(TaskContext::default().with_runtime(Arc::new(runtime)));
+
+        let stream = join.execute(0, task_ctx)?;
+        let output = pool
+            .metrics()
+            .into_iter()
+            .find(|consumer| consumer.name == "PiecewiseMergeJoinOutput[0]")
+            .expect("output coalescer must register a memory consumer");
+        assert!(output.reserved > 0);
+
+        drop(stream);
+        assert!(
+            pool.metrics()
+                .iter()
+                .all(|consumer| consumer.name != "PiecewiseMergeJoinOutput[0]")
+        );
+        assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 

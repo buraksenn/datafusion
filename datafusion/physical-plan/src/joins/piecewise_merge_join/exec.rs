@@ -584,6 +584,10 @@ impl ExecutionPlan for PiecewiseMergeJoinExec {
             ))
         })?;
 
+        let output_reservation =
+            MemoryConsumer::new(format!("PiecewiseMergeJoinOutput[{partition}]"))
+                .register(context.memory_pool());
+
         let streamed = self.streamed.execute(partition, Arc::clone(&context))?;
 
         let batch_size = context.session_config().batch_size();
@@ -603,6 +607,7 @@ impl ExecutionPlan for PiecewiseMergeJoinExec {
                 self.sort_options,
                 metrics,
                 batch_size,
+                output_reservation,
             )))
         }
     }
