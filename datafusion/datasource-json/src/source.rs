@@ -232,8 +232,7 @@ impl FileSource for JsonSource {
         "json"
     }
 
-    /// Emit a `JsonScan` node wrapping the shared base config; JSON has no
-    /// format-specific fields, so the node is `base_conf` only.
+    /// Emit a `JsonScan` node wrapping the shared base config.
     #[cfg(feature = "proto")]
     fn try_to_proto(
         &self,
@@ -254,12 +253,9 @@ impl FileSource for JsonSource {
 
 #[cfg(feature = "proto")]
 impl JsonSource {
-    /// Reconstruct a `DataSourceExec` (wrapping a `FileScanConfig` over a
-    /// `JsonSource`) from a `JsonScan` [`PhysicalPlanNode`].
+    /// Reconstructs a `DataSourceExec` from a protobuf `JsonScan`.
     ///
-    /// The inverse of [`FileSource::try_to_proto`] on `JsonSource`.
-    ///
-    /// [`PhysicalPlanNode`]: datafusion_proto_models::protobuf::PhysicalPlanNode
+    /// Defaults to newline-delimited JSON because protobuf does not encode the mode.
     pub fn try_from_proto(
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &datafusion_physical_plan::proto::ExecutionPlanDecodeCtx<'_>,

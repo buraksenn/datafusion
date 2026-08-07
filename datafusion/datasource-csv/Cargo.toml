@@ -31,8 +31,7 @@ version.workspace = true
 all-features = true
 
 [features]
-# Enables `FileSource::try_to_proto` on `CsvSource` and the `CsvScan` decode
-# entry point. Mirrors the `proto` feature on `datafusion-datasource`.
+# Enables protobuf serialization hooks for CSV sources and sinks.
 proto = [
     "dep:datafusion-proto-models",
     "datafusion-datasource/proto",

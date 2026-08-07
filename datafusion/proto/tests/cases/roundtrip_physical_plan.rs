@@ -1333,7 +1333,7 @@ fn roundtrip_avro_scan() -> Result<()> {
 }
 
 #[test]
-fn roundtrip_csv_scan() -> Result<()> {
+fn roundtrip_csv_scan_preserves_format_options() -> Result<()> {
     use datafusion::common::config::CsvOptions;
 
     let file_schema =
@@ -1341,9 +1341,13 @@ fn roundtrip_csv_scan() -> Result<()> {
     let table_schema = TableSchema::from(&file_schema);
     let file_source =
         Arc::new(CsvSource::new(table_schema).with_csv_options(CsvOptions {
-            has_header: Some(true),
-            delimiter: b',',
-            quote: b'"',
+            has_header: Some(false),
+            delimiter: b'|',
+            quote: b'\'',
+            escape: Some(b'\\'),
+            comment: Some(b'#'),
+            newlines_in_values: Some(true),
+            truncated_rows: Some(true),
             ..Default::default()
         }));
 
@@ -1355,7 +1359,33 @@ fn roundtrip_csv_scan() -> Result<()> {
             )])])
             .build();
 
-    roundtrip_test(DataSourceExec::from_data_source(scan_config))
+    let ctx = SessionContext::new();
+    let roundtripped = roundtrip_test_and_return(
+        DataSourceExec::from_data_source(scan_config),
+        &ctx,
+        &DefaultPhysicalExtensionCodec {},
+        &DefaultPhysicalProtoConverter {},
+    )?;
+    let data_source = roundtripped
+        .downcast_ref::<DataSourceExec>()
+        .ok_or_else(|| internal_datafusion_err!("Expected DataSourceExec"))?;
+    let file_scan = data_source
+        .data_source()
+        .downcast_ref::<FileScanConfig>()
+        .ok_or_else(|| internal_datafusion_err!("Expected FileScanConfig"))?;
+    let csv_source = file_scan
+        .file_source()
+        .downcast_ref::<CsvSource>()
+        .ok_or_else(|| internal_datafusion_err!("Expected CsvSource"))?;
+
+    assert!(!csv_source.has_header());
+    assert_eq!(csv_source.delimiter(), b'|');
+    assert_eq!(csv_source.quote(), b'\'');
+    assert_eq!(csv_source.escape(), Some(b'\\'));
+    assert_eq!(csv_source.comment(), Some(b'#'));
+    assert!(csv_source.newlines_in_values());
+    assert!(csv_source.truncate_rows());
+    Ok(())
 }
 
 #[tokio::test]

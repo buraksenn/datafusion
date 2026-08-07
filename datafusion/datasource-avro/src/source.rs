@@ -169,8 +169,7 @@ impl FileSource for AvroSource {
         false
     }
 
-    /// Emit an `AvroScan` node wrapping the shared base config; Avro has no
-    /// format-specific fields, so the node is `base_conf` only.
+    /// Emit an `AvroScan` node wrapping the shared base config.
     #[cfg(feature = "proto")]
     fn try_to_proto(
         &self,
@@ -191,11 +190,7 @@ impl FileSource for AvroSource {
 
 #[cfg(feature = "proto")]
 impl AvroSource {
-    /// Reconstruct a `DataSourceExec` (wrapping a `FileScanConfig` over an
-    /// `AvroSource`) from an `AvroScan`
-    /// [`PhysicalPlanNode`](datafusion_proto_models::protobuf::PhysicalPlanNode).
-    ///
-    /// The inverse of [`FileSource::try_to_proto`] on `AvroSource`.
+    /// Reconstructs a `DataSourceExec` from a protobuf `AvroScan`.
     pub fn try_from_proto(
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &datafusion_physical_plan::proto::ExecutionPlanDecodeCtx<'_>,

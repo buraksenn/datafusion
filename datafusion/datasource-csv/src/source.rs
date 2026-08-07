@@ -309,8 +309,7 @@ impl FileSource for CsvSource {
         }
     }
 
-    /// Emit a `CsvScan` node wrapping the shared base config plus the
-    /// CSV-specific parsing options.
+    /// Emit a `CsvScan` node wrapping the shared base config and CSV options.
     #[cfg(feature = "proto")]
     fn try_to_proto(
         &self,
@@ -546,7 +545,6 @@ pub async fn plan_to_csv(
     Ok(())
 }
 
-/// Convert a single byte to its one-character UTF-8 string form for the wire.
 #[cfg(feature = "proto")]
 fn proto_byte_to_string(b: u8, description: &str) -> Result<String> {
     let bytes = &[b];
@@ -558,7 +556,6 @@ fn proto_byte_to_string(b: u8, description: &str) -> Result<String> {
     Ok(s.to_owned())
 }
 
-/// Convert a one-character string from the wire back to a single byte.
 #[cfg(feature = "proto")]
 fn proto_str_to_byte(s: &str, description: &str) -> Result<u8> {
     datafusion_common::assert_eq_or_internal_err!(
@@ -571,12 +568,9 @@ fn proto_str_to_byte(s: &str, description: &str) -> Result<u8> {
 
 #[cfg(feature = "proto")]
 impl CsvSource {
-    /// Reconstruct a `DataSourceExec` (wrapping a `FileScanConfig` over a
-    /// `CsvSource`) from a `CsvScan` [`PhysicalPlanNode`].
+    /// Reconstructs a `DataSourceExec` from a protobuf `CsvScan`.
     ///
-    /// The inverse of [`FileSource::try_to_proto`] on `CsvSource`.
-    ///
-    /// [`PhysicalPlanNode`]: datafusion_proto_models::protobuf::PhysicalPlanNode
+    /// Custom line terminators are not represented in the wire format.
     pub fn try_from_proto(
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &datafusion_physical_plan::proto::ExecutionPlanDecodeCtx<'_>,
@@ -624,6 +618,7 @@ impl CsvSource {
             delimiter: proto_str_to_byte(&scan.delimiter, "delimiter")?,
             quote: proto_str_to_byte(&scan.quote, "quote")?,
             newlines_in_values: Some(scan.newlines_in_values),
+            truncated_rows: Some(scan.truncate_rows),
             ..Default::default()
         };
         let source = Arc::new(

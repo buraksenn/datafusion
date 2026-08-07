@@ -393,8 +393,7 @@ impl FileSource for ArrowSource {
         Some(&self.projection.source)
     }
 
-    /// Emit an `ArrowScan` node wrapping the shared base config; Arrow has no
-    /// format-specific fields, so the node is `base_conf` only.
+    /// Emit an `ArrowScan` node wrapping the shared base config.
     #[cfg(feature = "proto")]
     fn try_to_proto(
         &self,
@@ -416,12 +415,10 @@ impl FileSource for ArrowSource {
 
 #[cfg(feature = "proto")]
 impl ArrowSource {
-    /// Reconstruct a `DataSourceExec` (wrapping a `FileScanConfig` over an
-    /// `ArrowSource`) from an `ArrowScan` [`PhysicalPlanNode`].
+    /// Reconstructs a `DataSourceExec` from a protobuf `ArrowScan`.
     ///
-    /// The inverse of [`FileSource::try_to_proto`] on `ArrowSource`.
-    ///
-    /// [`PhysicalPlanNode`]: datafusion_proto_models::protobuf::PhysicalPlanNode
+    /// Defaults to the IPC file format because protobuf does not distinguish it
+    /// from the IPC stream format.
     pub fn try_from_proto(
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &datafusion_physical_plan::proto::ExecutionPlanDecodeCtx<'_>,
