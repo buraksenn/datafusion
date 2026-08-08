@@ -840,8 +840,8 @@ impl ExecutionPlan for FilterExec {
                         expr: Some(expr),
                         default_filter_selectivity: self.default_selectivity() as u32,
                         projection,
-                        batch_size: self.batch_size() as u32,
-                        fetch: self.fetch().map(|f| f as u32),
+                        batch_size: self.batch_size() as u64,
+                        fetch: self.fetch().map(|f| f as u64),
                     },
                 )),
             ),
@@ -862,6 +862,7 @@ impl FilterExec {
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_common::utils::usize_from_wire;
         use datafusion_proto_models::protobuf;
         let filter = crate::expect_plan_variant!(
             node,
@@ -894,14 +895,21 @@ impl FilterExec {
         } else {
             Some(projection_vec)
         };
-        use datafusion_common::utils::usize_from_wire;
-        let filter = FilterExecBuilder::new(predicate, input)
-            .apply_projection(projection)?
-            .with_batch_size(usize_from_wire(
+        let builder =
+            FilterExecBuilder::new(predicate, input).apply_projection(projection)?;
+        // A batch_size of 0 (the proto3 default when the field is absent) means
+        // unset: keep the builder default rather than a coalescer that can
+        // never emit a batch.
+        let builder = if filter.batch_size > 0 {
+            builder.with_batch_size(usize_from_wire(
                 filter.batch_size,
                 "FilterExec",
                 "batch_size",
             )?)
+        } else {
+            builder
+        };
+        let filter = builder
             .with_fetch(
                 filter
                     .fetch

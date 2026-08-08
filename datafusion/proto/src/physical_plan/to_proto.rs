@@ -465,7 +465,7 @@ pub fn serialize_file_scan_config(
     Ok(protobuf::FileScanExecConf {
         file_groups,
         statistics: Some((&conf.statistics()).into()),
-        limit: conf.limit.map(|l| protobuf::ScanLimit { limit: l as u32 }),
+        limit: conf.limit.map(|l| protobuf::ScanLimit { limit: l as u64 }),
         projection: vec![],
         schema: Some(schema.as_ref().try_into()?),
         table_partition_cols: conf

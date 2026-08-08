@@ -303,8 +303,8 @@ impl ExecutionPlan for CoalesceBatchesExec {
                 protobuf::physical_plan_node::PhysicalPlanType::CoalesceBatches(
                     Box::new(protobuf::CoalesceBatchesExecNode {
                         input: Some(Box::new(input)),
-                        target_batch_size: self.target_batch_size() as u32,
-                        fetch: self.fetch().map(|n| n as u32),
+                        target_batch_size: self.target_batch_size() as u64,
+                        fetch: self.fetch().map(|n| n as u64),
                     }),
                 ),
             ),
@@ -329,6 +329,7 @@ impl CoalesceBatchesExec {
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_common::utils::usize_from_wire;
         use datafusion_proto_models::protobuf;
         let coalesce_batches = crate::expect_plan_variant!(
             node,
@@ -340,12 +341,17 @@ impl CoalesceBatchesExec {
             "CoalesceBatchesExec",
             "input",
         )?;
-        use datafusion_common::utils::usize_from_wire;
         let target_batch_size = usize_from_wire(
             coalesce_batches.target_batch_size,
             "CoalesceBatchesExec",
             "target_batch_size",
         )?;
+        // A zero batch size builds a coalescer that can never emit a batch.
+        if target_batch_size == 0 {
+            return datafusion_common::exec_err!(
+                "CoalesceBatchesExec: target_batch_size must be greater than 0"
+            );
+        }
         let fetch = coalesce_batches
             .fetch
             .map(|f| usize_from_wire(f, "CoalesceBatchesExec", "fetch"))

@@ -359,7 +359,7 @@ impl ExecutionPlan for CoalescePartitionsExec {
                 protobuf::physical_plan_node::PhysicalPlanType::Merge(Box::new(
                     protobuf::CoalescePartitionsExecNode {
                         input: Some(Box::new(input)),
-                        fetch: self.fetch().map(|f| f as u32),
+                        fetch: self.fetch().map(|f| f as u64),
                     },
                 )),
             ),
@@ -380,6 +380,7 @@ impl CoalescePartitionsExec {
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_common::utils::usize_from_wire;
         use datafusion_proto_models::protobuf;
         let merge = crate::expect_plan_variant!(
             node,
@@ -393,13 +394,7 @@ impl CoalescePartitionsExec {
         )?;
         let fetch = merge
             .fetch
-            .map(|f| {
-                datafusion_common::utils::usize_from_wire(
-                    f,
-                    "CoalescePartitionsExec",
-                    "fetch",
-                )
-            })
+            .map(|f| usize_from_wire(f, "CoalescePartitionsExec", "fetch"))
             .transpose()?;
         Ok(Arc::new(
             CoalescePartitionsExec::new(input).with_fetch(fetch),

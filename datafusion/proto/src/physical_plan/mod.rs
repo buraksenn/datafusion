@@ -24,8 +24,10 @@ use std::sync::Arc;
 use arrow::datatypes::{IntervalMonthDayNanoType, Schema, SchemaRef};
 use datafusion_catalog::memory::MemorySourceConfig;
 use datafusion_common::config::CsvOptions;
+use datafusion_common::utils::usize_from_wire;
 use datafusion_common::{
-    DataFusionError, Result, internal_datafusion_err, internal_err, not_impl_err,
+    DataFusionError, Result, exec_err, internal_datafusion_err, internal_err,
+    not_impl_err,
 };
 #[cfg(feature = "parquet")]
 use datafusion_datasource::file::FileSource;
@@ -1203,13 +1205,7 @@ pub trait PhysicalPlanNodeExt: Sized {
 
         let fetch = scan
             .fetch
-            .map(|f| {
-                datafusion_common::utils::usize_from_wire(
-                    f,
-                    "MemoryScanExecNode",
-                    "fetch",
-                )
-            })
+            .map(|f| usize_from_wire(f, "MemoryScanExecNode", "fetch"))
             .transpose()?;
         let source = MemorySourceConfig::try_new(&partitions, schema, projection)?
             .with_limit(fetch)
@@ -1880,11 +1876,17 @@ pub trait PhysicalPlanNodeExt: Sized {
         };
 
         let table = GenerateSeriesTable::new(Arc::clone(&schema), args);
-        let target_batch_size = datafusion_common::utils::usize_from_wire(
+        let target_batch_size = usize_from_wire(
             generate_series.target_batch_size,
             "GenerateSeriesNode",
             "target_batch_size",
         )?;
+        // A zero batch size would generate an empty series.
+        if target_batch_size == 0 {
+            return exec_err!(
+                "GenerateSeriesNode: target_batch_size must be greater than 0"
+            );
+        }
         let generator = table.as_generator(target_batch_size)?;
 
         Ok(Arc::new(LazyMemoryExec::try_new(schema, vec![generator])?))
@@ -2409,7 +2411,7 @@ pub trait PhysicalPlanNodeExt: Sized {
                         projection: proto_projection,
                         sort_information: proto_sort_information,
                         show_sizes: source_conf.show_sizes(),
-                        fetch: source_conf.fetch().map(|f| f as u32),
+                        fetch: source_conf.fetch().map(|f| f as u64),
                     },
                 )),
             }));
@@ -2750,7 +2752,7 @@ pub trait PhysicalPlanNodeExt: Sized {
             let schema = exec.schema();
             let node = protobuf::GenerateSeriesNode {
                 schema: Some(schema.as_ref().try_into()?),
-                target_batch_size: int_64.batch_size() as u32,
+                target_batch_size: int_64.batch_size() as u64,
                 args: Some(protobuf::generate_series_node::Args::Int64Args(
                     protobuf::GenerateSeriesArgsInt64 {
                         start: *int_64.start(),
@@ -2814,7 +2816,7 @@ pub trait PhysicalPlanNodeExt: Sized {
 
             let node = protobuf::GenerateSeriesNode {
                 schema: Some(schema.as_ref().try_into()?),
-                target_batch_size: timestamp_args.batch_size() as u32,
+                target_batch_size: timestamp_args.batch_size() as u64,
                 args: Some(args),
             };
 

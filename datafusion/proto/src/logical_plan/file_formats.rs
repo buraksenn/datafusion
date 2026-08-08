@@ -704,17 +704,21 @@ mod parquet {
                         ),
                     })
                     .transpose()?,
-                max_row_group_bytes: match &proto.max_row_group_bytes_opt {
-                    Some(parquet_options::MaxRowGroupBytesOpt::MaxRowGroupBytes(
-                        size,
-                    )) => MaxRowGroupBytes::try_new(usize_from_wire(
-                        *size,
-                        "ParquetOptions",
-                        "max_row_group_bytes",
-                    )?)
-                    .ok(),
-                    None => None,
-                },
+                max_row_group_bytes: proto
+                    .max_row_group_bytes_opt
+                    .as_ref()
+                    .map(
+                        |parquet_options::MaxRowGroupBytesOpt::MaxRowGroupBytes(
+                            size,
+                        )| {
+                            MaxRowGroupBytes::try_new(usize_from_wire(
+                                *size,
+                                "ParquetOptions",
+                                "max_row_group_bytes",
+                            )?)
+                        },
+                    )
+                    .transpose()?,
                 content_defined_chunking: proto
                     .content_defined_chunking
                     .map(ParquetCdcOptions::try_from_proto)

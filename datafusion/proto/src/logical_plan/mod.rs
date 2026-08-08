@@ -41,7 +41,7 @@ use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::format::{
     ExplainAnalyzeCategories, ExplainFormat, MetricCategory, MetricType,
 };
-use datafusion_common::utils::usize_from_wire;
+use datafusion_common::utils::{usize_from_wire, usize_to_wire};
 use datafusion_common::{
     NullEquality, Result, TableReference, assert_or_internal_err, context,
     internal_datafusion_err, internal_err, not_impl_err, plan_err,
@@ -490,7 +490,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let n_cols = usize_from_wire(values.n_cols, "Values", "n_cols")?;
                 let values: Vec<Vec<Expr>> = if values.values_list.is_empty() {
                     Ok(Vec::new())
-                } else if values.values_list.len() % n_cols != 0 {
+                } else if n_cols == 0 || values.values_list.len() % n_cols != 0 {
                     internal_err!(
                         "Invalid values list length, expect {} to be divisible by {}",
                         values.values_list.len(),
@@ -720,7 +720,11 @@ impl AsLogicalPlan for LogicalPlanNode {
                     into_logical_plan!(sort.input, ctx, extension_codec)?;
                 let sort_expr: Vec<SortExpr> =
                     from_proto::parse_sorts(&sort.expr, ctx, extension_codec)?;
-                let fetch: Option<usize> = sort.fetch.try_into().ok();
+                let fetch = if sort.fetch >= 0 {
+                    Some(usize_from_wire(sort.fetch, "Sort", "fetch")?)
+                } else {
+                    None
+                };
                 LogicalPlanBuilder::from(input)
                     .sort_with_limit(sort_expr, fetch)?
                     .build()
@@ -841,7 +845,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                         .with_definition(definition)
                         .with_unbounded(create_extern_table.unbounded)
                         .with_options(create_extern_table.options.clone())
-                        .with_constraints(constraints.into())
+                        .with_constraints(constraints.try_into()?)
                         .with_column_defaults(column_defaults)
                         .build(),
                     ),
@@ -972,7 +976,11 @@ impl AsLogicalPlan for LogicalPlanNode {
                     into_logical_plan!(limit.input, ctx, extension_codec)?;
                 let skip = usize_from_wire(limit.skip.max(0), "Limit", "skip")?;
 
-                let fetch = if limit.fetch < 0 {
+                // `i64::MAX` is an alternate wire spelling of "no limit": it is
+                // what encoders write for `fetch: None` when they do not use
+                // the negative sentinel, and decoding it as a row count would
+                // overflow 32-bit targets.
+                let fetch = if limit.fetch < 0 || limit.fetch == i64::MAX {
                     None
                 } else {
                     Some(usize_from_wire(limit.fetch, "Limit", "fetch")?)
@@ -1739,8 +1747,11 @@ impl AsLogicalPlan for LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Limit(Box::new(
                         protobuf::LimitNode {
                             input: Some(Box::new(input)),
-                            skip: skip as i64,
-                            fetch: fetch.unwrap_or(i64::MAX as usize) as i64,
+                            skip: usize_to_wire(skip, "Limit", "skip")?,
+                            fetch: match fetch {
+                                Some(f) => usize_to_wire(f, "Limit", "fetch")?,
+                                None => -1, // no limit
+                            },
                         },
                     ))),
                 })
@@ -1757,7 +1768,10 @@ impl AsLogicalPlan for LogicalPlanNode {
                         protobuf::SortNode {
                             input: Some(Box::new(input)),
                             expr: sort_expr,
-                            fetch: fetch.map(|f| f as i64).unwrap_or(-1i64),
+                            fetch: match fetch {
+                                Some(f) => usize_to_wire(*f, "Sort", "fetch")?,
+                                None => -1, // no limit
+                            },
                         },
                     ))),
                 })

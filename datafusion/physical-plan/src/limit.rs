@@ -250,6 +250,7 @@ impl ExecutionPlan for GlobalLimitExec {
         &self,
         ctx: &crate::proto::ExecutionPlanEncodeCtx<'_>,
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        use datafusion_common::utils::usize_to_wire;
         use datafusion_proto_models::protobuf;
         let input = ctx.encode_child(self.input())?;
         Ok(Some(protobuf::PhysicalPlanNode {
@@ -257,10 +258,10 @@ impl ExecutionPlan for GlobalLimitExec {
                 protobuf::physical_plan_node::PhysicalPlanType::GlobalLimit(Box::new(
                     protobuf::GlobalLimitExecNode {
                         input: Some(Box::new(input)),
-                        skip: self.skip() as u32,
+                        skip: self.skip() as u64,
                         fetch: match self.fetch() {
-                            Some(n) => n as i64,
-                            _ => -1, // no limit
+                            Some(n) => usize_to_wire(n, "GlobalLimitExec", "fetch")?,
+                            None => -1, // no limit
                         },
                     },
                 )),
@@ -275,6 +276,7 @@ impl GlobalLimitExec {
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_common::utils::usize_from_wire;
         use datafusion_proto_models::protobuf;
         let limit = crate::expect_plan_variant!(
             node,
@@ -286,7 +288,6 @@ impl GlobalLimitExec {
             "GlobalLimitExec",
             "input",
         )?;
-        use datafusion_common::utils::usize_from_wire;
         let fetch = if limit.fetch >= 0 {
             Some(usize_from_wire(limit.fetch, "GlobalLimitExec", "fetch")?)
         } else {
@@ -483,7 +484,7 @@ impl ExecutionPlan for LocalLimitExec {
                 protobuf::physical_plan_node::PhysicalPlanType::LocalLimit(Box::new(
                     protobuf::LocalLimitExecNode {
                         input: Some(Box::new(input)),
-                        fetch: self.fetch() as u32,
+                        fetch: self.fetch() as u64,
                     },
                 )),
             ),
@@ -497,6 +498,7 @@ impl LocalLimitExec {
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_common::utils::usize_from_wire;
         use datafusion_proto_models::protobuf;
         let limit = crate::expect_plan_variant!(
             node,
@@ -505,11 +507,7 @@ impl LocalLimitExec {
         );
         let input =
             ctx.decode_required_child(limit.input.as_deref(), "LocalLimitExec", "input")?;
-        let fetch = datafusion_common::utils::usize_from_wire(
-            limit.fetch,
-            "LocalLimitExec",
-            "fetch",
-        )?;
+        let fetch = usize_from_wire(limit.fetch, "LocalLimitExec", "fetch")?;
         Ok(Arc::new(LocalLimitExec::new(input, fetch)))
     }
 }

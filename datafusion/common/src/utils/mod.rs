@@ -25,9 +25,7 @@ pub mod proxy;
 pub mod string_utils;
 
 use crate::assert_or_internal_err;
-use crate::error::{
-    _exec_datafusion_err, _exec_err, _internal_datafusion_err, _plan_datafusion_err,
-};
+use crate::error::{_exec_datafusion_err, _exec_err, _internal_datafusion_err};
 use crate::{Result, ScalarValue};
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, OffsetSizeTrait,
@@ -1145,9 +1143,9 @@ pub fn combine_limit(
 }
 
 /// Converts a decoded wire integer (e.g. a protobuf `uint64`/`int64` field) to
-/// `usize`, returning a plan error instead of silently truncating when the
-/// value cannot be represented on the current target (e.g. 32-bit platforms,
-/// where an `as usize` cast of `1 << 32` yields `0`).
+/// `usize`, returning an error instead of silently truncating when the value
+/// is negative or cannot be represented on the current target (e.g. 32-bit
+/// platforms, where an `as usize` cast of `1 << 32` yields `0`).
 ///
 /// `context` and `field` name the plan node (or option struct) and the field
 /// being decoded, e.g. `usize_from_wire(node.fetch, "GlobalLimitExec", "fetch")`.
@@ -1156,8 +1154,26 @@ where
     T: TryInto<usize> + std::fmt::Display + Copy,
 {
     value.try_into().map_err(|_| {
-        _plan_datafusion_err!(
-            "{context}: {field} value {value} cannot be represented as usize on this target"
+        _exec_datafusion_err!(
+            "{context}: {field} wire value {value} is out of range for usize"
+        )
+    })
+}
+
+/// Converts a `usize` to the wire integer type `T` (e.g. a protobuf `int64`
+/// field), returning an error instead of silently wrapping when the value does
+/// not fit.
+///
+/// The mirror of [`usize_from_wire`]: an out-of-range value is an error on
+/// both sides of the wire rather than a silent truncation on the way out.
+pub fn usize_to_wire<T: TryFrom<usize>>(
+    value: usize,
+    context: &str,
+    field: &str,
+) -> Result<T> {
+    T::try_from(value).map_err(|_| {
+        _exec_datafusion_err!(
+            "{context}: {field} value {value} is out of range for the plan wire format"
         )
     })
 }
@@ -1512,12 +1528,24 @@ mod tests {
         assert_eq!(
             err.strip_backtrace(),
             format!(
-                "Error during planning: SomeExec: fetch value {} cannot be represented as usize on this target",
+                "Execution error: SomeExec: fetch wire value {} is out of range for usize",
                 u128::MAX
             )
         );
         let err = usize_from_wire(-1_i64, "SomeExec", "skip").unwrap_err();
-        assert!(err.to_string().contains("skip value -1"));
+        assert!(err.to_string().contains("skip wire value -1"));
+    }
+
+    #[test]
+    fn test_usize_to_wire() {
+        assert_eq!(usize_to_wire::<u64>(42, "SomeExec", "fetch").unwrap(), 42);
+        assert_eq!(usize_to_wire::<i64>(0, "SomeExec", "fetch").unwrap(), 0);
+        // i8 makes the error path target-independent.
+        let err = usize_to_wire::<i8>(1 << 8, "SomeExec", "fetch").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("SomeExec: fetch value 256 is out of range")
+        );
     }
 
     #[test]

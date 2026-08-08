@@ -2486,10 +2486,14 @@ impl serde::Serialize for CoalesceBatchesExecNode {
             struct_ser.serialize_field("input", v)?;
         }
         if self.target_batch_size != 0 {
-            struct_ser.serialize_field("targetBatchSize", &self.target_batch_size)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("targetBatchSize", ToString::to_string(&self.target_batch_size).as_str())?;
         }
         if let Some(v) = self.fetch.as_ref() {
-            struct_ser.serialize_field("fetch", v)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("fetch", ToString::to_string(&v).as_str())?;
         }
         struct_ser.end()
     }
@@ -2613,7 +2617,9 @@ impl serde::Serialize for CoalescePartitionsExecNode {
             struct_ser.serialize_field("input", v)?;
         }
         if let Some(v) = self.fetch.as_ref() {
-            struct_ser.serialize_field("fetch", v)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("fetch", ToString::to_string(&v).as_str())?;
         }
         struct_ser.end()
     }
@@ -7530,10 +7536,14 @@ impl serde::Serialize for FilterExecNode {
             struct_ser.serialize_field("projection", &self.projection)?;
         }
         if self.batch_size != 0 {
-            struct_ser.serialize_field("batchSize", &self.batch_size)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("batchSize", ToString::to_string(&self.batch_size).as_str())?;
         }
         if let Some(v) = self.fetch.as_ref() {
-            struct_ser.serialize_field("fetch", v)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("fetch", ToString::to_string(&v).as_str())?;
         }
         struct_ser.end()
     }
@@ -8612,7 +8622,9 @@ impl serde::Serialize for GenerateSeriesNode {
             struct_ser.serialize_field("schema", v)?;
         }
         if self.target_batch_size != 0 {
-            struct_ser.serialize_field("targetBatchSize", &self.target_batch_size)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("targetBatchSize", ToString::to_string(&self.target_batch_size).as_str())?;
         }
         if let Some(v) = self.args.as_ref() {
             match v {
@@ -8788,7 +8800,9 @@ impl serde::Serialize for GlobalLimitExecNode {
             struct_ser.serialize_field("input", v)?;
         }
         if self.skip != 0 {
-            struct_ser.serialize_field("skip", &self.skip)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("skip", ToString::to_string(&self.skip).as_str())?;
         }
         if self.fetch != 0 {
             #[allow(clippy::needless_borrow)]
@@ -12598,7 +12612,9 @@ impl serde::Serialize for LocalLimitExecNode {
             struct_ser.serialize_field("input", v)?;
         }
         if self.fetch != 0 {
-            struct_ser.serialize_field("fetch", &self.fetch)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("fetch", ToString::to_string(&self.fetch).as_str())?;
         }
         struct_ser.end()
     }
@@ -14297,7 +14313,9 @@ impl serde::Serialize for MemoryScanExecNode {
             struct_ser.serialize_field("showSizes", &self.show_sizes)?;
         }
         if let Some(v) = self.fetch.as_ref() {
-            struct_ser.serialize_field("fetch", v)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("fetch", ToString::to_string(&v).as_str())?;
         }
         struct_ser.end()
     }
@@ -24358,7 +24376,9 @@ impl serde::Serialize for ScanLimit {
         }
         let mut struct_ser = serializer.serialize_struct("datafusion.ScanLimit", len)?;
         if self.limit != 0 {
-            struct_ser.serialize_field("limit", &self.limit)?;
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("limit", ToString::to_string(&self.limit).as_str())?;
         }
         struct_ser.end()
     }

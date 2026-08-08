@@ -1206,8 +1206,8 @@ message FilterExecNode {
   PhysicalExprNode expr = 2;
   uint32 default_filter_selectivity = 3;
   repeated uint32 projection = 9;
-  uint32 batch_size = 10;
-  optional uint32 fetch = 11;
+  uint64 batch_size = 10;
+  optional uint64 fetch = 11;
 }
 
 message FileGroup {
@@ -1216,7 +1216,7 @@ message FileGroup {
 
 message ScanLimit {
   // wrap into a message to make it optional
-  uint32 limit = 1;
+  uint64 limit = 1;
 }
 
 message PhysicalSortExprNodeCollection {
@@ -1299,7 +1299,7 @@ message MemoryScanExecNode {
   repeated uint32 projection = 3;
   repeated PhysicalSortExprNodeCollection sort_information = 4;
   bool show_sizes = 5;
-  optional uint32 fetch = 6;
+  optional uint64 fetch = 6;
 }
 
 message CooperativeExecNode {
@@ -1469,14 +1469,14 @@ message AggregateExecNode {
 message GlobalLimitExecNode {
   PhysicalPlanNode input = 1;
   // The number of rows to skip before fetch
-  uint32 skip = 2;
+  uint64 skip = 2;
   // Maximum number of rows to fetch; negative means no limit
   int64 fetch = 3;
 }
 
 message LocalLimitExecNode {
   PhysicalPlanNode input = 1;
-  uint32 fetch = 2;
+  uint64 fetch = 2;
 }
 
 message SortExecNode {
@@ -1506,13 +1506,13 @@ message NestedLoopJoinExecNode {
 
 message CoalesceBatchesExecNode {
   PhysicalPlanNode input = 1;
-  uint32 target_batch_size = 2;
-  optional uint32 fetch = 3;
+  uint64 target_batch_size = 2;
+  optional uint64 fetch = 3;
 }
 
 message CoalescePartitionsExecNode {
   PhysicalPlanNode input = 1;
-  optional uint32 fetch = 2;
+  optional uint64 fetch = 2;
 }
 
 message PhysicalHashRepartition {
@@ -1637,7 +1637,7 @@ message GenerateSeriesArgsDate {
 
 message GenerateSeriesNode {
   datafusion_common.Schema schema = 1;
-  uint32 target_batch_size = 2;
+  uint64 target_batch_size = 2;
 
   oneof args {
     GenerateSeriesArgsContainsNull contains_null = 3;

@@ -1556,6 +1556,7 @@ impl ExecutionPlan for SortExec {
         &self,
         ctx: &crate::proto::ExecutionPlanEncodeCtx<'_>,
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        use datafusion_common::utils::usize_to_wire;
         use datafusion_proto_models::protobuf;
         let input = ctx.encode_child(self.input())?;
         let expr = self
@@ -1589,8 +1590,8 @@ impl ExecutionPlan for SortExec {
                         input: Some(Box::new(input)),
                         expr,
                         fetch: match self.fetch() {
-                            Some(n) => n as i64,
-                            None => -1,
+                            Some(n) => usize_to_wire(n, "SortExec", "fetch")?,
+                            None => -1, // no limit
                         },
                         preserve_partitioning: self.preserve_partitioning(),
                         dynamic_filter,
@@ -1607,6 +1608,7 @@ impl SortExec {
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_common::utils::usize_from_wire;
         use datafusion_proto_models::protobuf;
         use protobuf::physical_expr_node::ExprType;
         let sort = crate::expect_plan_variant!(
@@ -1643,11 +1645,11 @@ impl SortExec {
         let Some(ordering) = LexOrdering::new(exprs) else {
             return datafusion_common::internal_err!("SortExec requires an ordering");
         };
-        let fetch = (sort.fetch >= 0)
-            .then(|| {
-                datafusion_common::utils::usize_from_wire(sort.fetch, "SortExec", "fetch")
-            })
-            .transpose()?;
+        let fetch = if sort.fetch >= 0 {
+            Some(usize_from_wire(sort.fetch, "SortExec", "fetch")?)
+        } else {
+            None
+        };
         let new_sort = SortExec::new(ordering, input)
             .with_fetch(fetch)
             .with_preserve_partitioning(sort.preserve_partitioning);

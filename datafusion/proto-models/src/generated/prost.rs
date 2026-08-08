@@ -1868,10 +1868,10 @@ pub struct FilterExecNode {
     pub default_filter_selectivity: u32,
     #[prost(uint32, repeated, tag = "9")]
     pub projection: ::prost::alloc::vec::Vec<u32>,
-    #[prost(uint32, tag = "10")]
-    pub batch_size: u32,
-    #[prost(uint32, optional, tag = "11")]
-    pub fetch: ::core::option::Option<u32>,
+    #[prost(uint64, tag = "10")]
+    pub batch_size: u64,
+    #[prost(uint64, optional, tag = "11")]
+    pub fetch: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FileGroup {
@@ -1881,8 +1881,8 @@ pub struct FileGroup {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScanLimit {
     /// wrap into a message to make it optional
-    #[prost(uint32, tag = "1")]
-    pub limit: u32,
+    #[prost(uint64, tag = "1")]
+    pub limit: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalSortExprNodeCollection {
@@ -1998,8 +1998,8 @@ pub struct MemoryScanExecNode {
     pub sort_information: ::prost::alloc::vec::Vec<PhysicalSortExprNodeCollection>,
     #[prost(bool, tag = "5")]
     pub show_sizes: bool,
-    #[prost(uint32, optional, tag = "6")]
-    pub fetch: ::core::option::Option<u32>,
+    #[prost(uint64, optional, tag = "6")]
+    pub fetch: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CooperativeExecNode {
@@ -2227,8 +2227,8 @@ pub struct GlobalLimitExecNode {
     #[prost(message, optional, boxed, tag = "1")]
     pub input: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
     /// The number of rows to skip before fetch
-    #[prost(uint32, tag = "2")]
-    pub skip: u32,
+    #[prost(uint64, tag = "2")]
+    pub skip: u64,
     /// Maximum number of rows to fetch; negative means no limit
     #[prost(int64, tag = "3")]
     pub fetch: i64,
@@ -2237,8 +2237,8 @@ pub struct GlobalLimitExecNode {
 pub struct LocalLimitExecNode {
     #[prost(message, optional, boxed, tag = "1")]
     pub input: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
-    #[prost(uint32, tag = "2")]
-    pub fetch: u32,
+    #[prost(uint64, tag = "2")]
+    pub fetch: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SortExecNode {
@@ -2282,17 +2282,17 @@ pub struct NestedLoopJoinExecNode {
 pub struct CoalesceBatchesExecNode {
     #[prost(message, optional, boxed, tag = "1")]
     pub input: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
-    #[prost(uint32, tag = "2")]
-    pub target_batch_size: u32,
-    #[prost(uint32, optional, tag = "3")]
-    pub fetch: ::core::option::Option<u32>,
+    #[prost(uint64, tag = "2")]
+    pub target_batch_size: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub fetch: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CoalescePartitionsExecNode {
     #[prost(message, optional, boxed, tag = "1")]
     pub input: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
-    #[prost(uint32, optional, tag = "2")]
-    pub fetch: ::core::option::Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub fetch: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalHashRepartition {
@@ -2484,8 +2484,8 @@ pub struct GenerateSeriesArgsDate {
 pub struct GenerateSeriesNode {
     #[prost(message, optional, tag = "1")]
     pub schema: ::core::option::Option<super::datafusion_common::Schema>,
-    #[prost(uint32, tag = "2")]
-    pub target_batch_size: u32,
+    #[prost(uint64, tag = "2")]
+    pub target_batch_size: u64,
     #[prost(oneof = "generate_series_node::Args", tags = "3, 4, 5, 6")]
     pub args: ::core::option::Option<generate_series_node::Args>,
 }
