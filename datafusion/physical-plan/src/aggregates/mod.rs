@@ -2461,11 +2461,14 @@ impl AggregateExec {
             Arc::clone(&input_schema),
         )?;
         let aggregate = if let Some(limit) = &hash_agg.limit {
+            let fetch = datafusion_common::utils::usize_from_wire(
+                limit.limit,
+                "AggregateExec",
+                "limit",
+            )?;
             let options = match limit.descending {
-                Some(descending) => {
-                    LimitOptions::new_with_order(limit.limit as usize, descending)
-                }
-                None => LimitOptions::new(limit.limit as usize),
+                Some(descending) => LimitOptions::new_with_order(fetch, descending),
+                None => LimitOptions::new(fetch),
             };
             aggregate.with_limit_options(Some(options))
         } else {

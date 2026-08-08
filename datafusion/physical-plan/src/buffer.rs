@@ -338,7 +338,12 @@ impl BufferExec {
         );
         let input =
             ctx.decode_required_child(buffer.input.as_deref(), "BufferExec", "input")?;
-        Ok(Arc::new(BufferExec::new(input, buffer.capacity as usize)))
+        let capacity = datafusion_common::utils::usize_from_wire(
+            buffer.capacity,
+            "BufferExec",
+            "capacity",
+        )?;
+        Ok(Arc::new(BufferExec::new(input, capacity)))
     }
 }
 

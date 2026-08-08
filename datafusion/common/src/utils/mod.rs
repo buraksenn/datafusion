@@ -25,7 +25,9 @@ pub mod proxy;
 pub mod string_utils;
 
 use crate::assert_or_internal_err;
-use crate::error::{_exec_datafusion_err, _exec_err, _internal_datafusion_err};
+use crate::error::{
+    _exec_datafusion_err, _exec_err, _internal_datafusion_err, _plan_datafusion_err,
+};
 use crate::{Result, ScalarValue};
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, OffsetSizeTrait,
@@ -1142,6 +1144,24 @@ pub fn combine_limit(
     (combined_skip, combined_fetch)
 }
 
+/// Converts a decoded wire integer (e.g. a protobuf `uint64`/`int64` field) to
+/// `usize`, returning a plan error instead of silently truncating when the
+/// value cannot be represented on the current target (e.g. 32-bit platforms,
+/// where an `as usize` cast of `1 << 32` yields `0`).
+///
+/// `context` and `field` name the plan node (or option struct) and the field
+/// being decoded, e.g. `usize_from_wire(node.fetch, "GlobalLimitExec", "fetch")`.
+pub fn usize_from_wire<T>(value: T, context: &str, field: &str) -> Result<usize>
+where
+    T: TryInto<usize> + std::fmt::Display + Copy,
+{
+    value.try_into().map_err(|_| {
+        _plan_datafusion_err!(
+            "{context}: {field} value {value} cannot be represented as usize on this target"
+        )
+    })
+}
+
 /// Returns the estimated number of threads available for parallel execution.
 ///
 /// This is a wrapper around `std::thread::available_parallelism`, providing a default value
@@ -1481,6 +1501,24 @@ mod tests {
     };
     #[cfg(feature = "sql")]
     use sqlparser::ast::Ident;
+
+    #[test]
+    fn test_usize_from_wire() {
+        assert_eq!(usize_from_wire(42_u64, "SomeExec", "fetch").unwrap(), 42);
+        assert_eq!(usize_from_wire(0_i64, "SomeExec", "fetch").unwrap(), 0);
+        // u128::MAX exceeds usize::MAX on every target, so the error path is
+        // exercised even on 64-bit hosts.
+        let err = usize_from_wire(u128::MAX, "SomeExec", "fetch").unwrap_err();
+        assert_eq!(
+            err.strip_backtrace(),
+            format!(
+                "Error during planning: SomeExec: fetch value {} cannot be represented as usize on this target",
+                u128::MAX
+            )
+        );
+        let err = usize_from_wire(-1_i64, "SomeExec", "skip").unwrap_err();
+        assert!(err.to_string().contains("skip value -1"));
+    }
 
     #[test]
     fn test_bisect_linear_left_and_right() -> Result<()> {

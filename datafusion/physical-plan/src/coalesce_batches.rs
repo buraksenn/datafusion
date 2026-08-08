@@ -340,9 +340,18 @@ impl CoalesceBatchesExec {
             "CoalesceBatchesExec",
             "input",
         )?;
+        use datafusion_common::utils::usize_from_wire;
+        let target_batch_size = usize_from_wire(
+            coalesce_batches.target_batch_size,
+            "CoalesceBatchesExec",
+            "target_batch_size",
+        )?;
+        let fetch = coalesce_batches
+            .fetch
+            .map(|f| usize_from_wire(f, "CoalesceBatchesExec", "fetch"))
+            .transpose()?;
         Ok(Arc::new(
-            CoalesceBatchesExec::new(input, coalesce_batches.target_batch_size as usize)
-                .with_fetch(coalesce_batches.fetch.map(|f| f as usize)),
+            CoalesceBatchesExec::new(input, target_batch_size).with_fetch(fetch),
         ))
     }
 }

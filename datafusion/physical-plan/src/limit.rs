@@ -286,16 +286,14 @@ impl GlobalLimitExec {
             "GlobalLimitExec",
             "input",
         )?;
+        use datafusion_common::utils::usize_from_wire;
         let fetch = if limit.fetch >= 0 {
-            Some(limit.fetch as usize)
+            Some(usize_from_wire(limit.fetch, "GlobalLimitExec", "fetch")?)
         } else {
             None
         };
-        Ok(Arc::new(GlobalLimitExec::new(
-            input,
-            limit.skip as usize,
-            fetch,
-        )))
+        let skip = usize_from_wire(limit.skip, "GlobalLimitExec", "skip")?;
+        Ok(Arc::new(GlobalLimitExec::new(input, skip, fetch)))
     }
 }
 
@@ -507,7 +505,12 @@ impl LocalLimitExec {
         );
         let input =
             ctx.decode_required_child(limit.input.as_deref(), "LocalLimitExec", "input")?;
-        Ok(Arc::new(LocalLimitExec::new(input, limit.fetch as usize)))
+        let fetch = datafusion_common::utils::usize_from_wire(
+            limit.fetch,
+            "LocalLimitExec",
+            "fetch",
+        )?;
+        Ok(Arc::new(LocalLimitExec::new(input, fetch)))
     }
 }
 

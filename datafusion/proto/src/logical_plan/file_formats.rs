@@ -19,13 +19,13 @@ use std::sync::Arc;
 
 use super::LogicalExtensionCodec;
 use crate::convert::FromProto;
-#[cfg(feature = "parquet")]
 use crate::convert::TryFromProto;
 use crate::protobuf::{
     CsvOptions as CsvOptionsProto, CsvQuoteStyle as CsvQuoteStyleProto,
     JsonOptions as JsonOptionsProto,
 };
 use datafusion_common::config::{CsvOptions, JsonOptions};
+use datafusion_common::utils::usize_from_wire;
 use datafusion_common::{
     TableReference, exec_datafusion_err, exec_err, not_impl_err,
     parsers::{CompressionTypeVariant, CsvQuoteStyle},
@@ -82,9 +82,13 @@ impl FromProto<&CsvFormatFactory> for CsvOptionsProto {
     }
 }
 
-impl FromProto<&CsvOptionsProto> for CsvOptions {
-    fn from_proto(proto: &CsvOptionsProto) -> Self {
-        CsvOptions {
+impl TryFromProto<&CsvOptionsProto> for CsvOptions {
+    type Error = datafusion_common::DataFusionError;
+
+    fn try_from_proto(
+        proto: &CsvOptionsProto,
+    ) -> datafusion_common::Result<Self, Self::Error> {
+        Ok(CsvOptions {
             has_header: if !proto.has_header.is_empty() {
                 Some(proto.has_header[0] != 0)
             } else {
@@ -114,7 +118,10 @@ impl FromProto<&CsvOptionsProto> for CsvOptions {
                 3 => CompressionTypeVariant::ZSTD,
                 _ => CompressionTypeVariant::UNCOMPRESSED,
             },
-            schema_infer_max_rec: proto.schema_infer_max_rec.map(|v| v as usize),
+            schema_infer_max_rec: proto
+                .schema_infer_max_rec
+                .map(|v| usize_from_wire(v, "CsvOptions", "schema_infer_max_rec"))
+                .transpose()?,
             date_format: if proto.date_format.is_empty() {
                 None
             } else {
@@ -183,7 +190,7 @@ impl FromProto<&CsvOptionsProto> for CsvOptions {
             } else {
                 Some(proto.ignore_trailing_whitespace[0] != 0)
             },
-        }
+        })
     }
 }
 
@@ -233,7 +240,7 @@ impl LogicalExtensionCodec for CsvLogicalExtensionCodec {
         let proto = CsvOptionsProto::decode(buf).map_err(|e| {
             exec_datafusion_err!("Failed to decode CsvOptionsProto: {e:?}")
         })?;
-        let options = CsvOptions::from_proto(&proto);
+        let options = CsvOptions::try_from_proto(&proto)?;
         Ok(Arc::new(CsvFormatFactory {
             options: Some(options),
         }))
@@ -277,9 +284,13 @@ impl FromProto<&JsonFormatFactory> for JsonOptionsProto {
     }
 }
 
-impl FromProto<&JsonOptionsProto> for JsonOptions {
-    fn from_proto(proto: &JsonOptionsProto) -> Self {
-        JsonOptions {
+impl TryFromProto<&JsonOptionsProto> for JsonOptions {
+    type Error = datafusion_common::DataFusionError;
+
+    fn try_from_proto(
+        proto: &JsonOptionsProto,
+    ) -> datafusion_common::Result<Self, Self::Error> {
+        Ok(JsonOptions {
             compression: match proto.compression {
                 0 => CompressionTypeVariant::GZIP,
                 1 => CompressionTypeVariant::BZIP2,
@@ -287,10 +298,13 @@ impl FromProto<&JsonOptionsProto> for JsonOptions {
                 3 => CompressionTypeVariant::ZSTD,
                 _ => CompressionTypeVariant::UNCOMPRESSED,
             },
-            schema_infer_max_rec: proto.schema_infer_max_rec.map(|v| v as usize),
+            schema_infer_max_rec: proto
+                .schema_infer_max_rec
+                .map(|v| usize_from_wire(v, "JsonOptions", "schema_infer_max_rec"))
+                .transpose()?,
             compression_level: proto.compression_level,
             newline_delimited: proto.newline_delimited.unwrap_or(true),
-        }
+        })
     }
 }
 
@@ -343,7 +357,7 @@ impl LogicalExtensionCodec for JsonLogicalExtensionCodec {
         let proto = JsonOptionsProto::decode(buf).map_err(|e| {
             exec_datafusion_err!("Failed to decode JsonOptionsProto: {e:?}")
         })?;
-        let options = JsonOptions::from_proto(&proto);
+        let options = JsonOptions::try_from_proto(&proto)?;
         Ok(Arc::new(JsonFormatFactory {
             options: Some(options),
         }))
@@ -506,14 +520,26 @@ mod parquet {
         }
     }
 
-    impl FromProto<ParquetCdcOptionsProto> for ParquetCdcOptions {
-        fn from_proto(value: ParquetCdcOptionsProto) -> Self {
-            ParquetCdcOptions {
+    impl TryFromProto<ParquetCdcOptionsProto> for ParquetCdcOptions {
+        type Error = datafusion_common::DataFusionError;
+
+        fn try_from_proto(
+            value: ParquetCdcOptionsProto,
+        ) -> datafusion_common::Result<Self, Self::Error> {
+            Ok(ParquetCdcOptions {
                 enabled: value.enabled,
-                min_chunk_size: value.min_chunk_size as usize,
-                max_chunk_size: value.max_chunk_size as usize,
+                min_chunk_size: usize_from_wire(
+                    value.min_chunk_size,
+                    "ParquetCdcOptions",
+                    "min_chunk_size",
+                )?,
+                max_chunk_size: usize_from_wire(
+                    value.max_chunk_size,
+                    "ParquetCdcOptions",
+                    "max_chunk_size",
+                )?,
                 norm_level: value.norm_level,
-            }
+            })
         }
     }
 
@@ -540,14 +566,27 @@ mod parquet {
                     .as_ref()
                     .map(|opt| match opt {
                         parquet_options::MetadataSizeHintOpt::MetadataSizeHint(size) => {
-                            *size as usize
+                            usize_from_wire(
+                                *size,
+                                "ParquetOptions",
+                                "metadata_size_hint",
+                            )
                         }
-                    }),
+                    })
+                    .transpose()?,
                 pushdown_filters: proto.pushdown_filters,
                 reorder_filters: proto.reorder_filters,
                 force_filter_selections: proto.force_filter_selections,
-                data_pagesize_limit: proto.data_pagesize_limit as usize,
-                write_batch_size: proto.write_batch_size as usize,
+                data_pagesize_limit: usize_from_wire(
+                    proto.data_pagesize_limit,
+                    "ParquetOptions",
+                    "data_pagesize_limit",
+                )?,
+                write_batch_size: usize_from_wire(
+                    proto.write_batch_size,
+                    "ParquetOptions",
+                    "write_batch_size",
+                )?,
                 writer_version,
                 compression: proto.compression_opt.as_ref().map(|opt| match opt {
                     parquet_options::CompressionOpt::Compression(compression) => {
@@ -561,7 +600,11 @@ mod parquet {
                         ) => *enabled,
                     }
                 }),
-                dictionary_page_size_limit: proto.dictionary_page_size_limit as usize,
+                dictionary_page_size_limit: usize_from_wire(
+                    proto.dictionary_page_size_limit,
+                    "ParquetOptions",
+                    "dictionary_page_size_limit",
+                )?,
                 statistics_enabled: proto.statistics_enabled_opt.as_ref().map(
                     |opt| match opt {
                         parquet_options::StatisticsEnabledOpt::StatisticsEnabled(
@@ -569,21 +612,39 @@ mod parquet {
                         ) => statistics.clone(),
                     },
                 ),
-                max_row_group_size: proto.max_row_group_size as usize,
+                max_row_group_size: usize_from_wire(
+                    proto.max_row_group_size,
+                    "ParquetOptions",
+                    "max_row_group_size",
+                )?,
                 created_by: proto.created_by.clone(),
                 column_index_truncate_length: proto
                     .column_index_truncate_length_opt
                     .as_ref()
                     .map(|opt| match opt {
-                        parquet_options::ColumnIndexTruncateLengthOpt::ColumnIndexTruncateLength(length) => *length as usize,
-                    }),
+                        parquet_options::ColumnIndexTruncateLengthOpt::ColumnIndexTruncateLength(length) => usize_from_wire(
+                            *length,
+                            "ParquetOptions",
+                            "column_index_truncate_length",
+                        ),
+                    })
+                    .transpose()?,
                 statistics_truncate_length: proto
                     .statistics_truncate_length_opt
                     .as_ref()
                     .map(|opt| match opt {
-                        parquet_options::StatisticsTruncateLengthOpt::StatisticsTruncateLength(length) => *length as usize,
-                    }),
-                data_page_row_count_limit: proto.data_page_row_count_limit as usize,
+                        parquet_options::StatisticsTruncateLengthOpt::StatisticsTruncateLength(length) => usize_from_wire(
+                            *length,
+                            "ParquetOptions",
+                            "statistics_truncate_length",
+                        ),
+                    })
+                    .transpose()?,
+                data_page_row_count_limit: usize_from_wire(
+                    proto.data_page_row_count_limit,
+                    "ParquetOptions",
+                    "data_page_row_count_limit",
+                )?,
                 encoding: proto.encoding_opt.as_ref().map(|opt| match opt {
                     parquet_options::EncodingOpt::Encoding(encoding) => {
                         encoding.clone()
@@ -604,12 +665,16 @@ mod parquet {
                         parquet_options::BloomFilterNdvOpt::BloomFilterNdv(ndv) => *ndv,
                     }),
                 allow_single_file_parallelism: proto.allow_single_file_parallelism,
-                maximum_parallel_row_group_writers: proto
-                    .maximum_parallel_row_group_writers
-                    as usize,
-                maximum_buffered_record_batches_per_stream: proto
-                    .maximum_buffered_record_batches_per_stream
-                    as usize,
+                maximum_parallel_row_group_writers: usize_from_wire(
+                    proto.maximum_parallel_row_group_writers,
+                    "ParquetOptions",
+                    "maximum_parallel_row_group_writers",
+                )?,
+                maximum_buffered_record_batches_per_stream: usize_from_wire(
+                    proto.maximum_buffered_record_batches_per_stream,
+                    "ParquetOptions",
+                    "maximum_buffered_record_batches_per_stream",
+                )?,
                 schema_force_view_types: proto.schema_force_view_types,
                 binary_as_string: proto.binary_as_string,
                 skip_arrow_metadata: proto.skip_arrow_metadata,
@@ -632,19 +697,28 @@ mod parquet {
                     .map(|opt| match opt {
                         parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(
                             size,
-                        ) => *size as usize,
-                    }),
-                max_row_group_bytes: proto
-                    .max_row_group_bytes_opt
-                    .as_ref()
-                    .and_then(|opt| match opt {
-                        parquet_options::MaxRowGroupBytesOpt::MaxRowGroupBytes(size) => {
-                            MaxRowGroupBytes::try_new(*size as usize).ok()
-                        }
-                    }),
+                        ) => usize_from_wire(
+                            *size,
+                            "ParquetOptions",
+                            "max_predicate_cache_size",
+                        ),
+                    })
+                    .transpose()?,
+                max_row_group_bytes: match &proto.max_row_group_bytes_opt {
+                    Some(parquet_options::MaxRowGroupBytesOpt::MaxRowGroupBytes(
+                        size,
+                    )) => MaxRowGroupBytes::try_new(usize_from_wire(
+                        *size,
+                        "ParquetOptions",
+                        "max_row_group_bytes",
+                    )?)
+                    .ok(),
+                    None => None,
+                },
                 content_defined_chunking: proto
                     .content_defined_chunking
-                    .map(ParquetCdcOptions::from_proto)
+                    .map(ParquetCdcOptions::try_from_proto)
+                    .transpose()?
                     .unwrap_or_default(),
             })
         }

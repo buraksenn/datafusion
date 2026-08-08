@@ -1643,7 +1643,11 @@ impl SortExec {
         let Some(ordering) = LexOrdering::new(exprs) else {
             return datafusion_common::internal_err!("SortExec requires an ordering");
         };
-        let fetch = (sort.fetch >= 0).then_some(sort.fetch as usize);
+        let fetch = (sort.fetch >= 0)
+            .then(|| {
+                datafusion_common::utils::usize_from_wire(sort.fetch, "SortExec", "fetch")
+            })
+            .transpose()?;
         let new_sort = SortExec::new(ordering, input)
             .with_fetch(fetch)
             .with_preserve_partitioning(sort.preserve_partitioning);

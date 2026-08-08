@@ -41,6 +41,7 @@ use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::format::{
     ExplainAnalyzeCategories, ExplainFormat, MetricCategory, MetricType,
 };
+use datafusion_common::utils::usize_from_wire;
 use datafusion_common::{
     NullEquality, Result, TableReference, assert_or_internal_err, context,
     internal_datafusion_err, internal_err, not_impl_err, plan_err,
@@ -486,7 +487,7 @@ impl AsLogicalPlan for LogicalPlanNode {
         })?;
         match plan {
             LogicalPlanType::Values(values) => {
-                let n_cols = values.n_cols as usize;
+                let n_cols = usize_from_wire(values.n_cols, "Values", "n_cols")?;
                 let values: Vec<Vec<Expr>> = if values.values_list.is_empty() {
                     Ok(Vec::new())
                 } else if values.values_list.len() % n_cols != 0 {
@@ -741,10 +742,18 @@ impl AsLogicalPlan for LogicalPlanNode {
                         partition_count,
                     }) => Partitioning::Hash(
                         from_proto::parse_exprs(pb_hash_expr, ctx, extension_codec)?,
-                        *partition_count as usize,
+                        usize_from_wire(
+                            *partition_count,
+                            "Repartition",
+                            "partition_count",
+                        )?,
                     ),
                     PartitionMethod::RoundRobin(partition_count) => {
-                        Partitioning::RoundRobinBatch(*partition_count as usize)
+                        Partitioning::RoundRobinBatch(usize_from_wire(
+                            *partition_count,
+                            "Repartition",
+                            "partition_count",
+                        )?)
                     }
                     PartitionMethod::Range(protobuf::RangeRepartition {
                         sort_expr: pb_sort_expr,
@@ -961,12 +970,12 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::Limit(limit) => {
                 let input: LogicalPlan =
                     into_logical_plan!(limit.input, ctx, extension_codec)?;
-                let skip = limit.skip.max(0) as usize;
+                let skip = usize_from_wire(limit.skip.max(0), "Limit", "skip")?;
 
                 let fetch = if limit.fetch < 0 {
                     None
                 } else {
-                    Some(limit.fetch as usize)
+                    Some(usize_from_wire(limit.fetch, "Limit", "fetch")?)
                 };
 
                 LogicalPlanBuilder::from(input).limit(skip, fetch)?.build()

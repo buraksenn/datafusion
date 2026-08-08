@@ -391,9 +391,18 @@ impl CoalescePartitionsExec {
             "CoalescePartitionsExec",
             "input",
         )?;
+        let fetch = merge
+            .fetch
+            .map(|f| {
+                datafusion_common::utils::usize_from_wire(
+                    f,
+                    "CoalescePartitionsExec",
+                    "fetch",
+                )
+            })
+            .transpose()?;
         Ok(Arc::new(
-            CoalescePartitionsExec::new(input)
-                .with_fetch(merge.fetch.map(|f| f as usize)),
+            CoalescePartitionsExec::new(input).with_fetch(fetch),
         ))
     }
 }

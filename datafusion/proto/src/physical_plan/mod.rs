@@ -1201,8 +1201,18 @@ pub trait PhysicalPlanNodeExt: Sized {
             sort_information.extend(LexOrdering::new(sort_exprs));
         }
 
+        let fetch = scan
+            .fetch
+            .map(|f| {
+                datafusion_common::utils::usize_from_wire(
+                    f,
+                    "MemoryScanExecNode",
+                    "fetch",
+                )
+            })
+            .transpose()?;
         let source = MemorySourceConfig::try_new(&partitions, schema, projection)?
-            .with_limit(scan.fetch.map(|f| f as usize))
+            .with_limit(fetch)
             .with_show_sizes(scan.show_sizes);
 
         let source = source.try_with_sort_information(sort_information)?;
@@ -1870,7 +1880,12 @@ pub trait PhysicalPlanNodeExt: Sized {
         };
 
         let table = GenerateSeriesTable::new(Arc::clone(&schema), args);
-        let generator = table.as_generator(generate_series.target_batch_size as usize)?;
+        let target_batch_size = datafusion_common::utils::usize_from_wire(
+            generate_series.target_batch_size,
+            "GenerateSeriesNode",
+            "target_batch_size",
+        )?;
+        let generator = table.as_generator(target_batch_size)?;
 
         Ok(Arc::new(LazyMemoryExec::try_new(schema, vec![generator])?))
     }

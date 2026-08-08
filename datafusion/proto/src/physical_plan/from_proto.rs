@@ -23,6 +23,7 @@ use arrow::array::RecordBatch;
 use arrow::compute::SortOptions;
 use arrow::datatypes::{Field, Schema};
 use arrow::ipc::reader::StreamReader;
+use datafusion_common::utils::usize_from_wire;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err, not_impl_err};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
@@ -532,14 +533,23 @@ pub fn parse_protobuf_file_scan_config(
         file_source
     };
 
+    let limit = proto
+        .limit
+        .as_ref()
+        .map(|sl| usize_from_wire(sl.limit, "FileScanConfig", "limit"))
+        .transpose()?;
+    let batch_size = proto
+        .batch_size
+        .map(|s| usize_from_wire(s, "FileScanConfig", "batch_size"))
+        .transpose()?;
     let config = FileScanConfigBuilder::new(object_store_url, file_source)
         .with_file_groups(file_groups)
         .with_constraints(constraints)
         .with_statistics(statistics)
-        .with_limit(proto.limit.as_ref().map(|sl| sl.limit as usize))
+        .with_limit(limit)
         .with_output_ordering(output_ordering)
         .with_output_partitioning(output_partitioning)
-        .with_batch_size(proto.batch_size.map(|s| s as usize))
+        .with_batch_size(batch_size)
         .build();
     Ok(config)
 }

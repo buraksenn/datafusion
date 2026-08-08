@@ -524,7 +524,15 @@ impl SortPreservingMergeExec {
         let Some(ordering) = LexOrdering::new(exprs) else {
             return internal_err!("SortPreservingMergeExec requires an ordering");
         };
-        let fetch = (spm.fetch >= 0).then_some(spm.fetch as usize);
+        let fetch = (spm.fetch >= 0)
+            .then(|| {
+                datafusion_common::utils::usize_from_wire(
+                    spm.fetch,
+                    "SortPreservingMergeExec",
+                    "fetch",
+                )
+            })
+            .transpose()?;
         Ok(Arc::new(
             SortPreservingMergeExec::new(ordering, input).with_fetch(fetch),
         ))

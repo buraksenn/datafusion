@@ -894,10 +894,20 @@ impl FilterExec {
         } else {
             Some(projection_vec)
         };
+        use datafusion_common::utils::usize_from_wire;
         let filter = FilterExecBuilder::new(predicate, input)
             .apply_projection(projection)?
-            .with_batch_size(filter.batch_size as usize)
-            .with_fetch(filter.fetch.map(|f| f as usize))
+            .with_batch_size(usize_from_wire(
+                filter.batch_size,
+                "FilterExec",
+                "batch_size",
+            )?)
+            .with_fetch(
+                filter
+                    .fetch
+                    .map(|f| usize_from_wire(f, "FilterExec", "fetch"))
+                    .transpose()?,
+            )
             .build()?;
         match filter_selectivity {
             Ok(filter_selectivity) => Ok(Arc::new(
