@@ -510,6 +510,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let n_cols = values.n_cols as usize;
                 let values: Vec<Vec<Expr>> = if values.values_list.is_empty() {
                     Ok(Vec::new())
+                } else if n_cols == 0 {
+                    internal_err!("ValuesNode n_cols must be greater than 0")
                 } else if values.values_list.len() % n_cols != 0 {
                     internal_err!(
                         "Invalid values list length, expect {} to be divisible by {}",
