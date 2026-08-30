@@ -37,7 +37,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Field, Fields, Schema};
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::utils::{usize_from_wire, usize_to_wire};
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
@@ -90,6 +90,12 @@ impl FileScanConfig {
             output_partitioning,
         } = self;
 
+        if *batch_size == Some(0) {
+            return datafusion_common::plan_err!(
+                "FileScanConfig: batch_size must be greater than 0"
+            );
+        }
+
         // Non-default factories are executable behavior with no protobuf
         // representation; silently replacing one can change scan results.
         if expr_adapter_factory
@@ -123,11 +129,17 @@ impl FileScanConfig {
         let file_schema = table_schema.file_schema();
         let table_partition_cols = table_schema.table_partition_cols();
 
-        // Partition fields must be added to the schema so they can persist in
-        // protobuf and then be removed again in `parse_table_schema_from_proto`.
+        // Partition fields remain in the base schema for legacy compatibility;
+        // virtual fields are separate so decoding can reconstruct all three
+        // parts of `TableSchema` without guessing.
         let mut fields = file_schema.fields().iter().cloned().collect::<Vec<_>>();
         fields.extend(table_partition_cols.iter().cloned());
         let schema = Schema::new(fields).with_metadata(file_schema.metadata.clone());
+        let virtual_columns = table_schema
+            .virtual_columns()
+            .iter()
+            .map(|field| Ok::<_, DataFusionError>(field.as_ref().try_into()?))
+            .collect::<Result<Vec<_>>>()?;
 
         let projection_exprs = file_source
             .projection()
@@ -176,6 +188,7 @@ impl FileScanConfig {
             output_partitioning: proto_output_partitioning,
             file_compression_type: proto_file_compression_type,
             preserve_order: Some(*preserve_order),
+            virtual_columns,
         })
     }
 
@@ -200,9 +213,10 @@ impl FileScanConfig {
             projection: _,
             limit,
             statistics,
-            // Used to construct `file_source` via `parse_table_schema_from_proto`
+            // These construct `file_source` via `parse_table_schema_from_proto`
             // before this hook is called.
             table_partition_cols: _,
+            virtual_columns: _,
             object_store_url,
             output_ordering,
             constraints,
@@ -213,7 +227,10 @@ impl FileScanConfig {
             preserve_order,
         } = conf;
 
-        let expression_schema = parse_file_scan_schema(proto_schema)?;
+        // Preserve the required-field check, then decode expressions against
+        // the reconstructed full schema, including virtual columns.
+        parse_file_scan_schema(proto_schema)?;
+        let expression_schema = Arc::clone(file_source.table_schema().table_schema());
 
         let decoded_constraints = constraints
             .as_ref()
@@ -348,33 +365,48 @@ impl FileScanConfig {
         conf: &protobuf::FileScanExecConf,
     ) -> Result<TableSchema> {
         let schema = parse_file_scan_schema(&conf.schema)?;
+        let partition_start = schema
+            .fields()
+            .len()
+            .checked_sub(conf.table_partition_cols.len())
+            .ok_or_else(|| {
+                internal_datafusion_err!(
+                    "FileScanExecConf has more partition columns than schema fields"
+                )
+            })?;
+        let (file_fields, partition_fields) = schema.fields().split_at(partition_start);
 
-        // Reacquire the partition column types from the schema before removing
-        // them below.
-        let table_partition_cols = conf
+        if let Some((index, (expected, actual))) = conf
             .table_partition_cols
             .iter()
-            .map(|col| Ok(Arc::new(schema.field_with_name(col)?.clone())))
-            .collect::<Result<Vec<_>>>()?;
+            .zip(partition_fields)
+            .enumerate()
+            .find(|(_, (expected, actual))| expected.as_str() != actual.name())
+        {
+            return datafusion_common::plan_err!(
+                "FileScanExecConf partition column {index} is named '{expected}', but schema field is named '{}'",
+                actual.name()
+            );
+        }
 
-        // Remove partition columns from the schema after recreating
-        // table_partition_cols because the partition columns are not in the
-        // file. They are present to allow the partition column types to be
-        // reconstructed after serde.
+        // The encoder appends partition fields after file fields, so split by
+        // position rather than name: file and partition columns may share a name.
         let file_schema = Arc::new(
-            Schema::new(
-                schema
-                    .fields()
-                    .iter()
-                    .filter(|field| !table_partition_cols.contains(field))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-            .with_metadata(schema.metadata.clone()),
+            Schema::new(file_fields.to_vec()).with_metadata(schema.metadata.clone()),
         );
+        let table_partition_cols = Fields::from(partition_fields.to_vec());
+        let virtual_columns = conf
+            .virtual_columns
+            .iter()
+            .map(|field| {
+                let field: Field = field.try_into()?;
+                Ok(Arc::new(field))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(TableSchema::builder(file_schema)
             .with_table_partition_cols(table_partition_cols)
+            .with_virtual_columns(virtual_columns)
             .build())
     }
 }

@@ -1192,6 +1192,9 @@ message PhysicalTryCastNode {
 message PhysicalCastNode {
   PhysicalExprNode expr = 1;
   datafusion_common.ArrowType arrow_type = 2;
+  // Full output field for casts with explicit name, nullability, or metadata.
+  // Absent payloads retain the legacy type-only cast behavior.
+  datafusion_common.Field target_field = 3;
 }
 
 message PhysicalNegativeNode {
@@ -1272,6 +1275,8 @@ message FileScanExecConf {
   // Whether file processing order must be preserved. Absent payloads retain the
   // legacy behavior of deriving this from output_ordering.
   optional bool preserve_order = 17;
+  // Columns produced by the file reader rather than stored in the file or path.
+  repeated datafusion_common.Field virtual_columns = 18;
 }
 
 message ParquetScanExecNode {

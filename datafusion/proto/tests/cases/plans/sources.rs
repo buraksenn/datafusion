@@ -824,6 +824,17 @@ async fn roundtrip_parquet_select_star() -> Result<()> {
 }
 
 #[tokio::test]
+async fn roundtrip_parquet_file_row_index() -> Result<()> {
+    let ctx = all_types_context().await?;
+    let plan = ctx
+        .sql("select file_row_index() from alltypes_plain")
+        .await?
+        .create_physical_plan()
+        .await?;
+    roundtrip_test(plan)
+}
+
+#[tokio::test]
 async fn roundtrip_parquet_select_projection() -> Result<()> {
     let ctx = all_types_context().await?;
     let sql = "select string_col, timestamp_col from alltypes_plain";

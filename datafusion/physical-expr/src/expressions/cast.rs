@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::physical_expr::PhysicalExpr;
 
 use arrow::compute::{CastOptions, can_cast_types};
-use arrow::datatypes::{DataType, DataType::*, FieldRef, Schema};
+use arrow::datatypes::{DataType, DataType::*, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
@@ -319,6 +319,7 @@ impl PhysicalExpr for CastExpr {
                 protobuf::PhysicalCastNode {
                     expr: Some(Box::new(ctx.encode_child(self.expr())?)),
                     arrow_type: Some(self.cast_type().try_into()?),
+                    target_field: Some(self.target_field().as_ref().try_into()?),
                 },
             ))),
         }))
@@ -349,16 +350,35 @@ impl CastExpr {
             _ => return internal_err!("PhysicalExprNode is not a CastExpr"),
         };
 
-        let expr = ctx.decode_required_expression(
-            cast_expr.expr.as_deref(),
-            "CastExpr",
-            "expr",
-        )?;
-        let arrow_type = cast_expr.arrow_type.as_ref().ok_or_else(|| {
+        let protobuf::PhysicalCastNode {
+            expr,
+            arrow_type,
+            target_field,
+        } = cast_expr;
+        let expr = ctx.decode_required_expression(expr.as_deref(), "CastExpr", "expr")?;
+        let arrow_type = arrow_type.as_ref().ok_or_else(|| {
             internal_datafusion_err!("CastExpr is missing required field 'arrow_type'")
         })?;
+        let cast_type: DataType = arrow_type.try_into()?;
+        let decoded_target_field = target_field
+            .as_ref()
+            .map(|field| {
+                let field: Field = field.try_into()?;
+                if field.data_type() != &cast_type {
+                    return internal_err!(
+                        "CastExpr target_field type does not match arrow_type"
+                    );
+                }
+                Ok(Arc::new(field))
+            })
+            .transpose()?;
 
-        Ok(Arc::new(CastExpr::new(expr, arrow_type.try_into()?, None)))
+        Ok(Arc::new(match decoded_target_field {
+            Some(target_field) => {
+                CastExpr::new_with_target_field(expr, target_field, None)
+            }
+            None => CastExpr::new(expr, cast_type, None),
+        }))
     }
 }
 
@@ -1258,6 +1278,7 @@ mod proto_tests {
     use datafusion_proto_models::protobuf::{
         PhysicalCastNode, PhysicalExprNode, physical_expr_node,
     };
+    use std::collections::HashMap;
 
     /// A `CastExpr` over an `Int32` column, casting to `Int64`.
     fn proto_cast_fixture() -> CastExpr {
@@ -1277,7 +1298,11 @@ mod proto_tests {
         PhysicalExprNode {
             expr_id: None,
             expr_type: Some(physical_expr_node::ExprType::Cast(Box::new(
-                PhysicalCastNode { expr, arrow_type },
+                PhysicalCastNode {
+                    expr,
+                    arrow_type,
+                    target_field: None,
+                },
             ))),
         }
     }
@@ -1306,6 +1331,13 @@ mod proto_tests {
             .expect("cast type should be encoded");
         let data_type: DataType = arrow_type.try_into().unwrap();
         assert_eq!(data_type, Int64);
+        let target_field: Field = cast_node
+            .target_field
+            .as_ref()
+            .expect("cast target field should be encoded")
+            .try_into()
+            .unwrap();
+        assert_eq!(&target_field, cast.target_field().as_ref());
     }
 
     #[test]
@@ -1338,6 +1370,36 @@ mod proto_tests {
 
         assert_eq!(cast.cast_type(), &Int64);
         assert!(cast.expr().downcast_ref::<Column>().is_some());
+    }
+
+    #[test]
+    fn try_from_proto_preserves_target_field() {
+        let target_field = Field::new("cast_result", Int64, false)
+            .with_metadata(HashMap::from([("key".to_string(), "value".to_string())]));
+        let mut node = proto_cast_node(
+            Some(Box::new(column_node("a"))),
+            Some(proto_int64_arrow_type()),
+        );
+        let Some(physical_expr_node::ExprType::Cast(cast)) = node.expr_type.as_mut()
+        else {
+            unreachable!()
+        };
+        cast.target_field = Some((&target_field).try_into().unwrap());
+
+        let schema = Schema::empty();
+        let decoder = StubDecoder::ok();
+        let ctx = PhysicalExprDecodeCtx::new(&schema, &decoder);
+        let decoded = CastExpr::try_from_proto(&node, &ctx).unwrap();
+        let cast = decoded.downcast_ref::<CastExpr>().unwrap();
+        assert_eq!(cast.target_field().as_ref(), &target_field);
+
+        let Some(physical_expr_node::ExprType::Cast(cast)) = node.expr_type.as_mut()
+        else {
+            unreachable!()
+        };
+        cast.target_field = Some((&Field::new("wrong", Int32, true)).try_into().unwrap());
+        let err = CastExpr::try_from_proto(&node, &ctx).unwrap_err();
+        assert!(err.to_string().contains("target_field type"));
     }
 
     #[test]

@@ -1853,6 +1853,10 @@ pub struct PhysicalCastNode {
     pub expr: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
     #[prost(message, optional, tag = "2")]
     pub arrow_type: ::core::option::Option<super::datafusion_common::ArrowType>,
+    /// Full output field for casts with explicit name, nullability, or metadata.
+    /// Absent payloads retain the legacy type-only cast behavior.
+    #[prost(message, optional, tag = "3")]
+    pub target_field: ::core::option::Option<super::datafusion_common::Field>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalNegativeNode {
@@ -1963,6 +1967,9 @@ pub struct FileScanExecConf {
     /// legacy behavior of deriving this from output_ordering.
     #[prost(bool, optional, tag = "17")]
     pub preserve_order: ::core::option::Option<bool>,
+    /// Columns produced by the file reader rather than stored in the file or path.
+    #[prost(message, repeated, tag = "18")]
+    pub virtual_columns: ::prost::alloc::vec::Vec<super::datafusion_common::Field>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParquetScanExecNode {

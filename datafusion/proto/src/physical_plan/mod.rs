@@ -450,6 +450,61 @@ mod file_scan_config_serde {
     }
 
     #[test]
+    fn new_file_scan_config_encode_rejects_zero_batch_size() {
+        let serde = FileScanSerdeHarness::new();
+        let config = FileScanConfigBuilder::from(test_config(None))
+            .with_batch_size(Some(0))
+            .build();
+
+        let err = serde
+            .encode(&config)
+            .expect_err("zero batch size must not produce an undecodable payload");
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn new_file_scan_config_serde_preserves_name_colliding_partition_column() -> Result<()>
+    {
+        let serde = FileScanSerdeHarness::new();
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "shared",
+            DataType::Int32,
+            false,
+        )]));
+        let table_schema = TableSchema::builder(Arc::clone(&file_schema))
+            .with_table_partition_cols(vec![Arc::new(Field::new(
+                "shared",
+                DataType::Utf8,
+                false,
+            ))])
+            .build();
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(SerdeTestSource::new(table_schema, None)),
+        )
+        .build();
+
+        let mut encoded = serde.encode(&config)?;
+        let decoded = serde.decode(&encoded)?;
+        assert_eq!(decoded.file_schema().field(0).data_type(), &DataType::Int32);
+        assert_eq!(
+            decoded.table_partition_cols()[0].data_type(),
+            &DataType::Utf8
+        );
+
+        encoded.table_partition_cols[0] = "different".to_string();
+        let err = serde
+            .decode(&encoded)
+            .expect_err("partition column names must match their positional fields");
+        assert!(err.to_string().contains("partition column 0"));
+        Ok(())
+    }
+
+    #[test]
     fn new_file_scan_config_decode_without_compression_uses_legacy_default() -> Result<()>
     {
         let serde = FileScanSerdeHarness::new();

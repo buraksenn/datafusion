@@ -7136,6 +7136,9 @@ impl serde::Serialize for FileScanExecConf {
         if self.preserve_order.is_some() {
             len += 1;
         }
+        if !self.virtual_columns.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.FileScanExecConf", len)?;
         if !self.file_groups.is_empty() {
             struct_ser.serialize_field("fileGroups", &self.file_groups)?;
@@ -7183,6 +7186,9 @@ impl serde::Serialize for FileScanExecConf {
         if let Some(v) = self.preserve_order.as_ref() {
             struct_ser.serialize_field("preserveOrder", v)?;
         }
+        if !self.virtual_columns.is_empty() {
+            struct_ser.serialize_field("virtualColumns", &self.virtual_columns)?;
+        }
         struct_ser.end()
     }
 }
@@ -7216,6 +7222,8 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             "fileCompressionType",
             "preserve_order",
             "preserveOrder",
+            "virtual_columns",
+            "virtualColumns",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7234,6 +7242,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             OutputPartitioning,
             FileCompressionType,
             PreserveOrder,
+            VirtualColumns,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7269,6 +7278,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             "outputPartitioning" | "output_partitioning" => Ok(GeneratedField::OutputPartitioning),
                             "fileCompressionType" | "file_compression_type" => Ok(GeneratedField::FileCompressionType),
                             "preserveOrder" | "preserve_order" => Ok(GeneratedField::PreserveOrder),
+                            "virtualColumns" | "virtual_columns" => Ok(GeneratedField::VirtualColumns),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7302,6 +7312,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                 let mut output_partitioning__ = None;
                 let mut file_compression_type__ = None;
                 let mut preserve_order__ = None;
+                let mut virtual_columns__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::FileGroups => {
@@ -7393,6 +7404,12 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             }
                             preserve_order__ = map_.next_value()?;
                         }
+                        GeneratedField::VirtualColumns => {
+                            if virtual_columns__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("virtualColumns"));
+                            }
+                            virtual_columns__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(FileScanExecConf {
@@ -7410,6 +7427,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                     output_partitioning: output_partitioning__,
                     file_compression_type: file_compression_type__,
                     preserve_order: preserve_order__,
+                    virtual_columns: virtual_columns__.unwrap_or_default(),
                 })
             }
         }
@@ -18066,12 +18084,18 @@ impl serde::Serialize for PhysicalCastNode {
         if self.arrow_type.is_some() {
             len += 1;
         }
+        if self.target_field.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalCastNode", len)?;
         if let Some(v) = self.expr.as_ref() {
             struct_ser.serialize_field("expr", v)?;
         }
         if let Some(v) = self.arrow_type.as_ref() {
             struct_ser.serialize_field("arrowType", v)?;
+        }
+        if let Some(v) = self.target_field.as_ref() {
+            struct_ser.serialize_field("targetField", v)?;
         }
         struct_ser.end()
     }
@@ -18086,12 +18110,15 @@ impl<'de> serde::Deserialize<'de> for PhysicalCastNode {
             "expr",
             "arrow_type",
             "arrowType",
+            "target_field",
+            "targetField",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Expr,
             ArrowType,
+            TargetField,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -18115,6 +18142,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalCastNode {
                         match value {
                             "expr" => Ok(GeneratedField::Expr),
                             "arrowType" | "arrow_type" => Ok(GeneratedField::ArrowType),
+                            "targetField" | "target_field" => Ok(GeneratedField::TargetField),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -18136,6 +18164,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalCastNode {
             {
                 let mut expr__ = None;
                 let mut arrow_type__ = None;
+                let mut target_field__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Expr => {
@@ -18150,11 +18179,18 @@ impl<'de> serde::Deserialize<'de> for PhysicalCastNode {
                             }
                             arrow_type__ = map_.next_value()?;
                         }
+                        GeneratedField::TargetField => {
+                            if target_field__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("targetField"));
+                            }
+                            target_field__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(PhysicalCastNode {
                     expr: expr__,
                     arrow_type: arrow_type__,
+                    target_field: target_field__,
                 })
             }
         }
