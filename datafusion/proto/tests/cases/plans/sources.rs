@@ -139,6 +139,27 @@ async fn roundtrip_parquet_exec_with_sort_pushdown() -> Result<()> {
 }
 
 #[test]
+fn file_scan_encode_rejects_zero_batch_size() {
+    let scan_config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::local_filesystem(),
+        Arc::new(ParquetSource::new(Arc::new(Schema::empty()))),
+    )
+    .with_batch_size(Some(0))
+    .build();
+
+    let err = PhysicalPlanNode::try_from_physical_plan(
+        DataSourceExec::from_data_source(scan_config),
+        &DefaultPhysicalExtensionCodec {},
+    )
+    .expect_err("zero file scan batch size must not be encoded");
+    assert!(
+        err.to_string()
+            .contains("FileScanConfig: batch_size must be greater than 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn file_scan_rejects_zero_batch_size() -> Result<()> {
     let schema = Arc::new(Schema::empty());
     let scan_config = FileScanConfigBuilder::new(

@@ -68,6 +68,12 @@ impl FileScanConfig {
         &self,
         ctx: &ExecutionPlanEncodeCtx<'_>,
     ) -> Result<protobuf::FileScanExecConf> {
+        if self.batch_size == Some(0) {
+            return datafusion_common::plan_err!(
+                "FileScanConfig: batch_size must be greater than 0"
+            );
+        }
+
         let file_groups = self
             .file_groups
             .iter()
