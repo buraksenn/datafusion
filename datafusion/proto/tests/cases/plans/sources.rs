@@ -555,6 +555,35 @@ fn roundtrip_csv_scan_preserves_format_options() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn file_scan_schema_preserves_name_colliding_partition_column() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("shared", DataType::Int32, false),
+        Field::new("shared", DataType::Utf8, false),
+    ]);
+    let mut conf = protobuf::FileScanExecConf {
+        schema: Some((&schema).try_into()?),
+        table_partition_cols: vec!["shared".to_string()],
+        ..Default::default()
+    };
+
+    let table_schema = FileScanConfig::parse_table_schema_from_proto(&conf)?;
+    assert_eq!(
+        table_schema.file_schema().field(0).data_type(),
+        &DataType::Int32
+    );
+    assert_eq!(
+        table_schema.table_partition_cols()[0].data_type(),
+        &DataType::Utf8
+    );
+
+    conf.table_partition_cols[0] = "different".to_string();
+    let err = FileScanConfig::parse_table_schema_from_proto(&conf)
+        .expect_err("partition column names must match their positional fields");
+    assert!(err.to_string().contains("partition column 0"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn roundtrip_parquet_exec_with_table_partition_cols() -> Result<()> {
     let mut file_group =

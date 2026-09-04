@@ -286,32 +286,38 @@ impl FileScanConfig {
     ) -> Result<TableSchema> {
         let schema = parse_file_scan_schema(conf)?;
 
-        // Reacquire the partition column types from the schema before removing
-        // them below.
-        let table_partition_cols = conf
+        let partition_start = schema
+            .fields()
+            .len()
+            .checked_sub(conf.table_partition_cols.len())
+            .ok_or_else(|| {
+                internal_datafusion_err!(
+                    "FileScanExecConf has more partition columns than schema fields"
+                )
+            })?;
+        let (file_fields, partition_fields) = schema.fields().split_at(partition_start);
+
+        if let Some((index, (expected, actual))) = conf
             .table_partition_cols
             .iter()
-            .map(|col| Ok(Arc::new(schema.field_with_name(col)?.clone())))
-            .collect::<Result<Vec<_>>>()?;
+            .zip(partition_fields)
+            .enumerate()
+            .find(|(_, (expected, actual))| expected.as_str() != actual.name())
+        {
+            return datafusion_common::plan_err!(
+                "FileScanExecConf partition column {index} is named '{expected}', but schema field is named '{}'",
+                actual.name()
+            );
+        }
 
-        // Remove partition columns from the schema after recreating
-        // table_partition_cols because the partition columns are not in the
-        // file. They are present to allow the partition column types to be
-        // reconstructed after serde.
+        // The encoder appends partition fields after file fields, so split by
+        // position rather than name: file and partition columns may share a name.
         let file_schema = Arc::new(
-            Schema::new(
-                schema
-                    .fields()
-                    .iter()
-                    .filter(|field| !table_partition_cols.contains(field))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-            .with_metadata(schema.metadata.clone()),
+            Schema::new(file_fields.to_vec()).with_metadata(schema.metadata.clone()),
         );
 
         Ok(TableSchema::builder(file_schema)
-            .with_table_partition_cols(table_partition_cols)
+            .with_table_partition_cols(partition_fields.to_vec())
             .build())
     }
 }
